@@ -50,7 +50,7 @@ export default async ({ client } = {}) => {
       if (!config.command) config.command = {};
       config.command['memory'] = {
         description: '/memory → show index | /memory <text> → store a memory',
-        template: `Global memory dir: ${MEMORY_DIR}\n\nNo arguments: read and display ${MEMORY_INDEX} and list all topic files. Do not write anything.\n\nWith arguments ($ARGUMENTS): treat as a fact to persist — write to the appropriate topic file in ${MEMORY_DIR}, update ${MEMORY_INDEX} if needed, confirm what was stored and where. Treat any text including single words literally as content to store.`
+        template: `Memory dir: ${MEMORY_DIR}\n\nArguments: $ARGUMENTS\n\nIf arguments are empty: read and display ${MEMORY_INDEX} and list all .md files in the directory with their one-line summaries. Do not write anything.\n\nIf arguments are provided: treat them as a fact to persist — write to the appropriate topic file in ${MEMORY_DIR}, update ${MEMORY_INDEX} if needed, confirm what was stored and where. Any text including single words is treated literally as content to store.`
       };
     },
 
