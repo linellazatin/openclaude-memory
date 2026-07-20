@@ -8,11 +8,32 @@ const MEMORY_DIR = path.join(
 );
 const MEMORY_INDEX = path.join(MEMORY_DIR, 'MEMORY.md');
 
+const MEMORY_RULES = path.join(MEMORY_DIR, 'RULES.md');
+
 const MAX_LINES = 200;
 const MAX_BYTES = 25 * 1024;
 
 const INITIAL_MEMORY = `# Memory Index
 
+`;
+
+const INITIAL_RULES = `# Memory Rules
+
+## Always persist
+- Any issue solved or fixed
+- Server or infrastructure configuration discovered or changed
+- Reusable commands or workflows identified
+- Hardware, model, or environment facts learned
+
+## Never persist
+- Session-specific context that won't apply to future sessions
+- Opinions or preferences not confirmed by the user
+- Large blocks of code — summarize instead, or link to the file path
+
+## Always ask before persisting (non-overridable)
+- Credentials, tokens, API keys
+- Personal data
+- Anything the user marks as private or ephemeral
 `;
 
 function readMemoryIndex() {
@@ -29,6 +50,19 @@ function readMemoryIndex() {
       return truncated + '\n\n<!-- memory truncated: MEMORY.md exceeds 200-line limit; shorten the index -->';
     }
     return raw;
+  } catch {
+    return null;
+  }
+}
+
+function readMemoryRules() {
+  try {
+    if (!fs.existsSync(MEMORY_RULES)) {
+      fs.mkdirSync(MEMORY_DIR, { recursive: true });
+      fs.writeFileSync(MEMORY_RULES, INITIAL_RULES, 'utf8');
+      return INITIAL_RULES;
+    }
+    return fs.readFileSync(MEMORY_RULES, 'utf8');
   } catch {
     return null;
   }
@@ -56,8 +90,14 @@ export default async ({ client } = {}) => {
 
     'experimental.chat.system.transform': async (_input, output) => {
       const content = readMemoryIndex();
-      if (!content) return;
-      output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${MEMORY_DIR}\n\n${content}`);
+      if (content) {
+        output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${MEMORY_DIR}\n\n${content}`);
+      }
+
+      const rules = readMemoryRules();
+      if (rules) {
+        output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_RULES} to customise.\n\n${rules}`);
+      }
     },
   };
 };
