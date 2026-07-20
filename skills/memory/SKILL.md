@@ -2,7 +2,7 @@
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
 version: 0.0.1
-author: openclaude-memory
+author: Lines
 license: MIT
 platforms: [linux, macos]
 metadata:
@@ -79,21 +79,8 @@ If the injected `## Global Memory` block contains a truncation warning (`memory 
 4. If all entries are still valid but the count is high, consolidate: merge two closely related topic files into one, update the single index entry to reflect the combined scope, leave the old file in place or remove it only if all content was moved.
 5. Re-read `MEMORY.md` after trimming to confirm it is under 200 lines.
 
-## What to persist
+## Persist rules
 
-Persist without asking:
-- Solved bugs and their root causes
-- Server, infra, or environment configuration discovered or changed
-- Reusable commands, flags, or workflows
-- Hardware specs, model configs, tool versions
+Your persist rules are in `~/.config/opencode/memory/RULES.md` and are injected into your context under `## Memory Rules` each session. Follow them.
 
-Ask before persisting:
-- Credentials, tokens, API keys
-- Personal data
-- Anything the user marks as private or ephemeral
-
-## What NOT to persist
-
-- Session-specific context that won't apply to future sessions
-- Opinions or preferences not confirmed by the user
-- Large blocks of code — summarize instead, or link to the file path
+If no `## Memory Rules` block is in your context, read `~/.config/opencode/memory/RULES.md` directly.

@@ -19,7 +19,31 @@ When something worth remembering happens (a bug fixed, a config discovered, a co
 2. **Topic files**: `MEMORY.md` is a concise index (one line per topic). Detail lives in separate topic files (`~/.config/opencode/memory/<topic>.md`), loaded on-demand by the agent when it needs more context.
 3. **Auto-writes**: The agent writes to memory automatically when it solves issues, discovers infrastructure, identifies reusable commands, or learns hardware/model facts — no prompting needed.
 4. **Manual control**: Use `/memory` to view the current index, or `/memory <text>` to store a fact immediately.
-5. **Bootstrap**: On first run, the plugin creates `MEMORY.md` automatically. Nothing to set up.
+5. **Bootstrap**: On first run, the plugin creates `MEMORY.md` and `RULES.md` automatically. Nothing to set up.
+
+## Customising persist rules
+
+`~/.config/opencode/memory/RULES.md` is auto-created on first run with sensible defaults. Edit it directly to add, remove, or modify rules:
+
+```markdown
+# Memory Rules
+
+## Always persist
+- User preferences confirmed during session
+- Project-specific conventions discovered
+
+## Never persist
+- Temporary workarounds
+- Debug output and stack traces
+
+## Always ask before persisting (non-overridable)
+- Credentials, tokens, API keys
+- Personal data
+```
+
+The plugin injects this file into every session's system prompt under a `## Memory Rules` header. RULES.md is the single source of truth for persist rules — no other configuration needed.
+
+**Note:** The "Always ask before persisting" section is a strong convention. The agent will always prompt before storing credentials or personal data.
 
 ## Plugin architecture
 
@@ -67,15 +91,33 @@ Add to your `~/.config/opencode/opencode.json` (or `opencode.jsonc`) `plugin` ar
 }
 ```
 
-Restart opencode. On the next session, `~/.config/opencode/memory/MEMORY.md` will be created automatically if it doesn't exist, and the `## Global Memory` block will appear in the agent's context.
+Restart opencode. On the next session, `~/.config/opencode/memory/MEMORY.md` and `RULES.md` will be created automatically, and both `## Global Memory` and `## Memory Rules` blocks will appear in the agent's context. No manual configuration required.
 
 ## Compatibility
 
-| Requirement | Version |
+| Requirement | Notes |
 |---|---|
-| opencode | >= 1.4.3 (`@opencode-ai/plugin`) |
+| opencode | >= 1.4.3 |
 | Node.js | >= 18 (ESM, `fs`, `os`, `path` stdlib only) |
-| Platform | Linux, macOS |
+| Linux | Full support |
+| macOS | Supported. opencode follows XDG on macOS, so `~/.config/opencode/` is used by default. If your opencode config lives elsewhere, set `XDG_CONFIG_HOME` to the parent of your `opencode/` config dir. |
+| Windows | Not supported |
+
+## Token overhead
+
+The plugin injects the `MEMORY.md` index into the system prompt on every turn. Cost scales with index size:
+
+| State | Est. tokens / turn |
+|---|---|
+| Fresh install (empty index, default RULES.md) | ~120 |
+| Typical use (10–30 entries, default RULES.md) | ~300–700 |
+| Custom RULES.md (typical, 10–20 lines) | similar to above |
+| At cap (200 lines index) | ~4,300–4,900 |
+| Hard cap (25 KB) | ~6,400 |
+
+Estimates based on Claude's tokenizer averaging 3.5–4 characters per token for markdown prose. Topic files are **not** injected — only the index line — so even a large memory store stays cheap until the index itself grows large.
+
+For reference, Claude Sonnet's context window is ~200K tokens. Worst-case overhead from this plugin is ~3% of that.
 
 ## License
 
