@@ -20,4 +20,7 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
+      - run: npm install -g npm@latest
       - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ''
