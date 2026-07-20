@@ -13,6 +13,33 @@ I also wanted something local-first. My memories and notes stay on my machine, i
 
 When something worth remembering happens (a bug fixed, a config discovered, a command identified), the agent writes it to a structured markdown memory store. The next session, that context is already there — injected automatically into the system prompt before the first message.
 
+But this project wasn't born because I wanted to reinvent memory systems. It was born out of frustration.
+
+Over the past several months, I experimented with nearly every approach I could find: vector databases, embedding models, external memory services, MCP memory servers, and LLM-powered memory management. Some were incredibly clever. Some were feature-rich. But almost all of them came with trade-offs that didn't fit how I work.
+
+Running a separate LLM just to decide whether a memory should be saved felt wasteful. Maintaining embedding models and vector indexes consumed resources I'd rather dedicate to the coding model itself. I found myself spending more time configuring the memory system than actually using it.
+
+I also discovered that more intelligence didn't always mean better memory. During my own testing, I audited memories produced by automated systems and found that many retained facts were incomplete, misleading, or simply wrong. If the memory layer itself isn't trustworthy, every future conversation starts from a weaker foundation.
+
+Eventually I asked myself a simple question:
+
+> Why does remembering something require another AI model?
+
+For the kinds of things I actually wanted to remember—project architecture, debugging notes, shell commands, configuration quirks, design decisions—the answer was: it doesn't.
+
+A markdown file is deterministic. It's searchable with Git. It can be reviewed in code reviews. It survives model changes, provider changes, and framework changes. Most importantly, it never hides what the agent knows.
+
+So instead of building another "AI memory," I built a memory system that stays out of the way.
+
+- No embeddings.
+- No vector databases.
+- No background services.
+- No hidden retrieval algorithms.
+
+Just files, structure, and an agent that knows where to look.
+
+> If you've ever spent hours configuring a sophisticated memory stack only to realize you just wanted your coding agent to remember yesterday's bug fix, this project is for you.
+
 ## How it works
 
 1. **Injection**: On every turn, the plugin reads `~/.config/opencode/memory/MEMORY.md` and injects its contents into the system prompt under a `## Global Memory` header.
@@ -44,6 +71,24 @@ When something worth remembering happens (a bug fixed, a config discovered, a co
 The plugin injects this file into every session's system prompt under a `## Memory Rules` header. RULES.md is the single source of truth for persist rules — no other configuration needed.
 
 **Note:** The "Always ask before persisting" section is a strong convention. The agent will always prompt before storing credentials or personal data.
+
+## Cap handling
+
+`MEMORY.md` is capped at **200 lines or 25 KB**. The plugin never modifies `MEMORY.md` — it is read-only at the plugin level. When either limit is exceeded, the plugin truncates the injected content at 200 lines and appends a warning comment to what the agent sees in its context:
+
+```
+<!-- memory truncated: MEMORY.md exceeds 200-line limit; shorten the index -->
+```
+
+The file on disk is untouched. The agent sees the warning and is responsible for trimming the index. The remediation procedure it follows (defined in `SKILL.md`):
+
+1. Read `MEMORY.md` in full to assess all entries.
+2. Remove index lines that are stale (topic no longer relevant), superseded (merged into another topic file), or duplicated.
+3. If all entries are still valid but the count is high, consolidate: merge two closely related topic files into one and update the index entry to reflect the combined scope.
+4. Topic file content is never deleted — only index lines are removed.
+5. Re-read `MEMORY.md` after trimming to confirm it is under 200 lines.
+
+The cap exists to keep per-turn token overhead bounded. At 200 lines, the index alone costs ~4,300–4,900 tokens. A well-maintained index should stay well under 100 entries for typical personal use.
 
 ## Plugin architecture
 
