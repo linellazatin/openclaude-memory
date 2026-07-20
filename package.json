@@ -1,0 +1,13 @@
+{
+  "name": "@openlines/openclaude-memory",
+  "version": "1.0.0",
+  "description": "Global persistent memory for opencode sessions via MEMORY.md injection",
+  "keywords": ["opencode-plugin", "opencode"],
+  "type": "module",
+  "main": "./.opencode/plugins/ocl-memory.mjs",
+  "exports": {
+    ".": "./.opencode/plugins/ocl-memory.mjs",
+    "./plugin": "./.opencode/plugins/ocl-memory.mjs"
+  },
+  "files": ["skills/", ".opencode/"]
+}
