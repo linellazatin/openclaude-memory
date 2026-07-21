@@ -152,7 +152,9 @@ openclaude-memory/
 - Encryption or sync
 - Per-project memory (this is global only)
 
-## Installation
+## Installation and Update
+
+### Install
 
 Add to your `~/.config/opencode/opencode.json` (or `opencode.jsonc`) `plugin` array:
 
@@ -164,7 +166,18 @@ Add to your `~/.config/opencode/opencode.json` (or `opencode.jsonc`) `plugin` ar
 }
 ```
 
-Restart opencode. On the next session, `~/.config/opencode/memory/MEMORY.md` and `RULES.md` will be created automatically, and both `## Global Memory` and `## Memory Rules` blocks will appear in the agent's context. No manual configuration required.
+Restart opencode. On the first chat turn of the next session, `~/.config/opencode/memory/MEMORY.md` and `RULES.md` will be created automatically, and both `## Global Memory` and `## Memory Rules` blocks will appear in the agent's context. No manual configuration required.
+
+### Update
+
+opencode resolves `@latest` once at first install and caches it permanently — it does not re-check npm on restart. To update to a newer version, delete the cached package and restart:
+
+```bash
+rm -rf ~/.cache/opencode/packages/@openlines/openclaude-memory
+rm -rf ~/.cache/opencode/packages/@openlines/openclaude-memory@latest
+```
+
+opencode may create one or both directories depending on how the specifier was resolved. Delete whichever exists, then restart — opencode will fetch the newest published version on next start.
 
 ## System Compatibility
 
@@ -194,27 +207,25 @@ For reference, Claude Sonnet's context window is ~200K tokens. Worst-case overhe
 
 ## Model compatibility
 
-The plugin injects plain markdown into the system prompt — no model-specific features required. The `/memory` command templates are written to be explicit enough for smaller models.
+The plugin injects plain markdown into the system prompt — no model-specific features required. The `/memory` command templates are written with numbered steps and before/after examples to work reliably across a wide range of models.
 
-| Feature | Strong models (Claude Sonnet, GPT-4 class) | Smaller models (~7–14B) | Sub-7B models |
+Modern instruction-tuned models — including compact ones in the 4–9B range — handle all core features well. The table below reflects 2026-era model quality; results from older or poorly instruction-tuned models may vary.
+
+| Feature | Upper mid to large (14B+) | Mid-range (7–13B, well instruction-tuned) | Compact (<7B, modern) |
 |---|---|---|---|
 | `/memory` show index | Reliable | Reliable | Reliable |
-| `/memory <text>` store | Reliable | Reliable | Usually works; may miss date update |
-| `/memory pin <topic>` | Reliable | Usually works | May rewrite line incorrectly |
-| `/memory remove <topic>` | Reliable | Usually works | May misidentify entry |
-| Auto-trigger writes (AGENTS.md rules) | Reliable | Inconsistent | Unreliable |
-| Index metadata (date, [pin]) on auto-writes | Reliable | Inconsistent | Often skipped |
+| `/memory <text>` store | Reliable | Reliable | Reliable |
+| `/memory pin <topic>` | Reliable | Reliable | Usually works |
+| `/memory remove <topic>` | Reliable | Reliable | Usually works |
+| Auto-trigger writes (AGENTS.md rules) | Reliable | Reliable | Usually works |
+| Index metadata (date, [pin]) on auto-writes | Reliable | Reliable | Usually works; verify with `/memory` after |
 
 **Mitigations already in place:**
 - Before/after format examples in all write branches
 - Numbered steps with explicit "do not change any other part of the line"
 - `/memory pin` and `/memory remove` as explicit commands rather than relying on agent judgment
 
-**Recommendations for smaller models:**
-- Use `/memory <text>` explicitly rather than relying on auto-trigger writes
-- Use `/memory pin <topic>` and `/memory remove <topic>` for index maintenance
-- If auto-trigger writes are important, prefer models ≥7B with strong instruction-following
-- Verify index entries after writes on sub-10B models: run `/memory` to confirm format is correct
+If you are using an older or lightly instruction-tuned model, `/memory <text>` explicit commands will always be more reliable than auto-trigger writes.
 
 > **A note on the current design**
 >
