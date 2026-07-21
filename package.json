@@ -1,6 +1,6 @@
 {
   "name": "@openlines/openclaude-memory",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Global persistent memory for opencode sessions via MEMORY.md injection (like our mother Claude Code)",
   "keywords": ["opencode-plugin", "opencode"],
   "license": "MIT",
