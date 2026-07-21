@@ -217,8 +217,8 @@ Modern instruction-tuned models — including compact ones in the 4–9B range �
 | `/memory <text>` store | Reliable | Reliable | Reliable |
 | `/memory pin <topic>` | Reliable | Reliable | Usually works |
 | `/memory remove <topic>` | Reliable | Reliable | Usually works |
-| Auto-trigger writes (AGENTS.md rules) | Reliable | Reliable | Usually works |
-| Index metadata (date, [pin]) on auto-writes | Reliable | Reliable | Usually works; verify with `/memory` after |
+| Auto-trigger writes (AGENTS.md rules) | Reliable | Usually works | Best-effort |
+| Index metadata (date, [pin]) on auto-writes | Reliable | Usually works; may miss date occasionally | Best-effort; verify with `/memory` after |
 
 **Mitigations already in place:**
 - Before/after format examples in all write branches
