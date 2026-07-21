@@ -1,6 +1,6 @@
 {
   "name": "@openlines/openclaude-memory",
-  "version": "0.0.4",
+  "version": "0.1.0",
   "description": "Global persistent memory for opencode sessions via MEMORY.md injection (like our mother Claude Code)",
   "keywords": ["opencode-plugin", "opencode"],
   "license": "MIT",
@@ -9,10 +9,19 @@
     "url": "https://github.com/linellazatin/openclaude-memory.git"
   },
   "type": "module",
+  "scripts": {
+    "test": "node test.mjs"
+  },
   "main": "./.opencode/plugins/ocl-memory.mjs",
   "exports": {
     ".": "./.opencode/plugins/ocl-memory.mjs",
     "./plugin": "./.opencode/plugins/ocl-memory.mjs"
   },
-  "files": ["skills/", ".opencode/"]
+  "files": ["skills/", ".opencode/"],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "zod": "^3.0.0"
+  }
 }

@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.0.2
+version: 0.1.0
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -20,9 +20,19 @@ Global memory persists across all opencode sessions. It lives at:
 └── <topic>.md             # detail files — read on-demand
 ```
 
+## Available tools
+
+The plugin registers three native tools. Use these instead of raw Write/Edit tools for all memory operations — they handle file format, frontmatter, and index maintenance automatically.
+
+| Tool | Args | What it does |
+|---|---|---|
+| `write_memory` | `topic`, `content`, `summary`, `pin?` | Creates or appends to a topic file; upserts MEMORY.md index entry |
+| `remove_memory` | `topic` | Removes the index entry (refuses if pinned); topic file preserved |
+| `pin_memory` | `topic`, `pin` (bool) | Pins or unpins an index entry |
+
 ## Reading memory
 
-`MEMORY.md` is already in your context (injected by the plugin). You do not need to re-read it unless you've just written to it and want to verify.
+`MEMORY.md` is already in your context (injected by the plugin). You do not need to re-read it unless you have just written to it and want to verify.
 
 To read a topic file for detail:
 ```
@@ -36,62 +46,73 @@ Glob ~/.config/opencode/memory/*.md
 
 ## Writing memory
 
-Use the standard Write and Edit tools.
+Use the `write_memory` tool. Do not use raw Write/Edit tools on memory files.
 
 ### Adding a new topic
 
-1. Create the topic file: `~/.config/opencode/memory/<slug>.md`
-2. Add a YAML frontmatter block at the top:
-   ```yaml
-   ---
-   name: <Topic Name>
-   description: <one-line summary>
-   metadata:
-     node_type: memory
-   ---
-   ```
-3. Write the detail content in markdown below the frontmatter.
-4. Add one line to `MEMORY.md` index with today's date in ISO format. Add `[pin]` if the topic is permanent (hardware, user identity, core workflows):
-   ```
-   - [Topic Name](<slug>.md) [pin] YYYY-MM-DD -- <same one-line summary>   ← pinned
-   - [Topic Name](<slug>.md) YYYY-MM-DD -- <same one-line summary>          ← normal
-   ```
+Call `write_memory` with:
+- `topic`: the topic name, e.g. `"PostgreSQL Setup"`
+- `content`: the full detail content to write
+- `summary`: a one-line summary for the index
+- `pin`: `true` if the topic is permanent (hardware, user identity, core workflows)
+
+The plugin will:
+1. Derive a slug filename from the topic name (lowercase, hyphens)
+2. Create the file with YAML frontmatter stamped automatically
+3. Add a new index line to `MEMORY.md` with today's date
 
 ### Updating an existing topic
 
-1. Read the existing topic file.
-2. Edit it with new information — append under a `## <date>` heading or update the relevant section.
-3. Update the index entry: set `last_updated` to today's ISO date (`YYYY-MM-DD`). Preserve `[pin]` if present. Preserve the `--` summary. If the summary is stale, update it.
+Call `write_memory` with the same `topic` name. The plugin appends the new content under a `## YYYY-MM-DD` heading. The index date is updated automatically.
 
 ### Index discipline
 
 - `MEMORY.md` must stay under the configured `max_lines` limit (default 200; set in `## Config` section of `RULES.md`). One line per topic.
 - Never expand an index entry beyond one line. Put detail in the topic file.
-- Topic file names: lowercase, hyphens, no spaces (e.g. `local-llm-models.md`).
-- After any write, verify `MEMORY.md` line count with Read and trim if needed.
+- After any write, verify `MEMORY.md` line count and trim if needed.
 - Entries with `[pin]` are exempt from all cleanup and staleness logic — never suggest removing them.
 
-### Pinning entries
+### Pinning and unpinning
+
+Use `pin_memory({ topic, pin: true })` to pin. Use `pin_memory({ topic, pin: false })` to unpin.
 
 Use `[pin]` for topics that should never be cleaned up: hardware specs, user identity, core workflows, permanent reference material.
 
-To pin an existing entry: use `/memory pin <topic name>`.
-
-To add a pin when creating a new topic: include `[pin]` in the index line at creation time.
-
 Never remove `[pin]` from an entry unless the user explicitly asks.
 
-### When the cap is hit
+## Staleness flags
 
-If the injected `## Global Memory` block contains a truncation warning (`memory truncated`), the index has exceeded the configured line limit and must be trimmed before the next write. Steps:
+The plugin stamps `[stale?]` on index entries older than `stale_after_days` (default 180, configurable in `RULES.md`). The flag appears in the index line, after the date:
 
-1. Read `~/.config/opencode/memory/MEMORY.md` in full.
+```
+- [Topic Name](file.md) 2025-11-01 [stale?] -- summary
+```
+
+`[stale?]` means "this entry has not been updated in a while — worth reviewing". It is a candidate signal, not a deletion order.
+
+**How `[stale?]` self-heals**: when you call `write_memory` on a stale topic, the plugin updates the date and removes `[stale?]` from that entry automatically during the next index maintenance pass.
+
+**Pinned entries are never flagged** regardless of age.
+
+**Entries with no date** are never flagged — they are treated as legacy entries.
+
+When you see `[stale?]` entries in the index, you can:
+- Ask the user if the topic is still relevant
+- Call `write_memory` to refresh it (flag disappears automatically)
+- Call `remove_memory` to delete the index entry if clearly obsolete
+
+## When the cap is hit
+
+If the injected `## Global Memory` block contains a truncation warning (`memory truncated`), the index has exceeded the configured line limit and must be trimmed. Steps:
+
+1. Read `MEMORY.md` in full to assess all entries.
 2. Identify entries that are candidates for removal. Check in this order:
    - **Skip immediately**: any entry with `[pin]` — never a removal candidate.
-   - **Objective (remove without judgment)**: entry points to a topic file that no longer exists on disk; or two entries point to the same filename (keep the one with the more recent date, remove the other).
-   - **Conservative judgment (remove only if clearly obsolete)**: topic was session-specific and no longer applies; topic is fully superseded by a newer broader entry. When in doubt, keep the entry.
-3. Remove those index lines from `MEMORY.md`. Do not delete the topic files themselves — only remove the index entry.
-4. If all entries are still valid but the count is high, consolidate: merge two closely related topic files into one, update the single index entry to reflect the combined scope, leave the old file in place or remove it only if all content was moved.
+   - **Objective (remove without judgment)**: entry points to a topic file that no longer exists on disk; or two entries point to the same filename (keep the one with the more recent date, remove the other). Use `remove_memory` for these.
+   - **Conservative judgment (remove only if clearly obsolete)**: topic was session-specific and no longer applies; topic is fully superseded by a newer broader entry. When in doubt, keep the entry. Use `remove_memory` for these.
+   - **`[stale?]` entries**: these are prioritised candidates — review them first.
+3. If all entries are still valid but the count is high, consolidate: merge two closely related topic files into one using `write_memory`, then `remove_memory` on the now-redundant entry.
+4. Topic file content is never deleted — only index lines are removed.
 5. Re-read `MEMORY.md` after trimming to confirm it is under the configured limit.
 
 ## Persist rules
