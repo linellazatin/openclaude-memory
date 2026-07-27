@@ -5,6 +5,17 @@
 
 Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
+## Updates
+
+- On-going work with 'localizing' logic from 'model-based' to 'plugin-based', getting closer towards my main goal (still learning the ropes on memory-handling); this should be a pretty 'major' release once done.
+- On-going local LLM (very simple) test and benchmarks for instruction following - using my own 'mid-tier gaming' hardware (AMD, no ROCm, plain Vulkan by llama.cpp) - not really related with this project, but worth mentioning. Will be creating a separate 'doc' for those kinds of stuff.
+
+> **A note on the current design**
+>
+> This plugin started as a personal project — a quick answer to a real need I had. Right now it leans heavily on the agent model to do the right thing: follow format rules, update dates, respect pins, and know when to write. That works well with strong models, and reasonably well with mid-range ones. It's an honest tradeoff I made to ship something useful fast.
+>
+> In future releases, I want to move more of that responsibility into the plugin itself — reducing how much you need to trust the model to get consistent behaviour, and bringing the design closer to the original philosophy of keeping things simple and deterministic. I don't have a timeline, but I'm genuinely committed to improving this. If you run into rough edges, feedback is welcome.
+
 ## Why
 
 I built this because I genuinely like how Claude Code handles memory: no complex algorithms, no external LLM for heavy lifting, no vector databases. It just works — the agent reads a markdown file and acts on it. Simple, transparent, effective.
@@ -167,6 +178,7 @@ openclaude-memory/
 ## Scope
 
 **In scope:**
+
 - Flat markdown persistence (`MEMORY.md` + topic files)
 - System prompt injection every session turn
 - Native plugin tools for write, remove, and pin operations
@@ -179,6 +191,7 @@ openclaude-memory/
 - Index maintenance: orphan removal, duplicate removal, staleness flagging on tool calls
 
 **Out of scope:**
+
 - Semantic or fuzzy search across memories
 - Custom MCP server (the agent uses plugin-registered tools)
 - Encryption or sync
@@ -214,25 +227,27 @@ opencode may create one or both directories depending on how the specifier was r
 
 ## System Compatibility
 
-| Requirement | Notes |
-|---|---|
-| opencode | >= 1.4.3 |
-| Node.js | >= 18 (ESM, `fs`, `os`, `path` stdlib only) |
-| Linux | Full support |
-| macOS | Supported. opencode follows XDG on macOS, so `~/.config/opencode/` is used by default. If your opencode config lives elsewhere, set `XDG_CONFIG_HOME` to the parent of your `opencode/` config dir. |
-| Windows | Not supported |
+
+| Requirement | Notes                                                                                                                                                                                              |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| opencode    | >= 1.4.3                                                                                                                                                                                           |
+| Node.js     | >= 18 (ESM,`fs`, `os`, `path` stdlib only)                                                                                                                                                         |
+| Linux       | Full support                                                                                                                                                                                       |
+| macOS       | Supported. opencode follows XDG on macOS, so`~/.config/opencode/` is used by default. If your opencode config lives elsewhere, set `XDG_CONFIG_HOME` to the parent of your `opencode/` config dir. |
+| Windows     | Not supported                                                                                                                                                                                      |
 
 ## Token overhead
 
 The plugin injects the `MEMORY.md` index into the system prompt on every turn. Cost scales with index size:
 
-| State | Est. tokens / turn |
-|---|---|
-| Fresh install (empty index, default RULES.md) | ~120 |
-| Typical use (10–30 entries, default RULES.md) | ~300–700 |
-| Custom RULES.md (typical, 10–20 lines) | similar to above |
-| At cap (configured limit, default 200 lines) | ~4,300–4,900 |
-| Hard cap (25 KB) | ~6,400 |
+
+| State                                          | Est. tokens / turn |
+| ------------------------------------------------ | -------------------- |
+| Fresh install (empty index, default RULES.md)  | ~120               |
+| Typical use (10–30 entries, default RULES.md) | ~300–700          |
+| Custom RULES.md (typical, 10–20 lines)        | similar to above   |
+| At cap (configured limit, default 200 lines)   | ~4,300–4,900      |
+| Hard cap (25 KB)                               | ~6,400             |
 
 Estimates based on [Claude's tokenizer](https://www.claudetokenizer.com/) averaging 3.5–4 characters per token for markdown prose. Topic files are **not** injected — only the index line — so even a large memory store stays cheap until the index itself grows large.
 
