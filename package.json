@@ -9,9 +9,6 @@
     "url": "https://github.com/linellazatin/openclaude-memory.git"
   },
   "type": "module",
-  "scripts": {
-    "test": "node test.mjs"
-  },
   "main": "./.opencode/plugins/ocl-memory.mjs",
   "exports": {
     ".": "./.opencode/plugins/ocl-memory.mjs",
