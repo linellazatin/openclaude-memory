@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0] - 2026-07-27
+## [0.1.0] - FIRST BETA RELEASE - 2026-07-27
 
 ### Added
 
@@ -16,7 +16,7 @@ All notable changes to this project will be documented in this file.
 - `stale_after_days` config in `RULES.md` `## Config` section (default 180; `0` = disabled)
 - `findIndexEntry()` shared helper: extracted from duplicated search loops in `remove_memory` and `pin_memory`
 - `engines: { node: ">=18" }` in `package.json`
-- `.opencode/.npmignore`: excludes `node_modules/`, dev configs, and `plans/` from published tarball
+- `.opencode/.npmignore`: excludes `node_modules/`, and dev configs from published tarball
 
 ### Fixed
 
@@ -27,13 +27,12 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - `parseMaxLines()` replaced by `parseConfig()` — parses both `max_lines` and `stale_after_days` in one pass
-- All `/memory` write branches (`store`, `pin`, `remove`) now delegate to native tools instead of instructing the agent to edit files directly
+- All `/memory` write branches (`store`, `pin`, `remove`) now delegate to native tools instead of instructing the agent to edit files directly (HUGE STUFF!)
 - `write_memory` index read deduplicated — one `fs.readFileSync` call reused for topic-name lookup and upsert
 - `upsertIndexLine` dead variable removed; `pinToken` moved to the append path only
 - Unused `name` destructure removed from `maintainIndex`; `result.push` now uses `parsed.name` directly
 - `SKILL.md` bumped to `v0.1.0`: removed manual frontmatter instruction, added tools reference table, updated write and cap-remediation procedures, added `[stale?]` documentation
 - `zod` added to root `dependencies` (required for tool arg schemas at runtime)
-- Root `.npmignore` removed — redundant; `.opencode/.npmignore` handles all exclusions
 
 ## [0.0.4] - 2026-07-21
 
