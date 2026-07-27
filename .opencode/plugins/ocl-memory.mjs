@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { z } from 'zod';
 
 const MEMORY_DIR = path.join(
   process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
@@ -11,6 +12,7 @@ const MEMORY_RULES = path.join(MEMORY_DIR, 'RULES.md');
 
 const MAX_LINES = 200;
 const MAX_BYTES = 25 * 1024;
+const DEFAULT_STALE_DAYS = 180;
 
 const INITIAL_MEMORY = `# Memory Index
 
@@ -35,23 +37,53 @@ const INITIAL_RULES = `# Memory Rules
 - Anything the user marks as private or ephemeral
 
 ## Config
-# max_lines: 200  (default; valid range 50–500)
+# max_lines: 200         (default; valid range 50–500)
+# stale_after_days: 180  (default; 0 = disable age flagging)
 `;
 
-function parseMaxLines(rulesContent) {
-  if (!rulesContent) return MAX_LINES;
-  const match = rulesContent.match(/^\s*max_lines:\s*(\d+)\s*$/m);
-  if (!match) return MAX_LINES;
-  const val = parseInt(match[1], 10);
-  if (val < 50) return 50;
-  if (val > 500) return 500;
-  return val;
+// --- Config parsing ---
+
+function parseConfig(rulesContent) {
+  const config = { maxLines: MAX_LINES, staleAfterDays: DEFAULT_STALE_DAYS };
+  if (!rulesContent) return config;
+
+  const maxMatch = rulesContent.match(/^\s*max_lines:\s*(\d+)\s*$/m);
+  if (maxMatch) {
+    const val = parseInt(maxMatch[1], 10);
+    config.maxLines = Math.min(500, Math.max(50, val));
+  }
+
+  const staleMatch = rulesContent.match(/^\s*stale_after_days:\s*(\d+)\s*$/m);
+  if (staleMatch) {
+    config.staleAfterDays = Math.max(0, parseInt(staleMatch[1], 10));
+  }
+
+  return config;
+}
+
+// --- File I/O helpers ---
+
+function ensureMemoryDir() {
+  fs.mkdirSync(MEMORY_DIR, { recursive: true });
+}
+
+function readMemoryRules() {
+  try {
+    if (!fs.existsSync(MEMORY_RULES)) {
+      ensureMemoryDir();
+      fs.writeFileSync(MEMORY_RULES, INITIAL_RULES, 'utf8');
+      return INITIAL_RULES;
+    }
+    return fs.readFileSync(MEMORY_RULES, 'utf8');
+  } catch {
+    return null;
+  }
 }
 
 function readMemoryIndex(maxLines) {
   try {
     if (!fs.existsSync(MEMORY_INDEX)) {
-      fs.mkdirSync(MEMORY_DIR, { recursive: true });
+      ensureMemoryDir();
       fs.writeFileSync(MEMORY_INDEX, INITIAL_MEMORY, 'utf8');
       return INITIAL_MEMORY;
     }
@@ -67,18 +99,320 @@ function readMemoryIndex(maxLines) {
   }
 }
 
-function readMemoryRules() {
-  try {
-    if (!fs.existsSync(MEMORY_RULES)) {
-      fs.mkdirSync(MEMORY_DIR, { recursive: true });
-      fs.writeFileSync(MEMORY_RULES, INITIAL_RULES, 'utf8');
-      return INITIAL_RULES;
+// --- Index line parsing ---
+
+// Parses a single index line into parts. Returns null if not a memory entry line.
+// Line format: - [Topic Name](file.md) [pin] YYYY-MM-DD [stale?] -- summary
+function parseIndexLine(line) {
+  const match = line.match(/^(\s*-\s+\[)([^\]]+)(\]\()([^)]+)(\))(.*)/);
+  if (!match) return null;
+  return {
+    prefix: match[1],      // "- ["
+    name: match[2],         // "Topic Name"
+    mid: match[3] + match[4] + match[5], // "](file.md)"
+    filename: match[4],     // "file.md"
+    rest: match[6],         // " [pin] YYYY-MM-DD [stale?] -- summary"
+  };
+}
+
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function daysSince(dateStr) {
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return null;
+  return Math.floor((Date.now() - d.getTime()) / 86400000);
+}
+
+// --- Index maintenance ---
+// Runs after every tool call that mutates MEMORY.md.
+// Handles: orphan removal, duplicate removal, [stale?] stamping/removal.
+// Does NOT run on session load — file only mutated when agent calls a tool.
+
+function maintainIndex(lines, config) {
+  const { staleAfterDays } = config;
+  const seen = new Map(); // filename -> index in lines array (for duplicate detection)
+  const result = [];
+
+  for (const line of lines) {
+    const parsed = parseIndexLine(line);
+    if (!parsed) {
+      result.push(line);
+      continue;
     }
-    return fs.readFileSync(MEMORY_RULES, 'utf8');
-  } catch {
-    return null;
+
+    const { filename, prefix, mid } = parsed;
+    let rest = parsed.rest;
+
+    // Orphan check
+    const fullPath = path.join(MEMORY_DIR, filename);
+    if (!fs.existsSync(fullPath)) {
+      // Remove this line entirely
+      continue;
+    }
+
+    // Duplicate check: keep the one with the more recent date
+    if (seen.has(filename)) {
+      const existingIdx = seen.get(filename);
+      const existingLine = result[existingIdx];
+      const existingDate = (existingLine.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
+      const thisDate = (rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
+      if (thisDate > existingDate) {
+        // Replace the existing one with this one
+        result[existingIdx] = null; // mark for removal
+        seen.set(filename, result.length);
+      } else {
+        // Drop this line
+        continue;
+      }
+    } else {
+      seen.set(filename, result.length);
+    }
+
+    // [stale?] stamping — skip pinned entries
+    const isPinned = rest.includes('[pin]');
+    if (!isPinned && staleAfterDays > 0) {
+      const dateMatch = rest.match(/(\d{4}-\d{2}-\d{2})/);
+      if (dateMatch) {
+        const age = daysSince(dateMatch[1]);
+        if (age !== null && age > staleAfterDays) {
+          // Stamp [stale?] after the date if not already present
+          if (!rest.includes('[stale?]')) {
+            rest = rest.replace(dateMatch[1], dateMatch[1] + ' [stale?]');
+          }
+        } else {
+          // Remove [stale?] if present (self-heal)
+          rest = rest.replace(' [stale?]', '');
+        }
+      }
+    }
+
+    result.push(prefix + parsed.name + mid + rest);
+  }
+
+  // Remove nulls from duplicate elimination
+  return result.filter(l => l !== null);
+}
+
+// --- Shared index search helper ---
+
+function findIndexEntry(lines, search) {
+  const s = search.toLowerCase();
+  for (let i = 0; i < lines.length; i++) {
+    const parsed = parseIndexLine(lines[i]);
+    if (!parsed) continue;
+    if (parsed.name.toLowerCase().includes(s) || parsed.filename.toLowerCase().includes(s))
+      return { idx: i, parsed };
+  }
+  return null;
+}
+
+// --- Slug generation ---
+
+function toSlug(topic) {
+  return topic
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-');
+}
+
+// --- Index upsert ---
+// Finds and updates an existing index line for the given filename, or appends a new one.
+// Returns updated lines array.
+
+function upsertIndexLine(lines, filename, name, summary, pin) {
+  const dateStr = today();
+
+  for (let i = 0; i < lines.length; i++) {
+    const parsed = parseIndexLine(lines[i]);
+    if (!parsed) continue;
+    if (parsed.filename === filename) {
+      const effectivePin = parsed.rest.includes('[pin]') || pin;
+      const pinToken = effectivePin ? ' [pin]' : '';
+      lines[i] = `- [${name}](${filename})${pinToken} ${dateStr} -- ${summary}`;
+      return lines;
+    }
+  }
+
+  // New entry
+  const pinToken = pin ? ' [pin]' : '';
+  lines.push(`- [${name}](${filename})${pinToken} ${dateStr} -- ${summary}`);
+  return lines;
+}
+
+// Simple in-process mutex to prevent concurrent index writes
+let writeLock = false;
+async function withLock(fn) {
+  while (writeLock) {
+    await new Promise(r => setTimeout(r, 10));
+  }
+  writeLock = true;
+  try {
+    return await fn();
+  } finally {
+    writeLock = false;
   }
 }
+
+// --- Tool definitions ---
+
+const tools = {
+  write_memory: {
+    description: 'Write or update a memory topic. Creates a new topic file or appends to an existing one. Updates the MEMORY.md index automatically. Use this instead of raw Write/Edit tools for all memory operations.',
+    args: {
+      topic: z.string().describe('Topic name, e.g. "PostgreSQL Setup" or "Homelab Server"'),
+      content: z.string().describe('The content to write or append to the topic file'),
+      summary: z.string().describe('One-line summary for the MEMORY.md index entry'),
+      pin: z.boolean().default(false).describe('Pin this entry so it is never a cleanup candidate'),
+    },
+    async execute(args) {
+      return withLock(() => {
+        const { topic, content, summary, pin } = args;
+
+        ensureMemoryDir();
+
+        // Read index once — reuse for topic-name lookup and upsert
+        const rawIndex = fs.existsSync(MEMORY_INDEX)
+          ? fs.readFileSync(MEMORY_INDEX, 'utf8')
+          : INITIAL_MEMORY;
+
+        // Check if an existing index entry matches this topic name — use its filename if so
+        let filename = toSlug(topic) + '.md';
+        for (const line of rawIndex.split('\n')) {
+          const parsed = parseIndexLine(line);
+          if (parsed && parsed.name.toLowerCase() === topic.toLowerCase()) {
+            filename = parsed.filename;
+            break;
+          }
+        }
+        const topicPath = path.join(MEMORY_DIR, filename);
+
+        let isNew = false;
+        if (!fs.existsSync(topicPath)) {
+          isNew = true;
+          const frontmatter = `---\nname: ${topic}\ndescription: ${summary}\ncreated: ${today()}\nmetadata:\n  node_type: memory\n---\n\n`;
+          fs.writeFileSync(topicPath, frontmatter + content + '\n', 'utf8');
+        } else {
+          const heading = `\n## ${today()}\n\n`;
+          fs.appendFileSync(topicPath, heading + content + '\n', 'utf8');
+        }
+
+        // Update index
+        let lines = rawIndex.split('\n');
+
+        lines = upsertIndexLine(lines, filename, topic, summary, pin);
+
+        const rules = readMemoryRules();
+        const config = parseConfig(rules);
+        lines = maintainIndex(lines, config);
+
+        fs.writeFileSync(MEMORY_INDEX, lines.join('\n'), 'utf8');
+
+        return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${MEMORY_INDEX}\nEntry: [${topic}](${filename}) ${today()} -- ${summary}`;
+      });
+    },
+  },
+
+  remove_memory: {
+    description: 'Remove a topic entry from the MEMORY.md index. The topic file on disk is preserved. Pinned entries cannot be removed.',
+    args: {
+      topic: z.string().describe('Topic name or partial filename to search for (case-insensitive)'),
+    },
+    async execute(args) {
+      return withLock(() => {
+        const { topic } = args;
+        const search = topic.toLowerCase();
+
+        if (!fs.existsSync(MEMORY_INDEX)) {
+          return 'No memory index found.';
+        }
+
+        const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
+        const lines = raw.split('\n');
+
+        const found = findIndexEntry(lines, search);
+        if (!found) {
+          return `No matching entry found for "${topic}".`;
+        }
+        const { idx: foundIdx, parsed } = found;
+
+        if (parsed.rest.includes('[pin]')) {
+          return `Entry is pinned and cannot be removed. Use pin_memory with pin: false to unpin it first.`;
+        }
+
+        const removedLine = lines[foundIdx];
+        lines.splice(foundIdx, 1);
+
+        const rules = readMemoryRules();
+        const config = parseConfig(rules);
+        const maintained = maintainIndex(lines, config);
+
+        fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
+
+        const topicFile = path.join(MEMORY_DIR, parsed.filename);
+        const fileNote = fs.existsSync(topicFile)
+          ? `Topic file ${parsed.filename} still exists on disk.`
+          : `Topic file ${parsed.filename} was not found on disk.`;
+
+        return `Index entry removed: ${removedLine.trim()}\n${fileNote}`;
+      });
+    },
+  },
+
+  pin_memory: {
+    description: 'Pin or unpin a memory index entry. Pinned entries are never flagged as stale and cannot be removed.',
+    args: {
+      topic: z.string().describe('Topic name or partial filename to search for (case-insensitive)'),
+      pin: z.boolean().describe('true to pin, false to unpin'),
+    },
+    async execute(args) {
+      return withLock(() => {
+        const { topic, pin } = args;
+        const search = topic.toLowerCase();
+
+        if (!fs.existsSync(MEMORY_INDEX)) {
+          return 'No memory index found.';
+        }
+
+        const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
+        const lines = raw.split('\n');
+
+        const found = findIndexEntry(lines, search);
+        if (!found) {
+          return `No matching entry found for "${topic}".`;
+        }
+        const { idx: foundIdx, parsed } = found;
+
+        const line = lines[foundIdx];
+        const alreadyPinned = parsed.rest.includes('[pin]');
+
+        if (pin && alreadyPinned) return `Already pinned: ${line.trim()}`;
+        if (!pin && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
+
+        const newRest = pin
+          ? ' [pin]' + parsed.rest
+          : parsed.rest.replace(/\s*\[pin\]/, '');
+
+        const before = line.trim();
+        lines[foundIdx] = parsed.prefix + parsed.name + parsed.mid + newRest;
+        const after = lines[foundIdx].trim();
+
+        const rules = readMemoryRules();
+        const config = parseConfig(rules);
+        const maintained = maintainIndex(lines, config);
+
+        fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
+
+        return `${pin ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
+      });
+    },
+  },
+};
+
+// --- Plugin export ---
 
 export default async ({ client } = {}) => {
   const skillsDir = new URL('../../skills', import.meta.url).pathname;
@@ -95,7 +429,7 @@ export default async ({ client } = {}) => {
       // Register /memory command
       if (!config.command) config.command = {};
       config.command['memory'] = {
-        description: '/memory → show index | /memory <text> → store | /memory pin <topic> → pin | /memory remove <topic> → remove entry',
+        description: '/memory → show index | /memory <text> → store | /memory pin <topic> → pin | /memory unpin <topic> → unpin | /memory remove <topic> → remove entry',
         template: `Memory dir: ${MEMORY_DIR}
 Memory index: ${MEMORY_INDEX}
 
@@ -103,64 +437,45 @@ Arguments: $ARGUMENTS
 
 ## No arguments: show index
 
-Read and display ${MEMORY_INDEX}. For each entry, show whether it is pinned ([pin]) or not. List all .md files in ${MEMORY_DIR}. Do not write anything.
+Read ${MEMORY_INDEX}. Display each entry as a table with columns: Topic (name only — no markdown links, no filenames), Date, Pinned (yes/no), Stale (yes/no). List all .md files in ${MEMORY_DIR}. Do not write anything.
 
 After listing, append this legend:
-Tip: /memory <text> to store  |  /memory pin <topic> to pin  |  /memory remove <topic> to remove
+Tip: /memory <text> to store  |  /memory pin <topic> to pin  |  /memory unpin <topic> to unpin  |  /memory remove <topic> to remove
 
 ## Arguments start with "remove ": remove an index entry
 
-The text after "remove " is the topic to find. Steps:
-1. Read ${MEMORY_INDEX}.
-2. Find the index line whose topic name or filename contains the search text (case-insensitive).
-3. If no match found: report "no matching entry found" and stop.
-4. If the entry has [pin]: refuse removal and report "entry is pinned; unpin it first by editing MEMORY.md directly". Stop.
-5. Remove that line from ${MEMORY_INDEX}. Do not delete the topic file.
-6. Check if a topic file for this entry exists in ${MEMORY_DIR}. If it does, note it in the confirmation: "Index entry removed. Topic file <filename> still exists on disk."
-7. Confirm: which entry was removed.
+The text after "remove " is the topic to find. Call the remove_memory tool:
+  remove_memory({ topic: "<the text after 'remove '>" })
+
+The tool will refuse if the entry is pinned and report the reason.
 
 ## Arguments start with "pin ": pin an entry
 
-The text after "pin " is the topic to find. Steps:
-1. Read ${MEMORY_INDEX}.
-2. Find the index line whose topic name or filename contains the search text (case-insensitive).
-3. If no match found: report "no matching entry found" and stop.
-4. If already pinned: report "already pinned" and stop.
-5. Insert [pin] immediately after the closing ] of the filename link, before any date or --. Do not change any other part of the line.
-   Examples:
-   Before: - [Homelab Server](homelab-server.md) 2026-07-20 -- Intel i5...
-   After:  - [Homelab Server](homelab-server.md) [pin] 2026-07-20 -- Intel i5...
+The text after "pin " is the topic to find. Call the pin_memory tool:
+  pin_memory({ topic: "<the text after 'pin '>", pin: true })
 
-   Before: - [Some Topic](some-topic.md) -- summary text
-   After:  - [Some Topic](some-topic.md) [pin] 2026-07-21 -- summary text
-6. Write the updated line back to ${MEMORY_INDEX}.
-7. Confirm: which entry was pinned.
+## Arguments start with "unpin ": unpin an entry
 
-## Arguments provided (not starting with "pin " or "remove "): store a memory
+The text after "unpin " is the topic to find. Call the pin_memory tool:
+  pin_memory({ topic: "<the text after 'unpin '>", pin: false })
 
-Treat arguments as a fact or note to persist. Steps:
-1. Decide whether it belongs in an existing topic file or warrants a new one.
-2. Write to the appropriate topic file in ${MEMORY_DIR}.
-3. Update the index entry in ${MEMORY_INDEX}. Set last_updated to today's date (YYYY-MM-DD). Preserve [pin] if present. Preserve the -- summary. Do not change any other part of the line.
-   Examples of the index entry update:
-   Before: - [Topic](file.md) -- summary
-   After:  - [Topic](file.md) 2026-07-21 -- summary
+## Arguments provided (not starting with "pin ", "unpin ", or "remove "): store a memory
 
-   Before: - [Topic](file.md) [pin] 2026-06-01 -- summary
-   After:  - [Topic](file.md) [pin] 2026-07-21 -- summary
+Treat the arguments as a fact or note to persist. Decide the topic, a slug filename, a one-line summary, and whether the topic is permanent (hardware, user identity, core workflows = pin it). Then call the write_memory tool:
+  write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false> })
 
-   Full format for a new entry: - [Name](file.md) [pin] YYYY-MM-DD -- summary  (omit [pin] if not permanent)
-4. If a new topic file was created, add a new index line with today's date. Add [pin] if the topic is clearly permanent (hardware, user identity, core workflows).
-5. Confirm: what was stored, which file, whether MEMORY.md was updated.
+The tool creates a new topic file or appends to an existing one, and updates the MEMORY.md index automatically.
 
-Any text including single words is treated literally as content to store. Do not interpret "show", "list", or similar words as subcommands unless the full argument starts with "pin " or "remove ".`
+Any text including single words is treated literally as content to store. Do not interpret "show", "list", or similar words as subcommands unless the full argument starts with "pin ", "unpin ", or "remove ".`,
       };
     },
 
+    tool: tools,
+
     'experimental.chat.system.transform': async (_input, output) => {
       const rules = readMemoryRules();
-      const maxLines = parseMaxLines(rules);
-      const content = readMemoryIndex(maxLines);
+      const config = parseConfig(rules);
+      const content = readMemoryIndex(config.maxLines);
 
       if (content) {
         output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${MEMORY_DIR}\n\n${content}`);
