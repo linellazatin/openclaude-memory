@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - FIRST BETA RELEASE + README - 2026-07-27
+
+### Changed
+
+- updated README to remove 'On-going' work that has been completed (localizing logic) (my bad on forgetting to update/remove the Updates section)
+
 ## [0.1.0] - FIRST BETA RELEASE - 2026-07-27
 
 ### Added
