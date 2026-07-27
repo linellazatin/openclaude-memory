@@ -5,11 +5,6 @@
 
 Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
-## Updates
-
-- On-going work with 'localizing' logic from 'model-based' to 'plugin-based', getting closer towards my main goal (still learning the ropes on memory-handling); this should be a pretty 'major' release once done.
-- On-going local LLM (very simple) test and benchmarks for instruction following - using my own 'mid-tier gaming' hardware (AMD, no ROCm, plain Vulkan by llama.cpp) - not really related with this project, but worth mentioning. Will be creating a separate 'doc' for those kinds of stuff.
-
 ## Why
 
 I built this because I genuinely like how Claude Code handles memory: no complex algorithms, no external LLM for heavy lifting, no vector databases. It just works — the agent reads a markdown file and acts on it. Simple, transparent, effective.
@@ -154,6 +149,7 @@ The cap exists to keep per-turn token overhead bounded. At the default 200 lines
 
 ```
 openclaude-memory/
+├── CHANGELOG.md                        # release history
 ├── package.json                        # npm package manifest
 ├── .opencode/
 │   ├── plugins/ocl-memory.mjs          # plugin entry point — tools, system prompt injection
@@ -179,7 +175,7 @@ openclaude-memory/
 - Auto-creation of `MEMORY.md` and `RULES.md` on first run
 - Cap handling with truncation warning when index exceeds configured limit (default 200 lines) or 25 KB
 - Configurable `max_lines` and `stale_after_days` via `## Config` section in `RULES.md`
-- Index metadata: `[pin]` flag, `last_updated` date, `[stale?]` staleness flag per entry
+- Index metadata: `[pin]` flag, `YYYY-MM-DD` date, `[stale?]` staleness flag per entry
 - Index maintenance: orphan removal, duplicate removal, staleness flagging on tool calls
 
 **Out of scope:**
@@ -256,7 +252,7 @@ Where a feature is backed by a plugin tool, the tool guarantees correct format a
 | `/memory <text>` store via `write_memory` | Reliable | Reliable | Reliable |
 | `/memory pin/unpin <topic>` via `pin_memory` | Reliable | Reliable | Reliable |
 | `/memory remove <topic>` via `remove_memory` | Reliable | Reliable | Reliable |
-| Auto-trigger writes (AGENTS.md rules) | Reliable | Usually works | Best-effort |
+| Auto-trigger writes (persist rules) | Reliable | Usually works | Best-effort |
 | Topic/summary quality on auto-writes | Reliable | Usually works | Best-effort |
 | Date stamping on auto-writes | Plugin-guaranteed | Plugin-guaranteed | Plugin-guaranteed |
 | `[pin]` on auto-writes (arg passed correctly) | Reliable | Usually works | Best-effort; verify with `/memory` after |
