@@ -259,9 +259,9 @@ As of v0.2.0, two complementary optimizations apply:
   - Every `inject_every_n_turns` turns thereafter (default: 5 — so turns 1, 6, 11, 16...)
   - Any turn immediately following a memory tool mutation (`write_memory`, `remove_memory`, `pin_memory`)
 
-All other turns receive no injection. Users can tune `inject_every_n_turns` in `RULES.md` — lower values (e.g. `2`) keep memory more continuously visible at higher token cost; higher values (e.g. `10`) maximize savings at the cost of less frequent refreshes.
+All other turns receive no injection. Users can tune `inject_every_n_turns` in `RULES.md` — lower values (e.g. `2`) keep memory more continuously visible at higher token cost; higher values (e.g. `10`) maximize savings at the cost of less frequent refreshes. In addition to this, the tool injects current `MEMORY.md` and `RULES.md` content into the compaction context so memory survives context compression cleanly.
 
-**Savings per session — default interval of 5 (typical 10–30 entry index, ~300–700 tokens/injection):**
+**Savings per session — default interval of 5 (typical 10–30 entry index, ~300–700 tokens/injection, your mileage may vary):**
 
 | Session | Turns | Tool calls | Injections (before) | Injections (after, N=5) | Tokens saved (est.) |
 |---|---|---|---|---|---|
@@ -293,7 +293,7 @@ As of mid-2026, capable tool-calling models exist at every size tier. The bounda
 
 Where a feature is backed by a plugin tool, the tool guarantees correct format and index integrity regardless of model tier — only the model's decision to call the tool (and what args to pass) varies.
 
-| Feature | Large (20B+, e.g. Qwen3.6-27B, Mistral Small 3.1 24B) | Mid (7–13B, e.g. Qwen3-8B, Gemma 4 12B, Llama 3.2 8B) | Compact (<7B, e.g. Qwen3-4B, Gemma 4 E4B, Nanbeige4.1-3B) |
+| Feature | Large (20B+, e.g. Qwen3.6-27B, Mistral Small 3.1 24B) | Small-Mid (>7B <20B, e.g. Qwen3-8B, Gemma 4 12B, Llama 3.2 8B) | Compact (<7B, e.g. Qwen3-4B, Gemma 4 E4B, Nanbeige4.1-3B) |
 |---|---|---|---|
 | `/memory` show index | Reliable | Reliable | Reliable |
 | `/memory <text>` store via `write_memory` | Reliable | Reliable | Reliable |
@@ -310,8 +310,8 @@ Where a feature is backed by a plugin tool, the tool guarantees correct format a
 | Tier | Examples | Context | Tool calling |
 |---|---|---|---|
 | Large (20B+) | Qwen3.6-27B, Mistral Small 3.1 24B, Devstral 24B, Gemma 4 31B | 128K–256K | Native |
-| Mid (7–13B) | Qwen3-8B, Gemma 4 12B, GLM-4-9B, Llama 3.2 8B | 128K–256K | Native |
-| Compact (<7B) | Qwen3-4B, Qwen3-1.7B, Gemma 4 E4B (4.5B), Nanbeige4.1-3B, Llama 3.2 3B | 128K–256K | Native |
+| Small-Mid (>7B <20B) | Qwen3-8B, Gemma 4 12B, GLM-4-9B, Llama 3.2 8B | 128K–256K | Native |
+| Compact (<7B) | Qwen3-4B, Qwen3.1-7B, Gemma 4 E4B (4.5B), Nanbeige4.1-3B, Llama 3.2 3B | 128K–256K | Native |
 | Edge/on-device | Gemma 4 E2B (2.3B, 0.8GB mobile), Qwen3-0.6B, LittleLamb 0.3B | 128K | Native |
 
 **Mitigations already in place:**
@@ -320,7 +320,7 @@ Where a feature is backed by a plugin tool, the tool guarantees correct format a
 - `[stale?]` flagging and orphan/duplicate cleanup run entirely in the plugin
 - `/memory pin`, `/memory unpin`, and `/memory remove` are single structured tool calls — reliable even on compact and edge models
 
-If you are using an older model (pre-2024), `/memory <text>` explicit commands will always be more reliable than auto-trigger writes.
+If you are using an older model, compact, or edge models, `/memory <text>` explicit commands will always be more reliable than auto-trigger writes.
 
 ## License
 
