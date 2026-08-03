@@ -13,6 +13,7 @@ const MEMORY_RULES = path.join(MEMORY_DIR, 'RULES.md');
 const MAX_LINES = 200;
 const MAX_BYTES = 25 * 1024;
 const DEFAULT_STALE_DAYS = 180;
+const DEFAULT_INJECT_INTERVAL = 5;
 
 const INITIAL_MEMORY = `# Memory Index
 
@@ -39,12 +40,43 @@ const INITIAL_RULES = `# Memory Rules
 ## Config
 # max_lines: 200         (default; valid range 50–500)
 # stale_after_days: 180  (default; 0 = disable age flagging)
+# inject_every_n_turns: 5  (default; re-inject memory index every N turns; 1 = every turn)
 `;
+
+// --- In-process cache ---
+// Loaded once per session (or after any tool mutation / compaction).
+// Avoids re-reading RULES.md and MEMORY.md on every turn.
+// Caveat: manual edits to RULES.md or MEMORY.md between turns are not
+// reflected until the next tool call or compaction event.
+let _cache = null;
+
+// Injection state — controls whether system.transform injects memory this turn.
+// _injectedOnce: false until first injection; reset to false after compaction.
+// _dirty: set to true by tool.execute.after when a memory tool mutates MEMORY.md;
+//         cleared after system.transform injects the updated content.
+// _turnCount: incremented each turn; used to enforce the inject_every_n_turns interval.
+let _injectedOnce = false;
+let _dirty = false;
+let _turnCount = 0;
+
+function getCache(forceRefresh = false) {
+  if (!_cache || forceRefresh) {
+    const rules = readMemoryRules();
+    const config = parseConfig(rules);
+    const content = readMemoryIndex(config.maxLines);
+    _cache = { rules, config, content };
+  }
+  return _cache;
+}
+
+function invalidateCache() {
+  _cache = null;
+}
 
 // --- Config parsing ---
 
 function parseConfig(rulesContent) {
-  const config = { maxLines: MAX_LINES, staleAfterDays: DEFAULT_STALE_DAYS };
+  const config = { maxLines: MAX_LINES, staleAfterDays: DEFAULT_STALE_DAYS, injectEveryNTurns: DEFAULT_INJECT_INTERVAL };
   if (!rulesContent) return config;
 
   const maxMatch = rulesContent.match(/^\s*max_lines:\s*(\d+)\s*$/m);
@@ -56,6 +88,11 @@ function parseConfig(rulesContent) {
   const staleMatch = rulesContent.match(/^\s*stale_after_days:\s*(\d+)\s*$/m);
   if (staleMatch) {
     config.staleAfterDays = Math.max(0, parseInt(staleMatch[1], 10));
+  }
+
+  const injectMatch = rulesContent.match(/^\s*inject_every_n_turns:\s*(\d+)\s*$/m);
+  if (injectMatch) {
+    config.injectEveryNTurns = Math.max(1, parseInt(injectMatch[1], 10));
   }
 
   return config;
@@ -305,11 +342,11 @@ const tools = {
 
         lines = upsertIndexLine(lines, filename, topic, summary, pin);
 
-        const rules = readMemoryRules();
-        const config = parseConfig(rules);
+        const { config } = getCache();
         lines = maintainIndex(lines, config);
 
         fs.writeFileSync(MEMORY_INDEX, lines.join('\n'), 'utf8');
+        invalidateCache();
 
         return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${MEMORY_INDEX}\nEntry: [${topic}](${filename}) ${today()} -- ${summary}`;
       });
@@ -346,11 +383,11 @@ const tools = {
         const removedLine = lines[foundIdx];
         lines.splice(foundIdx, 1);
 
-        const rules = readMemoryRules();
-        const config = parseConfig(rules);
+        const { config } = getCache();
         const maintained = maintainIndex(lines, config);
 
         fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
+        invalidateCache();
 
         const topicFile = path.join(MEMORY_DIR, parsed.filename);
         const fileNote = fs.existsSync(topicFile)
@@ -400,11 +437,11 @@ const tools = {
         lines[foundIdx] = parsed.prefix + parsed.name + parsed.mid + newRest;
         const after = lines[foundIdx].trim();
 
-        const rules = readMemoryRules();
-        const config = parseConfig(rules);
+        const { config } = getCache();
         const maintained = maintainIndex(lines, config);
 
         fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
+        invalidateCache();
 
         return `${pin ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
       });
@@ -472,18 +509,56 @@ Any text including single words is treated literally as content to store. Do not
 
     tool: tools,
 
+    // Set _dirty when a memory tool mutates MEMORY.md so system.transform
+    // knows to re-inject the updated index on the next turn.
+    'tool.execute.after': async (input, _output) => {
+      const memoryTools = new Set(['write_memory', 'remove_memory', 'pin_memory']);
+      if (memoryTools.has(input.tool)) {
+        _dirty = true;
+      }
+    },
+
+    // Inject memory into system prompt on:
+    //   1. First turn of the session (_injectedOnce === false)
+    //   2. Any turn following a memory tool mutation (_dirty === true)
+    //   3. Every N turns per inject_every_n_turns config (default: 5)
+    // All other turns skip injection, saving tokens while keeping memory salient.
     'experimental.chat.system.transform': async (_input, output) => {
-      const rules = readMemoryRules();
-      const config = parseConfig(rules);
-      const content = readMemoryIndex(config.maxLines);
+      _turnCount++;
+      const { rules, content, config } = getCache();
+      const shouldInject = !_injectedOnce || _dirty || (_turnCount % config.injectEveryNTurns === 0);
+
+      if (shouldInject) {
+        if (content) {
+          output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${MEMORY_DIR}\n\n${content}`);
+        }
+
+        if (rules) {
+          output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_RULES} to customise.\n\n${rules}`);
+        }
+
+        _injectedOnce = true;
+        _dirty = false;
+      }
+    },
+
+    'experimental.session.compacting': async (_input, output) => {
+      // Force a fresh read so the compaction prompt gets up-to-date memory state.
+      const { rules, content } = getCache(true);
 
       if (content) {
-        output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${MEMORY_DIR}\n\n${content}`);
+        output.context.push(`## Global Memory (current index)\n\n${content}`);
       }
 
       if (rules) {
-        output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_RULES} to customise.\n\n${rules}`);
+        output.context.push(`## Memory Rules\n\n${rules}`);
       }
+
+      // Reset so the first turn after compaction re-injects memory into the
+      // system prompt — the agent's context window was just replaced.
+      _injectedOnce = false;
+      _dirty = false;
+      _turnCount = 0;
     },
   };
 };
