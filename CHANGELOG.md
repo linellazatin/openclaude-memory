@@ -18,6 +18,7 @@ All notable changes to this project will be documented in this file.
 - `maintainIndex` calls inside tools now use the cached config instead of re-reading `RULES.md`
 - `experimental.session.compacting` forces a fresh disk read (`forceRefresh`) and resets `_injectedOnce`, `_dirty`, and `_turnCount` so the first turn after compaction re-injects memory
 - `parseConfig()` now parses `inject_every_n_turns` in addition to `max_lines` and `stale_after_days`
+- `README` update: new section `Disk I/O and injection overhead`, and subsection `Representative models by tier`; updated `Model compatibility`
 
 ### Known limitation
 
