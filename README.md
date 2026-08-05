@@ -42,12 +42,15 @@ Just files, structure, and an agent that knows where to look.
 
 ## How it works
 
-1. **Injection**: On every turn, the plugin reads `~/.config/opencode/memory/MEMORY.md` and injects its contents into the system prompt under a `## Global Memory` header.
+1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `RULES.md` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection then repeats every `inject_every_n_turns` turns (default: 5) and immediately after any memory tool mutation, keeping memory salient without paying the token cost every turn.
 2. **Topic files**: `MEMORY.md` is a concise index (one line per topic). Detail lives in separate topic files (`~/.config/opencode/memory/<topic>.md`), loaded on-demand by the agent when it needs more context.
-3. **Native tools**: The plugin registers `write_memory`, `remove_memory`, and `pin_memory` tools. The agent calls these instead of raw file operations — the plugin guarantees consistent format, frontmatter, and index maintenance every time.
+3. **Native tools**: The plugin registers `write_memory`, `remove_memory`, and `pin_memory` tools. The agent calls these instead of raw file operations — the plugin guarantees consistent format, frontmatter, and index maintenance every time. After each tool call the cache is invalidated and a dirty flag is set, so the next turn re-injects the updated index.
 4. **Auto-writes**: The agent writes to memory automatically when it solves issues, discovers infrastructure, identifies reusable commands, or learns hardware/model facts — no prompting needed. Reliability varies by model; see [Model compatibility](#model-compatibility).
 5. **Manual control**: Use `/memory` to view the current index, `/memory <text>` to store a fact immediately, `/memory pin <topic>` to pin an entry, `/memory unpin <topic>` to unpin, or `/memory remove <topic>` to remove one.
-6. **Bootstrap**: On first run, the plugin creates `MEMORY.md` and `RULES.md` automatically. Nothing to set up.
+6. **Compaction**: When context compression runs, the plugin forces a fresh disk read and injects the current memory state into the compaction context, ensuring memory survives the compaction cleanly. The injection counter is also reset so the first turn after compaction re-injects the index.
+7. **Bootstrap**: On first run, the plugin creates `MEMORY.md` and `RULES.md` automatically. Nothing to set up.
+
+> **Note:** If you edit `MEMORY.md` or `RULES.md` manually between turns, the change will not be reflected until the next tool call, the next periodic re-injection turn, or a compaction event. This is an intentional trade-off to avoid per-turn disk reads.
 
 ## Native tools
 
@@ -81,13 +84,16 @@ After every tool call that touches `MEMORY.md`, the plugin runs an index mainten
 - Personal data
 
 ## Config
-# max_lines: 200         (default; valid range 50–500)
-# stale_after_days: 180  (default; 0 = disable age flagging)
+# max_lines: 200           (default; valid range 50–500)
+# stale_after_days: 180    (default; 0 = disable age flagging)
+# inject_every_n_turns: 5  (default; minimum 1; re-inject memory index every N turns)
 ```
 
 Uncomment and change `max_lines` to set a custom index size limit. The plugin clamps values to the valid range `[50, 500]`. If the line is absent or commented, the default of 200 is used.
 
 Uncomment and change `stale_after_days` to control when entries are flagged as stale. Set to `0` to disable age flagging entirely.
+
+Uncomment and change `inject_every_n_turns` to tune how often the memory index is re-injected into the system prompt. The default of `5` means the index appears on turn 1, turn 6, turn 11, and so on — plus immediately after any memory tool call. Set to `1` to restore every-turn injection (original behavior). Higher values save more tokens on long sessions; lower values keep memory more continuously visible. The minimum is `1`.
 
 The plugin injects this file into every session's system prompt under a `## Memory Rules` header. RULES.md is the single source of truth for persist rules — no other configuration needed.
 
@@ -160,7 +166,7 @@ openclaude-memory/
 
 | File | Role |
 |---|---|
-| `ocl-memory.mjs` | Reads `MEMORY.md` on every turn, injects into system prompt. Registers `write_memory`, `remove_memory`, `pin_memory` tools. Runs index maintenance (orphan removal, duplicate removal, `[stale?]` stamping) after every tool call. Auto-creates files on first run. Caps injection at configured lines / 25 KB. |
+| `ocl-memory.mjs` | Loads `MEMORY.md` and `RULES.md` into an in-process cache on first turn; injects into system prompt. Re-injects only when a memory tool mutated the index since the last turn. Invalidates cache and sets dirty flag after every tool call. Forces fresh read and resets injection state on compaction. Registers `write_memory`, `remove_memory`, `pin_memory` tools. Runs index maintenance (orphan removal, duplicate removal, `[stale?]` stamping) after every tool call. Auto-creates files on first run. Caps injection at configured lines / 25 KB. |
 | `memory.md` (command) | `/memory` shows the index. `/memory <text>` stores a fact via `write_memory`. `/memory pin <topic>` pins via `pin_memory`. `/memory unpin <topic>` unpins. `/memory remove <topic>` removes via `remove_memory`. |
 | `SKILL.md` | Loaded on-demand by the agent — full instructions for memory tools, format, index discipline, staleness handling, and cap remediation. |
 
@@ -169,7 +175,7 @@ openclaude-memory/
 **In scope:**
 
 - Flat markdown persistence (`MEMORY.md` + topic files)
-- System prompt injection every session turn
+- System prompt injection on first turn and after memory tool mutations only (not every turn)
 - Native plugin tools for write, remove, and pin operations
 - Automatic writes triggered by agent activity (issues solved, infra discovered, commands identified, hardware/model facts)
 - Manual `/memory` command for show, explicit storage, pin, unpin, and remove
@@ -227,10 +233,10 @@ opencode may create one or both directories depending on how the specifier was r
 
 ## Token overhead
 
-The plugin injects the `MEMORY.md` index into the system prompt on every turn. Cost scales with index size:
+The plugin injects the `MEMORY.md` index and `RULES.md` into the system prompt on the first turn of each session, and again only when a memory tool mutated the index since the last turn. All other turns receive no injection. Cost scales with index size, but only pays on turns where injection actually occurs:
 
 
-| State                                          | Est. tokens / turn |
+| State                                          | Est. tokens / injection |
 | ------------------------------------------------ | -------------------- |
 | Fresh install (empty index, default RULES.md)  | ~120               |
 | Typical use (10–30 entries, default RULES.md) | ~300–700          |
@@ -240,35 +246,81 @@ The plugin injects the `MEMORY.md` index into the system prompt on every turn. C
 
 Estimates based on [Claude's tokenizer](https://www.claudetokenizer.com/) averaging 3.5–4 characters per token for markdown prose. Topic files are **not** injected — only the index line — so even a large memory store stays cheap until the index itself grows large.
 
-For reference, Claude Sonnet's context window is ~200K tokens. Worst-case overhead from this plugin is ~3% of that.
+## Disk I/O and injection overhead
+
+Prior to v0.2.0, the plugin read `MEMORY.md` and `RULES.md` from disk on **every turn** and injected both into every system prompt.
+
+As of v0.2.0, two complementary optimizations apply:
+
+**1. Disk reads** — both files are loaded once into an in-process cache on first use. The cache is invalidated only when a tool call mutates `MEMORY.md`. A forced fresh read is performed before compaction.
+
+**2. Token injection** — `MEMORY.md` and `RULES.md` are injected into the system prompt on:
+  - Turn 1 (session start)
+  - Every `inject_every_n_turns` turns thereafter (default: 5 — so turns 1, 6, 11, 16...)
+  - Any turn immediately following a memory tool mutation (`write_memory`, `remove_memory`, `pin_memory`)
+
+All other turns receive no injection. Users can tune `inject_every_n_turns` in `RULES.md` — lower values (e.g. `2`) keep memory more continuously visible at higher token cost; higher values (e.g. `10`) maximize savings at the cost of less frequent refreshes. In addition to this, the tool injects current `MEMORY.md` and `RULES.md` content into the compaction context so memory survives context compression cleanly.
+
+**Savings per session — default interval of 5 (typical 10–30 entry index, ~300–700 tokens/injection, your mileage may vary):**
+
+| Session | Turns | Tool calls | Injections (before) | Injections (after, N=5) | Tokens saved (est.) |
+|---|---|---|---|---|---|
+| Read-heavy, 0 writes | 20 | 0 | 20 | 5 | ~4,500–10,500 (75%) |
+| Typical, 3 writes | 20 | 3 | 20 | ~7 | ~3,900–9,100 (65%) |
+| Write-heavy, 10 writes | 30 | 10 | 30 | ~15 | ~4,500–10,500 (50%) |
+| Long session, 5 writes | 100 | 5 | 100 | ~25 | ~22,500–52,500 (75%) |
+
+Injection count formula (default N=5): `ceil(turns / 5) + tool_calls_on_non-interval_turns`. Before: `1 × turns`.
+
+Disk read formula: `reads = 2 (cold load) + 2 × tool_calls`. Before: `2 × turns`.
+
+**Savings at other interval settings (20-turn read-heavy session, 0 writes):**
+
+| `inject_every_n_turns` | Injections | Tokens saved vs every-turn (est.) |
+|---|---|---|
+| `1` (every turn — original behavior) | 20 | 0% |
+| `3` | 7 | ~65% |
+| `5` (default) | 5 | ~75% |
+| `10` | 2 | ~90% |
+
+Savings are most pronounced in long read-heavy sessions (debugging, exploration, code review) where the agent rarely writes to memory but turns are numerous. For write-heavy sessions the interval matters less since tool mutations trigger injection regardless.
 
 ## Model compatibility
 
 The plugin injects plain markdown into the system prompt and registers structured tools — no model-specific features required. Tool calls are more reliable than free-form write instructions, especially on smaller models.
 
-Modern instruction-tuned models — including compact ones in the 4–9B range — handle all core features well. The table below reflects 2026-era model quality; results from older or poorly instruction-tuned models may vary.
+As of mid-2026, capable tool-calling models exist at every size tier. The boundaries that previously separated "small" from "capable" have largely collapsed: Qwen3-8B carries a 131K context window and native tool calling; Gemma 4 E2B (2.3B effective) runs on a phone and still supports native function calling; Nanbeige4.1-3B sustains up to 600 tool-call turns on a 256K context. The tier labels below reflect operational reliability on this plugin's specific workload — structured tool calls against a markdown index — not general model capability.
 
 Where a feature is backed by a plugin tool, the tool guarantees correct format and index integrity regardless of model tier — only the model's decision to call the tool (and what args to pass) varies.
 
-| Feature | Upper mid to large (14B+) | Mid-range (7–13B, well instruction-tuned) | Compact (<7B, modern) |
+| Feature | Large (20B+, e.g. Qwen3.6-27B, Mistral Small 3.1 24B) | Small-Mid (>7B <20B, e.g. Qwen3-8B, Gemma 4 12B, Llama 3.2 8B) | Compact (<7B, e.g. Qwen3-4B, Gemma 4 E4B, Nanbeige4.1-3B) |
 |---|---|---|---|
 | `/memory` show index | Reliable | Reliable | Reliable |
 | `/memory <text>` store via `write_memory` | Reliable | Reliable | Reliable |
 | `/memory pin/unpin <topic>` via `pin_memory` | Reliable | Reliable | Reliable |
 | `/memory remove <topic>` via `remove_memory` | Reliable | Reliable | Reliable |
-| Auto-trigger writes (persist rules) | Reliable | Usually works | Best-effort |
-| Topic/summary quality on auto-writes | Reliable | Usually works | Best-effort |
+| Auto-trigger writes (persist rules) | Reliable | Reliable | Usually works |
+| Topic/summary quality on auto-writes | Reliable | Reliable | Usually works |
 | Date stamping on auto-writes | Plugin-guaranteed | Plugin-guaranteed | Plugin-guaranteed |
-| `[pin]` on auto-writes (arg passed correctly) | Reliable | Usually works | Best-effort; verify with `/memory` after |
+| `[pin]` on auto-writes (arg passed correctly) | Reliable | Reliable | Usually works; verify with `/memory` after |
 | `[stale?]` flagging and self-healing | Plugin-guaranteed | Plugin-guaranteed | Plugin-guaranteed |
+
+**Representative models by tier (mid-2026):**
+
+| Tier | Examples | Context | Tool calling |
+|---|---|---|---|
+| Large (20B+) | Qwen3.6-27B, Mistral Small 3.1 24B, Devstral 24B, Gemma 4 31B | 128K–256K | Native |
+| Small-Mid (>7B <20B) | Qwen3-8B, Gemma 4 12B, GLM-4-9B, Llama 3.2 8B | 128K–256K | Native |
+| Compact (<7B) | Qwen3-4B, Qwen3.1-7B, Gemma 4 E4B (4.5B), Nanbeige4.1-3B, Llama 3.2 3B | 128K–256K | Native |
+| Edge/on-device | Gemma 4 E2B (2.3B, 0.8GB mobile), Qwen3-0.6B, LittleLamb 0.3B | 128K | Native |
 
 **Mitigations already in place:**
 - Structured tool calls replace free-form write instructions — format, frontmatter, and index integrity are guaranteed by the plugin
 - Date stamping is handled by the plugin, not the model — no model tier can get it wrong
 - `[stale?]` flagging and orphan/duplicate cleanup run entirely in the plugin
-- `/memory pin`, `/memory unpin`, and `/memory remove` are single structured tool calls — reliable even on compact models
+- `/memory pin`, `/memory unpin`, and `/memory remove` are single structured tool calls — reliable even on compact and edge models
 
-If you are using an older or lightly instruction-tuned model, `/memory <text>` explicit commands will always be more reliable than auto-trigger writes.
+If you are using an older model, compact, or edge models, `/memory <text>` explicit commands will always be more reliable than auto-trigger writes.
 
 ## License
 

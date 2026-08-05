@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-08-05
+
+### Added
+
+- `experimental.session.compacting` hook: injects current `MEMORY.md` and `RULES.md` content into the compaction context so memory survives context compression cleanly
+- `tool.execute.after` hook: sets `_dirty = true` when `write_memory`, `remove_memory`, or `pin_memory` completes, signalling that the index has changed
+- Conditional system prompt injection: `MEMORY.md` and `RULES.md` are now injected on the first turn, after any memory tool mutation, and every `inject_every_n_turns` turns (default: 5). All other turns skip injection, saving tokens on long sessions while keeping memory salient.
+- `inject_every_n_turns` config in `RULES.md` `## Config` section (default 5; minimum 1): controls the periodic re-injection interval. Set to `1` to restore every-turn injection.
+
+### Changed
+
+- `MEMORY.md` and `RULES.md` are no longer read from disk on every turn. They are loaded once per session into an in-process cache and invalidated after any tool call that mutates `MEMORY.md` (`write_memory`, `remove_memory`, `pin_memory`). Cache is process-global; safe for single-user plugin (upgrade path: per-session Map if multi-session needed).
+- `system.transform` hook reads from the cache and injects only when `_injectedOnce === false`, `_dirty === true`, or `_turnCount % injectEveryNTurns === 0`
+- `maintainIndex` calls inside tools now use the cached config instead of re-reading `RULES.md`
+- `experimental.session.compacting` forces a fresh disk read (`forceRefresh`) and resets `_injectedOnce`, `_dirty`, and `_turnCount` so the first turn after compaction re-injects memory
+- `parseConfig()` now parses `inject_every_n_turns` in addition to `max_lines` and `stale_after_days`
+- `README` update: new section `Disk I/O and injection overhead`, and subsection `Representative models by tier`; updated `Model compatibility`
+- `npm test` script added to `package.json` - for when someone decides to create their own smoketest procedure
+
+### Notes
+- Smoke test suite (`test.mjs`, gitignored): 19 tests covering `parseConfig` clamping, `write_memory`/`pin_memory`/`remove_memory` tool behaviour, dirty flag path (`tool.execute.after` → `system.transform`), `session.compacting` reset, cache invalidation, and `plugin.config` hook registration.
+
+### Known limitation
+
+Manual edits to `MEMORY.md` or `RULES.md` made between turns (outside of tool calls) will not be reflected in the injected system prompt until the next tool call, the next periodic re-injection turn, or a compaction event. This is an intentional trade-off; for a local developer tool the cost is acceptable.
+
 ## [0.1.1] - FIRST BETA RELEASE (REITERATION) + README - 2026-07-27
 
 ### Added

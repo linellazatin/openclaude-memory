@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.1.0
+version: 0.2.0
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -32,7 +32,13 @@ The plugin registers three native tools. Use these instead of raw Write/Edit too
 
 ## Reading memory
 
-`MEMORY.md` is already in your context (injected by the plugin). You do not need to re-read it unless you have just written to it and want to verify.
+`MEMORY.md` is injected into your context by the plugin on the first turn of each session, every `inject_every_n_turns` turns (default: 5), and immediately after any memory tool call. If it is not in your current context, read it directly:
+
+```
+Read ~/.config/opencode/memory/MEMORY.md
+```
+
+You do not need to re-read it unless you have just written to it and want to verify.
 
 To read a topic file for detail:
 ```
@@ -117,6 +123,6 @@ If the injected `## Global Memory` block contains a truncation warning (`memory 
 
 ## Persist rules
 
-Your persist rules are in `~/.config/opencode/memory/RULES.md` and are injected into your context under `## Memory Rules` each session. Follow them.
+Your persist rules are in `~/.config/opencode/memory/RULES.md` and are injected into your context under `## Memory Rules` on the first turn, every `inject_every_n_turns` turns, and after memory tool calls. Follow them.
 
 If no `## Memory Rules` block is in your context, read `~/.config/opencode/memory/RULES.md` directly.
