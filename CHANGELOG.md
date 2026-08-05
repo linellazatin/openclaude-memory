@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.0] - 2026-08-03
+## [0.2.0] - 2026-08-05
 
 ### Added
 
@@ -13,12 +13,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- `MEMORY.md` and `RULES.md` are no longer read from disk on every turn. They are loaded once per session into an in-process cache and invalidated after any tool call that mutates `MEMORY.md` (`write_memory`, `remove_memory`, `pin_memory`).
+- `MEMORY.md` and `RULES.md` are no longer read from disk on every turn. They are loaded once per session into an in-process cache and invalidated after any tool call that mutates `MEMORY.md` (`write_memory`, `remove_memory`, `pin_memory`). Cache is process-global; safe for single-user plugin (upgrade path: per-session Map if multi-session needed).
 - `system.transform` hook reads from the cache and injects only when `_injectedOnce === false`, `_dirty === true`, or `_turnCount % injectEveryNTurns === 0`
 - `maintainIndex` calls inside tools now use the cached config instead of re-reading `RULES.md`
 - `experimental.session.compacting` forces a fresh disk read (`forceRefresh`) and resets `_injectedOnce`, `_dirty`, and `_turnCount` so the first turn after compaction re-injects memory
 - `parseConfig()` now parses `inject_every_n_turns` in addition to `max_lines` and `stale_after_days`
 - `README` update: new section `Disk I/O and injection overhead`, and subsection `Representative models by tier`; updated `Model compatibility`
+- `npm test` script added to `package.json` - for when someone decides to create their own smoketest procedure
+
+### Notes
+- Smoke test suite (`test.mjs`, gitignored): 19 tests covering `parseConfig` clamping, `write_memory`/`pin_memory`/`remove_memory` tool behaviour, dirty flag path (`tool.execute.after` → `system.transform`), `session.compacting` reset, cache invalidation, and `plugin.config` hook registration.
 
 ### Known limitation
 
