@@ -48,6 +48,8 @@ const INITIAL_RULES = `# Memory Rules
 // Avoids re-reading RULES.md and MEMORY.md on every turn.
 // Caveat: manual edits to RULES.md or MEMORY.md between turns are not
 // reflected until the next tool call or compaction event.
+// process-global state; safe for single-user plugin.
+// Upgrade path: per-session Map keyed by session ID if multi-session needed.
 let _cache = null;
 
 // Injection state — controls whether system.transform injects memory this turn.
@@ -342,11 +344,11 @@ const tools = {
 
         lines = upsertIndexLine(lines, filename, topic, summary, pin);
 
-        const { config } = getCache();
+        const { config } = getCache(); // read config before invalidating
         lines = maintainIndex(lines, config);
 
         fs.writeFileSync(MEMORY_INDEX, lines.join('\n'), 'utf8');
-        invalidateCache();
+        invalidateCache(); // nuke cache so the next caller re-reads the fresh index
 
         return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${MEMORY_INDEX}\nEntry: [${topic}](${filename}) ${today()} -- ${summary}`;
       });
