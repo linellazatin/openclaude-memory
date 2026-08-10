@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/@openlines/openclaude-memory)](https://www.npmjs.com/package/@openlines/openclaude-memory)
 [![license](https://img.shields.io/npm/l/@openlines/openclaude-memory)](./LICENSE)
 
-Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
+Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally. OPEN. CONFIGURABLE.
 
 ## Why
 
@@ -42,15 +42,15 @@ Just files, structure, and an agent that knows where to look.
 
 ## How it works
 
-1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `RULES.md` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection then repeats every `inject_every_n_turns` turns (default: 5) and immediately after any memory tool mutation, keeping memory salient without paying the token cost every turn.
+1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `RULES.jsonc` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection then repeats every `inject_every_n_turns` turns (default: 5) and immediately after any memory tool mutation, keeping memory salient without paying the token cost every turn.
 2. **Topic files**: `MEMORY.md` is a concise index (one line per topic). Detail lives in separate topic files (`~/.config/opencode/memory/<topic>.md`), loaded on-demand by the agent when it needs more context.
 3. **Native tools**: The plugin registers `write_memory`, `remove_memory`, and `pin_memory` tools. The agent calls these instead of raw file operations — the plugin guarantees consistent format, frontmatter, and index maintenance every time. After each tool call the cache is invalidated and a dirty flag is set, so the next turn re-injects the updated index.
 4. **Auto-writes**: The agent writes to memory automatically when it solves issues, discovers infrastructure, identifies reusable commands, or learns hardware/model facts — no prompting needed. Reliability varies by model; see [Model compatibility](#model-compatibility).
 5. **Manual control**: Use `/memory` to view the current index, `/memory <text>` to store a fact immediately, `/memory pin <topic>` to pin an entry, `/memory unpin <topic>` to unpin, or `/memory remove <topic>` to remove one.
 6. **Compaction**: When context compression runs, the plugin forces a fresh disk read and injects the current memory state into the compaction context, ensuring memory survives the compaction cleanly. The injection counter is also reset so the first turn after compaction re-injects the index.
-7. **Bootstrap**: On first run, the plugin creates `MEMORY.md` and `RULES.md` automatically. Nothing to set up.
+7. **Bootstrap**: On first run, the plugin creates `MEMORY.md` and `RULES.jsonc` automatically. Nothing to set up.
 
-> **Note:** If you edit `MEMORY.md` or `RULES.md` manually between turns, the change will not be reflected until the next tool call, the next periodic re-injection turn, or a compaction event. This is an intentional trade-off to avoid per-turn disk reads.
+> **Note:** If you edit `MEMORY.md` or `RULES.jsonc` manually between turns, the change will not be reflected until the next tool call, the next periodic re-injection turn, or a compaction event. This is an intentional trade-off to avoid per-turn disk reads.
 
 ## Native tools
 
@@ -66,36 +66,41 @@ After every tool call that touches `MEMORY.md`, the plugin runs an index mainten
 
 ## Customising persist rules and config
 
-`~/.config/opencode/memory/RULES.md` is auto-created on first run with sensible defaults. Edit it directly to add, remove, or modify rules, and to configure the index limits:
+`~/.config/opencode/memory/RULES.jsonc` is auto-created on first run with sensible defaults. Edit it directly to add, remove, or modify rules, and to configure the index limits:
 
-```markdown
-# Memory Rules
-
-## Always persist
-- User preferences confirmed during session
-- Project-specific conventions discovered
-
-## Never persist
-- Temporary workarounds
-- Debug output and stack traces
-
-## Always ask before persisting (non-overridable)
-- Credentials, tokens, API keys
-- Personal data
-
-## Config
-# max_lines: 200           (default; valid range 50–500)
-# stale_after_days: 180    (default; 0 = disable age flagging)
-# inject_every_n_turns: 5  (default; minimum 1; re-inject memory index every N turns)
+```jsonc
+{
+  // What to always persist
+  "always_persist": [
+    "User preferences confirmed during session",
+    "Project-specific conventions discovered"
+  ],
+  // What to never persist
+  "never_persist": [
+    "Temporary workarounds",
+    "Debug output and stack traces"
+  ],
+  // Always ask before persisting (non-overridable)
+  "always_ask": [
+    "Credentials, tokens, API keys",
+    "Personal data"
+  ],
+  // max_lines: valid range 50–500
+  "max_lines": 200,
+  // stale_after_days: 0 = disable age flagging
+  "stale_after_days": 180,
+  // inject_every_n_turns: re-inject memory every N user prompts; 1 = every prompt
+  "inject_every_n_turns": 5
+}
 ```
 
-Uncomment and change `max_lines` to set a custom index size limit. The plugin clamps values to the valid range `[50, 500]`. If the line is absent or commented, the default of 200 is used.
+Change `"max_lines"` to set a custom index size limit. The plugin clamps values to the valid range `[50, 500]`. If the key is absent, the default of 200 is used.
 
-Uncomment and change `stale_after_days` to control when entries are flagged as stale. Set to `0` to disable age flagging entirely.
+Change `"stale_after_days"` to control when entries are flagged as stale. Set to `0` to disable age flagging entirely.
 
-Uncomment and change `inject_every_n_turns` to tune how often the memory index is re-injected into the system prompt. The default of `5` means the index appears on turn 1, turn 6, turn 11, and so on — plus immediately after any memory tool call. Set to `1` to restore every-turn injection (original behavior). Higher values save more tokens on long sessions; lower values keep memory more continuously visible. The minimum is `1`.
+Change `"inject_every_n_turns"` to tune how often the memory index is re-injected into the system prompt. The default of `5` means the index appears on turn 1, turn 6, turn 11, and so on — plus immediately after any memory tool call. Set to `1` to restore every-turn injection (original behavior). Higher values save more tokens on long sessions; lower values keep memory more continuously visible. The minimum is `1`.
 
-The plugin injects this file into every session's system prompt under a `## Memory Rules` header. RULES.md is the single source of truth for persist rules — no other configuration needed.
+The plugin injects this file into every session's system prompt under a `## Memory Rules` header. `RULES.jsonc` is the single source of truth for persist rules — no other configuration needed.
 
 **Note:** The "Always ask before persisting" section is a strong convention. The agent will always prompt before storing credentials or personal data.
 
@@ -104,13 +109,13 @@ The plugin injects this file into every session's system prompt under a `## Memo
 Each entry in `MEMORY.md` can carry optional metadata fields:
 
 ```
-- [Topic Name](file.md) [pin] YYYY-MM-DD [stale?] -- one-line summary
+- [Topic Name](file.md) [pin] YYYY-MM-DDTHH:MM:SS±HH:MM [stale?] -- one-line summary
 ```
 
 | Field | Meaning |
 |---|---|
 | `[pin]` | Permanent entry — never a cleanup candidate and never flagged as stale. Use for hardware specs, user identity, core workflows. |
-| `YYYY-MM-DD` | Date the topic file was last written to. Maintained automatically by `write_memory`. |
+| `YYYY-MM-DDTHH:MM:SS±HH:MM` | ISO 8601 datetime (local timezone) the topic file was last written to. Maintained automatically by `write_memory`. |
 | `[stale?]` | Stamped by the plugin when the entry's date exceeds `stale_after_days`. Removed automatically when the topic is updated. See [Staleness](#staleness). |
 
 ## Staleness
@@ -127,7 +132,7 @@ The plugin stamps `[stale?]` on index entries older than `stale_after_days` (def
 - If yes: call `write_memory` to refresh it (flag disappears).
 - If no: call `remove_memory` to remove the index entry (topic file preserved).
 
-Set `stale_after_days: 0` in `RULES.md` to disable age flagging entirely.
+Set `"stale_after_days": 0` in `RULES.jsonc` to disable age flagging entirely.
 
 ## Cap handling
 
@@ -166,7 +171,7 @@ openclaude-memory/
 
 | File | Role |
 |---|---|
-| `ocl-memory.mjs` | Loads `MEMORY.md` and `RULES.md` into an in-process cache on first turn; injects into system prompt. Re-injects only when a memory tool mutated the index since the last turn. Invalidates cache and sets dirty flag after every tool call. Forces fresh read and resets injection state on compaction. Registers `write_memory`, `remove_memory`, `pin_memory` tools. Runs index maintenance (orphan removal, duplicate removal, `[stale?]` stamping) after every tool call. Auto-creates files on first run. Caps injection at configured lines / 25 KB. |
+| `ocl-memory.mjs` | Loads `MEMORY.md` and `RULES.jsonc` into an in-process cache on first turn; injects into system prompt. Re-injects only when a memory tool mutated the index since the last turn. Invalidates cache and sets dirty flag after every tool call. Forces fresh read and resets injection state on compaction. Registers `write_memory`, `remove_memory`, `pin_memory` tools. Runs index maintenance (orphan removal, duplicate removal, `[stale?]` stamping) after every tool call. Auto-creates files on first run. Caps injection at configured lines / 25 KB. |
 | `memory.md` (command) | `/memory` shows the index. `/memory <text>` stores a fact via `write_memory`. `/memory pin <topic>` pins via `pin_memory`. `/memory unpin <topic>` unpins. `/memory remove <topic>` removes via `remove_memory`. |
 | `SKILL.md` | Loaded on-demand by the agent — full instructions for memory tools, format, index discipline, staleness handling, and cap remediation. |
 
@@ -179,10 +184,10 @@ openclaude-memory/
 - Native plugin tools for write, remove, and pin operations
 - Automatic writes triggered by agent activity (issues solved, infra discovered, commands identified, hardware/model facts)
 - Manual `/memory` command for show, explicit storage, pin, unpin, and remove
-- Auto-creation of `MEMORY.md` and `RULES.md` on first run
+- Auto-creation of `MEMORY.md` and `RULES.jsonc` on first run
 - Cap handling with truncation warning when index exceeds configured limit (default 200 lines) or 25 KB
-- Configurable `max_lines` and `stale_after_days` via `## Config` section in `RULES.md`
-- Index metadata: `[pin]` flag, `YYYY-MM-DD` date, `[stale?]` staleness flag per entry
+- Configurable `max_lines` and `stale_after_days` via `RULES.jsonc`
+- Index metadata: `[pin]` flag, `YYYY-MM-DDTHH:MM:SS±HH:MM` ISO datetime, `[stale?]` staleness flag per entry
 - Index maintenance: orphan removal, duplicate removal, staleness flagging on tool calls
 
 **Out of scope:**
@@ -207,7 +212,7 @@ Add to your `~/.config/opencode/opencode.json` (or `opencode.jsonc`) `plugin` ar
 }
 ```
 
-Restart opencode. On the first chat turn of the next session, `~/.config/opencode/memory/MEMORY.md` and `RULES.md` will be created automatically, and both `## Global Memory` and `## Memory Rules` blocks will appear in the agent's context. No manual configuration required.
+Restart opencode. On the first chat turn of the next session, `~/.config/opencode/memory/MEMORY.md` and `RULES.jsonc` will be created automatically, and both `## Global Memory` and `## Memory Rules` blocks will appear in the agent's context. No manual configuration required.
 
 ### Update
 
@@ -233,42 +238,42 @@ opencode may create one or both directories depending on how the specifier was r
 
 ## Token overhead
 
-The plugin injects the `MEMORY.md` index and `RULES.md` into the system prompt on the first turn of each session, and again only when a memory tool mutated the index since the last turn. All other turns receive no injection. Cost scales with index size, but only pays on turns where injection actually occurs:
+The plugin injects the `MEMORY.md` index and rendered `RULES.jsonc` (behavioral rules only, as markdown) into the system prompt on the first turn of each session, and again only when a memory tool mutated the index since the last turn. All other turns receive no injection. Cost scales with index size, but only pays on turns where injection actually occurs:
 
 
-| State                                          | Est. tokens / injection |
-| ------------------------------------------------ | -------------------- |
-| Fresh install (empty index, default RULES.md)  | ~120               |
-| Typical use (10–30 entries, default RULES.md) | ~300–700          |
-| Custom RULES.md (typical, 10–20 lines)        | similar to above   |
-| At cap (configured limit, default 200 lines)   | ~4,300–4,900      |
-| Hard cap (25 KB)                               | ~6,400             |
+| State                                            | Est. tokens / injection |
+| ------------------------------------------------ | ----------------------- |
+| Fresh install (empty index, default RULES.jsonc) | ~200                    |
+| Typical use (10–30 entries, default RULES.jsonc) | ~400–900               |
+| Custom RULES.jsonc (typical, 10–20 rules)        | similar to above        |
+| At cap (configured limit, default 200 lines)     | ~4,500–5,200           |
+| Hard cap (25 KB)                                 | ~6,400                  |
 
-Estimates based on [Claude's tokenizer](https://www.claudetokenizer.com/) averaging 3.5–4 characters per token for markdown prose. Topic files are **not** injected — only the index line — so even a large memory store stays cheap until the index itself grows large.
+Estimates based on [Claude's tokenizer](https://www.claudetokenizer.com/) averaging 3.5–4 characters per token for markdown prose. Topic files are **not** injected — only the index line — so even a large memory store stays cheap until the index itself grows large. ISO 8601 datetimes in index lines add ~4 tokens/entry vs bare dates. Only the behavioral rule arrays are injected from `RULES.jsonc`; scalar config keys (`max_lines`, `stale_after_days`, `inject_every_n_turns`) are plugin internals and do not appear in the system prompt.
 
 ## Disk I/O and injection overhead
 
-Prior to v0.2.0, the plugin read `MEMORY.md` and `RULES.md` from disk on **every turn** and injected both into every system prompt.
+Prior to v0.2.0, the plugin read `MEMORY.md` and `RULES.md` from disk on **every turn** and injected both into every system prompt. As of v0.3.0, `RULES.jsonc` replaces `RULES.md` and only the behavioral rule arrays are rendered and injected — scalar config keys are excluded from the system prompt.
 
-As of v0.2.0, two complementary optimizations apply:
+As of v0.2.0, two complementary optimizations apply (carried forward in v0.3.0):
 
 **1. Disk reads** — both files are loaded once into an in-process cache on first use. The cache is invalidated only when a tool call mutates `MEMORY.md`. A forced fresh read is performed before compaction.
 
-**2. Token injection** — `MEMORY.md` and `RULES.md` are injected into the system prompt on:
+**2. Token injection** — `MEMORY.md` and `RULES.jsonc` are injected into the system prompt on:
   - Turn 1 (session start)
   - Every `inject_every_n_turns` turns thereafter (default: 5 — so turns 1, 6, 11, 16...)
   - Any turn immediately following a memory tool mutation (`write_memory`, `remove_memory`, `pin_memory`)
 
-All other turns receive no injection. Users can tune `inject_every_n_turns` in `RULES.md` — lower values (e.g. `2`) keep memory more continuously visible at higher token cost; higher values (e.g. `10`) maximize savings at the cost of less frequent refreshes. In addition to this, the tool injects current `MEMORY.md` and `RULES.md` content into the compaction context so memory survives context compression cleanly.
+All other turns receive no injection. Users can tune `inject_every_n_turns` in `RULES.jsonc` — lower values (e.g. `2`) keep memory more continuously visible at higher token cost; higher values (e.g. `10`) maximize savings at the cost of less frequent refreshes. In addition to this, the tool injects current `MEMORY.md` and rendered `RULES.jsonc` content into the compaction context so memory survives context compression cleanly.
 
-**Savings per session — default interval of 5 (typical 10–30 entry index, ~300–700 tokens/injection, your mileage may vary):**
+**Savings per session — default interval of 5 (typical 10–30 entry index, ~400–900 tokens/injection, your mileage may vary):**
 
 | Session | Turns | Tool calls | Injections (before) | Injections (after, N=5) | Tokens saved (est.) |
 |---|---|---|---|---|---|
-| Read-heavy, 0 writes | 20 | 0 | 20 | 5 | ~4,500–10,500 (75%) |
-| Typical, 3 writes | 20 | 3 | 20 | ~7 | ~3,900–9,100 (65%) |
-| Write-heavy, 10 writes | 30 | 10 | 30 | ~15 | ~4,500–10,500 (50%) |
-| Long session, 5 writes | 100 | 5 | 100 | ~25 | ~22,500–52,500 (75%) |
+| Read-heavy, 0 writes | 20 | 0 | 20 | 5 | ~6,000–13,500 (75%) |
+| Typical, 3 writes | 20 | 3 | 20 | ~7 | ~5,200–11,700 (65%) |
+| Write-heavy, 10 writes | 30 | 10 | 30 | ~15 | ~6,000–13,500 (50%) |
+| Long session, 5 writes | 100 | 5 | 100 | ~25 | ~30,000–67,500 (75%) |
 
 Injection count formula (default N=5): `ceil(turns / 5) + tool_calls_on_non-interval_turns`. Before: `1 × turns`.
 
