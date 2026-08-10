@@ -69,11 +69,11 @@ The plugin will:
 
 ### Updating an existing topic
 
-Call `write_memory` with the same `topic` name. The plugin appends the new content under a `## YYYY-MM-DD` heading. The index date is updated automatically.
+Call `write_memory` with the same `topic` name. The plugin appends the new content under a `## YYYY-MM-DDTHH:MM:SS±HH:MM` datetime heading and updates `last_updated` in the file's frontmatter. The index date is updated automatically.
 
 ### Index discipline
 
-- `MEMORY.md` must stay under the configured `max_lines` limit (default 200; set in `## Config` section of `RULES.md`). One line per topic.
+- `MEMORY.md` must stay under the configured `max_lines` limit (default 200; set via `"max_lines"` in `RULES.jsonc`). One line per topic.
 - Never expand an index entry beyond one line. Put detail in the topic file.
 - After any write, verify `MEMORY.md` line count and trim if needed.
 - Entries with `[pin]` are exempt from all cleanup and staleness logic — never suggest removing them.
@@ -88,10 +88,10 @@ Never remove `[pin]` from an entry unless the user explicitly asks.
 
 ## Staleness flags
 
-The plugin stamps `[stale?]` on index entries older than `stale_after_days` (default 180, configurable in `RULES.md`). The flag appears in the index line, after the date:
+The plugin stamps `[stale?]` on index entries older than `stale_after_days` (default 180, configurable via `"stale_after_days"` in `RULES.jsonc`). The flag appears in the index line, after the date:
 
 ```
-- [Topic Name](file.md) 2025-11-01 [stale?] -- summary
+- [Topic Name](file.md) 2025-11-01T09:53:38+08:00 [stale?] -- summary
 ```
 
 `[stale?]` means "this entry has not been updated in a while — worth reviewing". It is a candidate signal, not a deletion order.
@@ -123,6 +123,6 @@ If the injected `## Global Memory` block contains a truncation warning (`memory 
 
 ## Persist rules
 
-Your persist rules are in `~/.config/opencode/memory/RULES.md` and are injected into your context under `## Memory Rules` on the first turn, every `inject_every_n_turns` turns, and after memory tool calls. Follow them.
+Your persist rules are in `~/.config/opencode/memory/RULES.jsonc` and are injected into your context under `## Memory Rules` on the first turn, every `inject_every_n_turns` turns, and after memory tool calls. Follow them.
 
-If no `## Memory Rules` block is in your context, read `~/.config/opencode/memory/RULES.md` directly.
+If no `## Memory Rules` block is in your context, read `~/.config/opencode/memory/RULES.jsonc` directly.

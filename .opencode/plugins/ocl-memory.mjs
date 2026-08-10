@@ -1,14 +1,14 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { z } from 'zod';
 
 const MEMORY_DIR = path.join(
   process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
   'opencode', 'memory'
 );
 const MEMORY_INDEX = path.join(MEMORY_DIR, 'MEMORY.md');
-const MEMORY_RULES = path.join(MEMORY_DIR, 'RULES.md');
+const MEMORY_RULES = path.join(MEMORY_DIR, 'RULES.jsonc');
+const MEMORY_RULES_LEGACY = path.join(MEMORY_DIR, 'RULES.md');
 
 const MAX_LINES = 200;
 const MAX_BYTES = 25 * 1024;
@@ -19,34 +19,39 @@ const INITIAL_MEMORY = `# Memory Index
 
 `;
 
-const INITIAL_RULES = `# Memory Rules
-
-## Always persist
-- Any issue solved or fixed
-- Server or infrastructure configuration discovered or changed
-- Reusable commands or workflows identified
-- Hardware, model, or environment facts learned
-
-## Never persist
-- Session-specific context that won't apply to future sessions
-- Opinions or preferences not confirmed by the user
-- Large blocks of code — summarize instead, or link to the file path
-
-## Always ask before persisting (non-overridable)
-- Credentials, tokens, API keys
-- Personal data
-- Anything the user marks as private or ephemeral
-
-## Config
-# max_lines: 200         (default; valid range 50–500)
-# stale_after_days: 180  (default; 0 = disable age flagging)
-# inject_every_n_turns: 5  (default; re-inject memory index every N turns; 1 = every turn)
+const INITIAL_RULES_JSONC = `{
+  // What to always persist
+  "always_persist": [
+    "Any issue solved or fixed",
+    "Server or infrastructure configuration discovered or changed",
+    "Reusable commands or workflows identified",
+    "Hardware, model, or environment facts learned"
+  ],
+  // What to never persist
+  "never_persist": [
+    "Session-specific context that won't apply to future sessions",
+    "Opinions or preferences not confirmed by the user",
+    "Large blocks of code — summarize instead, or link to the file path"
+  ],
+  // Always ask before persisting (non-overridable)
+  "always_ask": [
+    "Credentials, tokens, API keys",
+    "Personal data",
+    "Anything the user marks as private or ephemeral"
+  ],
+  // max_lines: valid range 50–500
+  "max_lines": 200,
+  // stale_after_days: 0 = disable age flagging
+  "stale_after_days": 180,
+  // inject_every_n_turns: re-inject memory every N user prompts; 1 = every prompt
+  "inject_every_n_turns": 5
+}
 `;
 
 // --- In-process cache ---
 // Loaded once per session (or after any tool mutation / compaction).
-// Avoids re-reading RULES.md and MEMORY.md on every turn.
-// Caveat: manual edits to RULES.md or MEMORY.md between turns are not
+// Avoids re-reading RULES.jsonc and MEMORY.md on every turn.
+// Caveat: manual edits to RULES.jsonc or MEMORY.md between turns are not
 // reflected until the next tool call or compaction event.
 // process-global state; safe for single-user plugin.
 // Upgrade path: per-session Map keyed by session ID if multi-session needed.
@@ -64,9 +69,10 @@ let _turnCount = 0;
 function getCache(forceRefresh = false) {
   if (!_cache || forceRefresh) {
     const rules = readMemoryRules();
-    const config = parseConfig(rules);
+    const config = parseRules(rules);
+    const renderedRules = renderRulesForInjection(rules);
     const content = readMemoryIndex(config.maxLines);
-    _cache = { rules, config, content };
+    _cache = { renderedRules, config, content };
   }
   return _cache;
 }
@@ -77,27 +83,43 @@ function invalidateCache() {
 
 // --- Config parsing ---
 
-function parseConfig(rulesContent) {
-  const config = { maxLines: MAX_LINES, staleAfterDays: DEFAULT_STALE_DAYS, injectEveryNTurns: DEFAULT_INJECT_INTERVAL };
-  if (!rulesContent) return config;
+const stripJsonc = raw => raw.replace(/\/\/[^\n]*/g, '').replace(/,\s*([}\]])/g, '$1');
 
-  const maxMatch = rulesContent.match(/^\s*max_lines:\s*(\d+)\s*$/m);
-  if (maxMatch) {
-    const val = parseInt(maxMatch[1], 10);
-    config.maxLines = Math.min(500, Math.max(50, val));
+function parseRules(raw) {
+  const defaults = { maxLines: MAX_LINES, staleAfterDays: DEFAULT_STALE_DAYS, injectEveryNTurns: DEFAULT_INJECT_INTERVAL };
+  if (!raw) return defaults;
+  try {
+    const obj = JSON.parse(stripJsonc(raw));
+    return {
+      maxLines: Math.min(500, Math.max(50, Number.isInteger(obj.max_lines) ? obj.max_lines : defaults.maxLines)),
+      staleAfterDays: typeof obj.stale_after_days === 'number' ? Math.max(0, obj.stale_after_days) : defaults.staleAfterDays,
+      injectEveryNTurns: Number.isInteger(obj.inject_every_n_turns) ? Math.max(1, obj.inject_every_n_turns) : defaults.injectEveryNTurns,
+    };
+  } catch {
+    return defaults;
   }
+}
 
-  const staleMatch = rulesContent.match(/^\s*stale_after_days:\s*(\d+)\s*$/m);
-  if (staleMatch) {
-    config.staleAfterDays = Math.max(0, parseInt(staleMatch[1], 10));
+// Transforms RULES.jsonc content into markdown for agent injection.
+// Renders only the behavioral array keys (always_persist, never_persist, always_ask)
+// as markdown bullet lists. Scalar config keys are plugin internals — not injected.
+// Falls back to raw content if parsing fails (e.g. heavily customised JSONC).
+function renderRulesForInjection(raw) {
+  if (!raw) return null;
+  try {
+    const obj = JSON.parse(stripJsonc(raw));
+    const sections = [
+      ['always_persist', 'Always persist'],
+      ['never_persist', 'Never persist'],
+      ['always_ask', 'Always ask before persisting (non-overridable)'],
+    ];
+    const parts = sections
+      .filter(([key]) => Array.isArray(obj[key]) && obj[key].length)
+      .map(([key, heading]) => `### ${heading}\n${obj[key].map(i => `- ${i}`).join('\n')}`);
+    return parts.length ? parts.join('\n\n') : raw;
+  } catch {
+    return raw; // unparseable JSONC — inject as-is
   }
-
-  const injectMatch = rulesContent.match(/^\s*inject_every_n_turns:\s*(\d+)\s*$/m);
-  if (injectMatch) {
-    config.injectEveryNTurns = Math.max(1, parseInt(injectMatch[1], 10));
-  }
-
-  return config;
 }
 
 // --- File I/O helpers ---
@@ -106,12 +128,63 @@ function ensureMemoryDir() {
   fs.mkdirSync(MEMORY_DIR, { recursive: true });
 }
 
+// Converts legacy RULES.md content to a RULES.jsonc string.
+// Extracts bullet lists from known sections and uncommented numeric config keys.
+function migrateRulesMd(md) {
+  const extractBullets = (sectionPattern) => {
+    const m = md.match(new RegExp(`##\\s+${sectionPattern}[^\\n]*\\n([\\s\\S]*?)(?=\\n##|$)`, 'i'));
+    if (!m) return [];
+    return m[1].split('\n')
+      .map(l => l.replace(/^\s*-\s*/, '').trim())
+      .filter(l => l && !l.startsWith('#'));
+  };
+
+  const numKey = (key, def) => {
+    const m = md.match(new RegExp(`^\\s*${key}:\\s*(\\d+)\\s*$`, 'm'));
+    return m ? parseInt(m[1], 10) : def;
+  };
+
+  const arr = (items) => items.length
+    ? '[\n' + items.map(i => `    ${JSON.stringify(i)}`).join(',\n') + '\n  ]'
+    : '[]';
+
+  const always = extractBullets('Always persist');
+  const never = extractBullets('Never persist');
+  const ask = extractBullets('Always ask');
+  const maxLines = numKey('max_lines', 200);
+  const stale = numKey('stale_after_days', 180);
+  const inject = numKey('inject_every_n_turns', 5);
+
+  return `{
+  // What to always persist
+  "always_persist": ${arr(always)},
+  // What to never persist
+  "never_persist": ${arr(never)},
+  // Always ask before persisting (non-overridable)
+  "always_ask": ${arr(ask)},
+  // max_lines: valid range 50–500
+  "max_lines": ${maxLines},
+  // stale_after_days: 0 = disable age flagging
+  "stale_after_days": ${stale},
+  // inject_every_n_turns: re-inject memory every N user prompts; 1 = every prompt
+  "inject_every_n_turns": ${inject}
+}
+`;
+}
+
 function readMemoryRules() {
   try {
     if (!fs.existsSync(MEMORY_RULES)) {
       ensureMemoryDir();
-      fs.writeFileSync(MEMORY_RULES, INITIAL_RULES, 'utf8');
-      return INITIAL_RULES;
+      if (fs.existsSync(MEMORY_RULES_LEGACY)) {
+        const md = fs.readFileSync(MEMORY_RULES_LEGACY, 'utf8');
+        const jsonc = migrateRulesMd(md);
+        fs.writeFileSync(MEMORY_RULES, jsonc, 'utf8');
+        fs.renameSync(MEMORY_RULES_LEGACY, MEMORY_RULES_LEGACY + '.bak');
+        return jsonc;
+      }
+      fs.writeFileSync(MEMORY_RULES, INITIAL_RULES_JSONC, 'utf8');
+      return INITIAL_RULES_JSONC;
     }
     return fs.readFileSync(MEMORY_RULES, 'utf8');
   } catch {
@@ -154,8 +227,14 @@ function parseIndexLine(line) {
   };
 }
 
-function today() {
-  return new Date().toISOString().slice(0, 10);
+function nowIso() {
+  const now = new Date();
+  const off = -now.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const hh = String(Math.floor(Math.abs(off) / 60)).padStart(2, '0');
+  const mm = String(Math.abs(off) % 60).padStart(2, '0');
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 19) + sign + hh + ':' + mm;
 }
 
 function daysSince(dateStr) {
@@ -212,11 +291,11 @@ function maintainIndex(lines, config) {
     // [stale?] stamping — skip pinned entries
     const isPinned = rest.includes('[pin]');
     if (!isPinned && staleAfterDays > 0) {
-      const dateMatch = rest.match(/(\d{4}-\d{2}-\d{2})/);
+      const dateMatch = rest.match(/(\d{4}-\d{2}-\d{2}(?:T[\d:.+-]+)?)/);
       if (dateMatch) {
         const age = daysSince(dateMatch[1]);
         if (age !== null && age > staleAfterDays) {
-          // Stamp [stale?] after the date if not already present
+          // Stamp [stale?] after the date/datetime token if not already present
           if (!rest.includes('[stale?]')) {
             rest = rest.replace(dateMatch[1], dateMatch[1] + ' [stale?]');
           }
@@ -263,7 +342,7 @@ function toSlug(topic) {
 // Returns updated lines array.
 
 function upsertIndexLine(lines, filename, name, summary, pin) {
-  const dateStr = today();
+  const dateStr = nowIso();
 
   for (let i = 0; i < lines.length; i++) {
     const parsed = parseIndexLine(lines[i]);
@@ -282,178 +361,182 @@ function upsertIndexLine(lines, filename, name, summary, pin) {
   return lines;
 }
 
-// Simple in-process mutex to prevent concurrent index writes
-let writeLock = false;
-async function withLock(fn) {
-  while (writeLock) {
-    await new Promise(r => setTimeout(r, 10));
-  }
-  writeLock = true;
-  try {
-    return await fn();
-  } finally {
-    writeLock = false;
-  }
-}
-
 // --- Tool definitions ---
+
+const MEMORY_TOOL_NAMES = new Set(['write_memory', 'remove_memory', 'pin_memory']);
 
 const tools = {
   write_memory: {
     description: 'Write or update a memory topic. Creates a new topic file or appends to an existing one. Updates the MEMORY.md index automatically. Use this instead of raw Write/Edit tools for all memory operations.',
     args: {
-      topic: z.string().describe('Topic name, e.g. "PostgreSQL Setup" or "Homelab Server"'),
-      content: z.string().describe('The content to write or append to the topic file'),
-      summary: z.string().describe('One-line summary for the MEMORY.md index entry'),
-      pin: z.boolean().default(false).describe('Pin this entry so it is never a cleanup candidate'),
+      type: 'object',
+      required: ['topic', 'content', 'summary'],
+      properties: {
+        topic:   { type: 'string', description: 'Topic name, e.g. "PostgreSQL Setup" or "Homelab Server"' },
+        content: { type: 'string', description: 'The content to write or append to the topic file' },
+        summary: { type: 'string', description: 'One-line summary for the MEMORY.md index entry' },
+        pin:     { type: 'boolean', description: 'Pin this entry so it is never a cleanup candidate', default: false },
+      },
     },
     async execute(args) {
-      return withLock(() => {
-        const { topic, content, summary, pin } = args;
+      const { topic, content, summary, pin } = args;
 
-        ensureMemoryDir();
+      ensureMemoryDir();
 
-        // Read index once — reuse for topic-name lookup and upsert
-        const rawIndex = fs.existsSync(MEMORY_INDEX)
-          ? fs.readFileSync(MEMORY_INDEX, 'utf8')
-          : INITIAL_MEMORY;
+      // Read index once — reuse for topic-name lookup and upsert
+      const rawIndex = fs.existsSync(MEMORY_INDEX)
+        ? fs.readFileSync(MEMORY_INDEX, 'utf8')
+        : INITIAL_MEMORY;
 
-        // Check if an existing index entry matches this topic name — use its filename if so
-        let filename = toSlug(topic) + '.md';
-        for (const line of rawIndex.split('\n')) {
-          const parsed = parseIndexLine(line);
-          if (parsed && parsed.name.toLowerCase() === topic.toLowerCase()) {
-            filename = parsed.filename;
-            break;
-          }
+      // Check if an existing index entry matches this topic name — use its filename if so
+      let filename = toSlug(topic) + '.md';
+      for (const line of rawIndex.split('\n')) {
+        const parsed = parseIndexLine(line);
+        if (parsed && parsed.name.toLowerCase() === topic.toLowerCase()) {
+          filename = parsed.filename;
+          break;
         }
-        const topicPath = path.join(MEMORY_DIR, filename);
+      }
+      const topicPath = path.join(MEMORY_DIR, filename);
 
-        let isNew = false;
-        if (!fs.existsSync(topicPath)) {
-          isNew = true;
-          const frontmatter = `---\nname: ${topic}\ndescription: ${summary}\ncreated: ${today()}\nmetadata:\n  node_type: memory\n---\n\n`;
-          fs.writeFileSync(topicPath, frontmatter + content + '\n', 'utf8');
+      let isNew = false;
+      if (!fs.existsSync(topicPath)) {
+        isNew = true;
+        const now = nowIso();
+        const frontmatter = `---\nname: ${topic}\ndescription: ${summary}\ncreated: ${now}\nlast_updated: ${now}\nmetadata:\n  node_type: memory\n---\n\n`;
+        fs.writeFileSync(topicPath, frontmatter + content + '\n', 'utf8');
+      } else {
+        const now = nowIso();
+        const existing = fs.readFileSync(topicPath, 'utf8');
+        let body;
+        if (existing.includes('last_updated:')) {
+          body = existing.replace(/^(last_updated:\s*).*$/m, `$1${now}`);
+        } else if (existing.includes('created:')) {
+          body = existing.replace(/^(created:.*)$/m, `$1\nlast_updated: ${now}`);
         } else {
-          const heading = `\n## ${today()}\n\n`;
-          fs.appendFileSync(topicPath, heading + content + '\n', 'utf8');
+          body = existing;
         }
+        fs.writeFileSync(topicPath, body + `\n## ${now}\n\n` + content + '\n', 'utf8');
+      }
 
-        // Update index
-        let lines = rawIndex.split('\n');
+      // Update index
+      let lines = rawIndex.split('\n');
 
-        lines = upsertIndexLine(lines, filename, topic, summary, pin);
+      lines = upsertIndexLine(lines, filename, topic, summary, pin);
 
-        const { config } = getCache(); // read config before invalidating
-        lines = maintainIndex(lines, config);
+      const { config } = getCache(); // read config before invalidating
+      lines = maintainIndex(lines, config);
 
-        fs.writeFileSync(MEMORY_INDEX, lines.join('\n'), 'utf8');
-        invalidateCache(); // nuke cache so the next caller re-reads the fresh index
+      fs.writeFileSync(MEMORY_INDEX, lines.join('\n'), 'utf8');
+      invalidateCache(); // nuke cache so the next caller re-reads the fresh index
 
-        return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${MEMORY_INDEX}\nEntry: [${topic}](${filename}) ${today()} -- ${summary}`;
-      });
+      return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${MEMORY_INDEX}\nEntry: [${topic}](${filename}) ${nowIso()} -- ${summary}`;
     },
   },
 
   remove_memory: {
     description: 'Remove a topic entry from the MEMORY.md index. The topic file on disk is preserved. Pinned entries cannot be removed.',
     args: {
-      topic: z.string().describe('Topic name or partial filename to search for (case-insensitive)'),
+      type: 'object',
+      required: ['topic'],
+      properties: {
+        topic: { type: 'string', description: 'Topic name or partial filename to search for (case-insensitive)' },
+      },
     },
     async execute(args) {
-      return withLock(() => {
-        const { topic } = args;
-        const search = topic.toLowerCase();
+      const { topic } = args;
+      const search = topic.toLowerCase();
 
-        if (!fs.existsSync(MEMORY_INDEX)) {
-          return 'No memory index found.';
-        }
+      if (!fs.existsSync(MEMORY_INDEX)) {
+        return 'No memory index found.';
+      }
 
-        const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
-        const lines = raw.split('\n');
+      const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
+      const lines = raw.split('\n');
 
-        const found = findIndexEntry(lines, search);
-        if (!found) {
-          return `No matching entry found for "${topic}".`;
-        }
-        const { idx: foundIdx, parsed } = found;
+      const found = findIndexEntry(lines, search);
+      if (!found) {
+        return `No matching entry found for "${topic}".`;
+      }
+      const { idx: foundIdx, parsed } = found;
 
-        if (parsed.rest.includes('[pin]')) {
-          return `Entry is pinned and cannot be removed. Use pin_memory with pin: false to unpin it first.`;
-        }
+      if (parsed.rest.includes('[pin]')) {
+        return `Entry is pinned and cannot be removed. Use pin_memory with pin: false to unpin it first.`;
+      }
 
-        const removedLine = lines[foundIdx];
-        lines.splice(foundIdx, 1);
+      const removedLine = lines[foundIdx];
+      lines.splice(foundIdx, 1);
 
-        const { config } = getCache();
-        const maintained = maintainIndex(lines, config);
+      const { config } = getCache();
+      const maintained = maintainIndex(lines, config);
 
-        fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
-        invalidateCache();
+      fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
+      invalidateCache();
 
-        const topicFile = path.join(MEMORY_DIR, parsed.filename);
-        const fileNote = fs.existsSync(topicFile)
-          ? `Topic file ${parsed.filename} still exists on disk.`
-          : `Topic file ${parsed.filename} was not found on disk.`;
+      const topicFile = path.join(MEMORY_DIR, parsed.filename);
+      const fileNote = fs.existsSync(topicFile)
+        ? `Topic file ${parsed.filename} still exists on disk.`
+        : `Topic file ${parsed.filename} was not found on disk.`;
 
-        return `Index entry removed: ${removedLine.trim()}\n${fileNote}`;
-      });
+      return `Index entry removed: ${removedLine.trim()}\n${fileNote}`;
     },
   },
 
   pin_memory: {
     description: 'Pin or unpin a memory index entry. Pinned entries are never flagged as stale and cannot be removed.',
     args: {
-      topic: z.string().describe('Topic name or partial filename to search for (case-insensitive)'),
-      pin: z.boolean().describe('true to pin, false to unpin'),
+      type: 'object',
+      required: ['topic', 'pin'],
+      properties: {
+        topic: { type: 'string', description: 'Topic name or partial filename to search for (case-insensitive)' },
+        pin:   { type: 'boolean', description: 'true to pin, false to unpin' },
+      },
     },
     async execute(args) {
-      return withLock(() => {
-        const { topic, pin } = args;
-        const search = topic.toLowerCase();
+      const { topic, pin } = args;
+      const search = topic.toLowerCase();
 
-        if (!fs.existsSync(MEMORY_INDEX)) {
-          return 'No memory index found.';
-        }
+      if (!fs.existsSync(MEMORY_INDEX)) {
+        return 'No memory index found.';
+      }
 
-        const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
-        const lines = raw.split('\n');
+      const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
+      const lines = raw.split('\n');
 
-        const found = findIndexEntry(lines, search);
-        if (!found) {
-          return `No matching entry found for "${topic}".`;
-        }
-        const { idx: foundIdx, parsed } = found;
+      const found = findIndexEntry(lines, search);
+      if (!found) {
+        return `No matching entry found for "${topic}".`;
+      }
+      const { idx: foundIdx, parsed } = found;
 
-        const line = lines[foundIdx];
-        const alreadyPinned = parsed.rest.includes('[pin]');
+      const line = lines[foundIdx];
+      const alreadyPinned = parsed.rest.includes('[pin]');
 
-        if (pin && alreadyPinned) return `Already pinned: ${line.trim()}`;
-        if (!pin && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
+      if (pin && alreadyPinned) return `Already pinned: ${line.trim()}`;
+      if (!pin && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
 
-        const newRest = pin
-          ? ' [pin]' + parsed.rest
-          : parsed.rest.replace(/\s*\[pin\]/, '');
+      const newRest = pin
+        ? ' [pin]' + parsed.rest
+        : parsed.rest.replace(/\s*\[pin\]/, '');
 
-        const before = line.trim();
-        lines[foundIdx] = parsed.prefix + parsed.name + parsed.mid + newRest;
-        const after = lines[foundIdx].trim();
+      const before = line.trim();
+      lines[foundIdx] = parsed.prefix + parsed.name + parsed.mid + newRest;
+      const after = lines[foundIdx].trim();
 
-        const { config } = getCache();
-        const maintained = maintainIndex(lines, config);
+      const { config } = getCache();
+      const maintained = maintainIndex(lines, config);
 
-        fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
-        invalidateCache();
+      fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
+      invalidateCache();
 
-        return `${pin ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
-      });
+      return `${pin ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
     },
   },
 };
 
 // --- Plugin export ---
 
-export default async ({ client } = {}) => {
+export default async () => {
   const skillsDir = new URL('../../skills', import.meta.url).pathname;
 
   return {
@@ -514,8 +597,7 @@ Any text including single words is treated literally as content to store. Do not
     // Set _dirty when a memory tool mutates MEMORY.md so system.transform
     // knows to re-inject the updated index on the next turn.
     'tool.execute.after': async (input, _output) => {
-      const memoryTools = new Set(['write_memory', 'remove_memory', 'pin_memory']);
-      if (memoryTools.has(input.tool)) {
+      if (MEMORY_TOOL_NAMES.has(input.tool)) {
         _dirty = true;
       }
     },
@@ -527,7 +609,7 @@ Any text including single words is treated literally as content to store. Do not
     // All other turns skip injection, saving tokens while keeping memory salient.
     'experimental.chat.system.transform': async (_input, output) => {
       _turnCount++;
-      const { rules, content, config } = getCache();
+      const { renderedRules, content, config } = getCache();
       const shouldInject = !_injectedOnce || _dirty || (_turnCount % config.injectEveryNTurns === 0);
 
       if (shouldInject) {
@@ -535,8 +617,8 @@ Any text including single words is treated literally as content to store. Do not
           output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${MEMORY_DIR}\n\n${content}`);
         }
 
-        if (rules) {
-          output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_RULES} to customise.\n\n${rules}`);
+        if (renderedRules) {
+          output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_RULES} to customise.\n\n${renderedRules}`);
         }
 
         _injectedOnce = true;
@@ -546,14 +628,14 @@ Any text including single words is treated literally as content to store. Do not
 
     'experimental.session.compacting': async (_input, output) => {
       // Force a fresh read so the compaction prompt gets up-to-date memory state.
-      const { rules, content } = getCache(true);
+      const { renderedRules, content } = getCache(true);
 
       if (content) {
         output.context.push(`## Global Memory (current index)\n\n${content}`);
       }
 
-      if (rules) {
-        output.context.push(`## Memory Rules\n\n${rules}`);
+      if (renderedRules) {
+        output.context.push(`## Memory Rules\n\n${renderedRules}`);
       }
 
       // Reset so the first turn after compaction re-injects memory into the
