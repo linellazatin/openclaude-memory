@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/@openlines/openclaude-memory)](https://www.npmjs.com/package/@openlines/openclaude-memory)
 [![license](https://img.shields.io/npm/l/@openlines/openclaude-memory)](./LICENSE)
 
-Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally. OPEN. CONFIGURABLE.
+OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
 ## Why
 
@@ -45,7 +45,7 @@ Just files, structure, and an agent that knows where to look.
 1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `RULES.jsonc` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection then repeats every `inject_every_n_turns` turns (default: 5) and immediately after any memory tool mutation, keeping memory salient without paying the token cost every turn.
 2. **Topic files**: `MEMORY.md` is a concise index (one line per topic). Detail lives in separate topic files (`~/.config/opencode/memory/<topic>.md`), loaded on-demand by the agent when it needs more context.
 3. **Native tools**: The plugin registers `write_memory`, `remove_memory`, and `pin_memory` tools. The agent calls these instead of raw file operations — the plugin guarantees consistent format, frontmatter, and index maintenance every time. After each tool call the cache is invalidated and a dirty flag is set, so the next turn re-injects the updated index.
-4. **Auto-writes**: The agent writes to memory automatically when it solves issues, discovers infrastructure, identifies reusable commands, or learns hardware/model facts — no prompting needed. Reliability varies by model; see [Model compatibility](#model-compatibility).
+4. **Auto-writes**: The agent writes to memory proactively — without being asked — when it learns something worth keeping: user preferences, feedback on how to approach work, project constraints, or pointers to external systems. Memories are typed (`user`, `feedback`, `project`, `reference`), and structured entries include a `Why:` + `How to apply:` section so the agent can reason about edge cases, not just recite facts. Reliability varies by model; see [Model compatibility](#model-compatibility).
 5. **Manual control**: Use `/memory` to view the current index, `/memory <text>` to store a fact immediately, `/memory pin <topic>` to pin an entry, `/memory unpin <topic>` to unpin, or `/memory remove <topic>` to remove one.
 6. **Compaction**: When context compression runs, the plugin forces a fresh disk read and injects the current memory state into the compaction context, ensuring memory survives the compaction cleanly. The injection counter is also reset so the first turn after compaction re-injects the index.
 7. **Bootstrap**: On first run, the plugin creates `MEMORY.md` and `RULES.jsonc` automatically. Nothing to set up.
@@ -58,7 +58,7 @@ The plugin registers three tools that the agent calls directly. These replace ra
 
 | Tool | Args | What it does |
 |---|---|---|
-| `write_memory` | `topic`, `content`, `summary`, `pin?` | Creates a new topic file with YAML frontmatter, or appends to an existing one under a dated heading. Upserts the `MEMORY.md` index entry with today's date. |
+| `write_memory` | `topic`, `content`, `summary`, `pin?`, `mode?` | Creates a new topic file with YAML frontmatter, or updates an existing one. `mode: "append"` (default) adds content under a new dated heading; `mode: "replace"` overwrites the body while preserving frontmatter. Upserts the `MEMORY.md` index entry automatically. |
 | `remove_memory` | `topic` | Removes the index entry (case-insensitive match). Refuses if the entry is pinned. Topic file is preserved on disk. |
 | `pin_memory` | `topic`, `pin` (bool) | Pins (`true`) or unpins (`false`) an index entry. Pinned entries are never flagged as stale and cannot be removed. |
 
@@ -72,18 +72,25 @@ After every tool call that touches `MEMORY.md`, the plugin runs an index mainten
 {
   // What to always persist
   "always_persist": [
-    "User preferences confirmed during session",
-    "Project-specific conventions discovered"
+    "Any issue solved or fixed",
+    "Server or infrastructure configuration discovered or changed",
+    "Reusable commands or workflows identified",
+    "Hardware, model, or environment facts learned"
   ],
   // What to never persist
   "never_persist": [
-    "Temporary workarounds",
-    "Debug output and stack traces"
+    "Code patterns, conventions, or architecture derivable from reading the codebase",
+    "Git history — use git log/blame instead",
+    "Debugging fix recipes — the fix is in the code; the commit message has the context",
+    "Ephemeral in-session task state (todos, current work-in-progress)",
+    "Anything already documented in AGENTS.md, CLAUDE.md, or project config files",
+    "Large code blocks — summarize the insight or link to the file path instead"
   ],
   // Always ask before persisting (non-overridable)
   "always_ask": [
     "Credentials, tokens, API keys",
-    "Personal data"
+    "Personal data",
+    "Anything the user marks as private or ephemeral"
   ],
   // max_lines: valid range 50–500
   "max_lines": 200,
@@ -163,7 +170,8 @@ openclaude-memory/
 ├── CHANGELOG.md                        # release history
 ├── package.json                        # npm package manifest
 ├── .opencode/
-│   ├── plugins/ocl-memory.mjs          # plugin entry point — tools, system prompt injection
+│   ├── plugins/ocl-memory.mjs          # server plugin — tools, system prompt injection
+│   ├── plugins/ocl-memory-tui.mjs      # TUI plugin — interactive memory browser
 │   └── command/memory.md               # /memory slash command definition
 └── skills/
     └── memory/SKILL.md                 # agent instructions for reading/writing memory
@@ -172,7 +180,8 @@ openclaude-memory/
 | File | Role |
 |---|---|
 | `ocl-memory.mjs` | Loads `MEMORY.md` and `RULES.jsonc` into an in-process cache on first turn; injects into system prompt. Re-injects only when a memory tool mutated the index since the last turn. Invalidates cache and sets dirty flag after every tool call. Forces fresh read and resets injection state on compaction. Registers `write_memory`, `remove_memory`, `pin_memory` tools. Runs index maintenance (orphan removal, duplicate removal, `[stale?]` stamping) after every tool call. Auto-creates files on first run. Caps injection at configured lines / 25 KB. |
-| `memory.md` (command) | `/memory` shows the index. `/memory <text>` stores a fact via `write_memory`. `/memory pin <topic>` pins via `pin_memory`. `/memory unpin <topic>` unpins. `/memory remove <topic>` removes via `remove_memory`. |
+| `ocl-memory-tui.mjs` | TUI plugin — registered in `tui.jsonc`. Registers `ctrl+alt+m` keybinding. Provides an interactive, arrow-key-navigable browser over the memory index — view topic content, pin/unpin, and remove entries. All actions are direct file I/O; no LLM turn required. |
+| `memory.md` (command) | `/memory` shows the index (retained - with LLM turn). `/memory <text>` stores a fact via `write_memory`. `/memory pin <topic>` pins via `pin_memory`. `/memory unpin <topic>` unpins. `/memory remove <topic>` removes via `remove_memory`. |
 | `SKILL.md` | Loaded on-demand by the agent — full instructions for memory tools, format, index discipline, staleness handling, and cap remediation. |
 
 ## Scope
@@ -182,6 +191,7 @@ openclaude-memory/
 - Flat markdown persistence (`MEMORY.md` + topic files)
 - System prompt injection on first turn and after memory tool mutations only (not every turn)
 - Native plugin tools for write, remove, and pin operations
+- TUI memory browser (`ctrl+alt+m`): interactive, arrow-key-navigable browser
 - Automatic writes triggered by agent activity (issues solved, infra discovered, commands identified, hardware/model facts)
 - Manual `/memory` command for show, explicit storage, pin, unpin, and remove
 - Auto-creation of `MEMORY.md` and `RULES.jsonc` on first run
@@ -193,7 +203,7 @@ openclaude-memory/
 **Out of scope:**
 
 - Semantic or fuzzy search across memories
-- Custom MCP server (the agent uses plugin-registered tools)
+- Custom MCP/remote/local server (the agent uses plugin-registered tools)
 - Encryption or sync
 - Per-project memory (this is global only)
 - Real-time staleness monitoring (flags are stamped on tool calls, not on session load)
@@ -204,15 +214,51 @@ openclaude-memory/
 
 Add to your `~/.config/opencode/opencode.json` (or `opencode.jsonc`) `plugin` array:
 
-```json
+```jsonc
 {
   "plugin": [
     "@openlines/openclaude-memory"
   ]
 }
 ```
+**Via local path (development — works without publishing):**
+
+```jsonc
+{
+  "plugin": [
+    "/absolute/path/to/openclaude-memory"
+  ]
+}
+```
+
+The TUI plugin adds an interactive, arrow-key-navigable memory browser — no LLM turn required. Register to `~/.config/opencode/tui.jsonc`.
+
+```jsonc
+{
+  "plugin": [
+    "@openlines/openclaude-memory"
+  ]
+}
+```
+**Via local path (development — works without publishing):**
+
+```jsonc
+{
+  "plugin": [
+    "/absolute/path/to/openclaude-memory"
+  ]
+}
+```
 
 Restart opencode. On the first chat turn of the next session, `~/.config/opencode/memory/MEMORY.md` and `RULES.jsonc` will be created automatically, and both `## Global Memory` and `## Memory Rules` blocks will appear in the agent's context. No manual configuration required.
+
+Once installed:
+
+- Press `ctrl+alt+m` to open the **"Memory Browser"**
+- Arrow keys navigate the list; typing filters by topic name
+- Select a topic to view its content, pin/unpin it, or remove it from the index (topic file preserved on disk)
+
+The TUI plugin reads and writes `MEMORY.md` directly. Pin/unpin/remove are instant — no model involved.
 
 ### Update
 
@@ -253,7 +299,7 @@ Estimates based on [Claude's tokenizer](https://www.claudetokenizer.com/) averag
 
 ## Disk I/O and injection overhead
 
-Prior to v0.2.0, the plugin read `MEMORY.md` and `RULES.md` from disk on **every turn** and injected both into every system prompt. As of v0.3.0, `RULES.jsonc` replaces `RULES.md` and only the behavioral rule arrays are rendered and injected — scalar config keys are excluded from the system prompt.
+Prior to v0.2.0, the plugin read `MEMORY.md` and `RULES.md` from disk on **every turn** and injected both into every system prompt. As of v0.3.0, `RULES.jsonc` replaces `RULES.md` and only the behavioral rule arrays are rendered and injected — scalar config keys are excluded from the system prompt. As of v0.5.0, `write_memory` accepts an optional `mode` parameter (`"append"` | `"replace"`) for overwriting stale content in place.
 
 As of v0.2.0, two complementary optimizations apply (carried forward in v0.3.0):
 
@@ -265,6 +311,8 @@ As of v0.2.0, two complementary optimizations apply (carried forward in v0.3.0):
   - Any turn immediately following a memory tool mutation (`write_memory`, `remove_memory`, `pin_memory`)
 
 All other turns receive no injection. Users can tune `inject_every_n_turns` in `RULES.jsonc` — lower values (e.g. `2`) keep memory more continuously visible at higher token cost; higher values (e.g. `10`) maximize savings at the cost of less frequent refreshes. In addition to this, the tool injects current `MEMORY.md` and rendered `RULES.jsonc` content into the compaction context so memory survives context compression cleanly.
+
+> **Note:** TUI memory browser actions (pin/unpin/remove via `ctrl+alt+m`) write `MEMORY.md` directly without going through the server plugin. This bypasses the cache and dirty flag — the same caveat as manual file edits. Changes made via the TUI will not appear in the injected system prompt until the next tool call, the next periodic re-injection turn, or a compaction event.
 
 **Savings per session — default interval of 5 (typical 10–30 entry index, ~400–900 tokens/injection, your mileage may vary):**
 
@@ -304,6 +352,7 @@ Where a feature is backed by a plugin tool, the tool guarantees correct format a
 | `/memory <text>` store via `write_memory` | Reliable | Reliable | Reliable |
 | `/memory pin/unpin <topic>` via `pin_memory` | Reliable | Reliable | Reliable |
 | `/memory remove <topic>` via `remove_memory` | Reliable | Reliable | Reliable |
+| TUI browser — pin/unpin/remove (`ctrl+alt+m`) | Model-free | Model-free | Model-free |
 | Auto-trigger writes (persist rules) | Reliable | Reliable | Usually works |
 | Topic/summary quality on auto-writes | Reliable | Reliable | Usually works |
 | Date stamping on auto-writes | Plugin-guaranteed | Plugin-guaranteed | Plugin-guaranteed |
@@ -324,6 +373,7 @@ Where a feature is backed by a plugin tool, the tool guarantees correct format a
 - Date stamping is handled by the plugin, not the model — no model tier can get it wrong
 - `[stale?]` flagging and orphan/duplicate cleanup run entirely in the plugin
 - `/memory pin`, `/memory unpin`, and `/memory remove` are single structured tool calls — reliable even on compact and edge models
+- TUI browser pin/unpin/remove (`ctrl+alt+m`) are direct file writes — no model involved at any tier
 
 If you are using an older model, compact, or edge models, `/memory <text>` explicit commands will always be more reliable than auto-trigger writes.
 

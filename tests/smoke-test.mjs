@@ -163,6 +163,29 @@ await test('write_memory: existing topic appends with date heading', async () =>
   assert.ok(body.match(/last_updated:\s*\d{4}-\d{2}-\d{2}T/), 'last_updated should be present');
 });
 
+await test('write_memory: mode=replace overwrites body, preserves frontmatter', async () => {
+  await plugin.tool.write_memory.execute({
+    topic: 'Replace Mode Test',
+    content: 'Original content.',
+    summary: 'Replace mode test',
+    pin: false,
+  });
+  const result = await plugin.tool.write_memory.execute({
+    topic: 'Replace Mode Test',
+    content: 'Replaced content.',
+    summary: 'Replace mode test updated',
+    mode: 'replace',
+    pin: false,
+  });
+  assert.ok(result.includes('updated'), `expected "updated", got: ${result}`);
+  const body = fs.readFileSync(path.join(MEMORY_DIR, 'replace-mode-test.md'), 'utf8');
+  assert.ok(body.includes('Replaced content.'), 'new content should be present');
+  assert.ok(!body.includes('Original content.'), 'old content should be gone after replace');
+  assert.ok(body.startsWith('---\n'), 'frontmatter should be preserved');
+  assert.ok(body.match(/last_updated:\s*\d{4}-\d{2}-\d{2}T/), 'last_updated should be advanced');
+  assert.ok(!body.match(/## \d{4}-\d{2}-\d{2}T/), 'no dated append heading should be present');
+});
+
 await test('write_memory: pin=true adds [pin] to index entry', async () => {
   await plugin.tool.write_memory.execute({
     topic: 'Pinned Topic',
