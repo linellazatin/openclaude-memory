@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/@openlines/openclaude-memory)](https://www.npmjs.com/package/@openlines/openclaude-memory)
 [![license](https://img.shields.io/npm/l/@openlines/openclaude-memory)](./LICENSE)
 
-Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally. OPEN. CONFIGURABLE.
+OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
 ## Why
 
@@ -45,7 +45,7 @@ Just files, structure, and an agent that knows where to look.
 1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `RULES.jsonc` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection then repeats every `inject_every_n_turns` turns (default: 5) and immediately after any memory tool mutation, keeping memory salient without paying the token cost every turn.
 2. **Topic files**: `MEMORY.md` is a concise index (one line per topic). Detail lives in separate topic files (`~/.config/opencode/memory/<topic>.md`), loaded on-demand by the agent when it needs more context.
 3. **Native tools**: The plugin registers `write_memory`, `remove_memory`, and `pin_memory` tools. The agent calls these instead of raw file operations — the plugin guarantees consistent format, frontmatter, and index maintenance every time. After each tool call the cache is invalidated and a dirty flag is set, so the next turn re-injects the updated index.
-4. **Auto-writes**: The agent writes to memory automatically when it solves issues, discovers infrastructure, identifies reusable commands, or learns hardware/model facts — no prompting needed. Reliability varies by model; see [Model compatibility](#model-compatibility).
+4. **Auto-writes**: The agent writes to memory proactively — without being asked — when it learns something worth keeping: user preferences, feedback on how to approach work, project constraints, or pointers to external systems. Memories are typed (`user`, `feedback`, `project`, `reference`), and structured entries include a `Why:` + `How to apply:` section so the agent can reason about edge cases, not just recite facts. Reliability varies by model; see [Model compatibility](#model-compatibility).
 5. **Manual control**: Use `/memory` to view the current index, `/memory <text>` to store a fact immediately, `/memory pin <topic>` to pin an entry, `/memory unpin <topic>` to unpin, or `/memory remove <topic>` to remove one.
 6. **Compaction**: When context compression runs, the plugin forces a fresh disk read and injects the current memory state into the compaction context, ensuring memory survives the compaction cleanly. The injection counter is also reset so the first turn after compaction re-injects the index.
 7. **Bootstrap**: On first run, the plugin creates `MEMORY.md` and `RULES.jsonc` automatically. Nothing to set up.
@@ -58,7 +58,7 @@ The plugin registers three tools that the agent calls directly. These replace ra
 
 | Tool | Args | What it does |
 |---|---|---|
-| `write_memory` | `topic`, `content`, `summary`, `pin?` | Creates a new topic file with YAML frontmatter, or appends to an existing one under a dated heading. Upserts the `MEMORY.md` index entry with today's date. |
+| `write_memory` | `topic`, `content`, `summary`, `pin?`, `mode?` | Creates a new topic file with YAML frontmatter, or updates an existing one. `mode: "append"` (default) adds content under a new dated heading; `mode: "replace"` overwrites the body while preserving frontmatter. Upserts the `MEMORY.md` index entry automatically. |
 | `remove_memory` | `topic` | Removes the index entry (case-insensitive match). Refuses if the entry is pinned. Topic file is preserved on disk. |
 | `pin_memory` | `topic`, `pin` (bool) | Pins (`true`) or unpins (`false`) an index entry. Pinned entries are never flagged as stale and cannot be removed. |
 
@@ -253,7 +253,7 @@ Estimates based on [Claude's tokenizer](https://www.claudetokenizer.com/) averag
 
 ## Disk I/O and injection overhead
 
-Prior to v0.2.0, the plugin read `MEMORY.md` and `RULES.md` from disk on **every turn** and injected both into every system prompt. As of v0.3.0, `RULES.jsonc` replaces `RULES.md` and only the behavioral rule arrays are rendered and injected — scalar config keys are excluded from the system prompt.
+Prior to v0.2.0, the plugin read `MEMORY.md` and `RULES.md` from disk on **every turn** and injected both into every system prompt. As of v0.3.0, `RULES.jsonc` replaces `RULES.md` and only the behavioral rule arrays are rendered and injected — scalar config keys are excluded from the system prompt. As of v0.4.0, `write_memory` accepts an optional `mode` parameter (`"append"` | `"replace"`) for overwriting stale content in place.
 
 As of v0.2.0, two complementary optimizations apply (carried forward in v0.3.0):
 

@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-08-12
+
+### Added (all mjs)
+
+- `mode` parameter on `write_memory` (`"append"` | `"replace"`, default `"append"`). `"replace"` overwrites the topic body while preserving frontmatter and advancing `last_updated` — no dated heading is appended. Mirrors Claude Code's "rewrite stale content" principle. Backwards compatible: existing callers without `mode` get the previous append behavior.
+- 1 new smoke test for `mode: replace` (23 tests total, was 22).
+
+### Added (core SKILL)
+
+- **Memory Types** section: 4-type taxonomy (`user`, `feedback`, `project`, `reference`) with per-type guidance on when to save, when to recall, and what body structure to use. `feedback` and `project` types get a `Rule → **Why:** → **How to apply:**` scaffold.
+- **When to save** section: proactive saving triggers, and a principle-based "do not save" list (code derivable from codebase, git history, debugging recipes, ephemeral state, things in AGENTS.md/CLAUDE.md).
+- **Freshness verification** section: before acting on any file path, function name, or flag named in a memory, grep/read to confirm it still exists.
+- **Cross-linking** convention: use `[[slug]]` in topic file bodies to reference related memories.
+- `description` field re-stated as a relevance/gateway trigger, not a summary.
+- `mode` parameter documented in the "Updating an existing topic" section.
+
+### Changed
+
+- `INITIAL_RULES_JSONC` `never_persist` defaults rewritten from generic examples to principle-based exclusions: `code patterns derivable from the codebase, git history, debugging fix recipes, ephemeral task state, things already in AGENTS.md/CLAUDE.md, large code blocks`. Existing users' `~/.config/opencode/memory/RULES.jsonc` on disk is unaffected — only fresh installs (or users who delete their `RULES.jsonc`) receive the new defaults, so feel free to add these into your already existing config.
+
+### Notes
+
+- The methodology additions to `SKILL.md` (types, proactive saving, structured body) are all stemmed from how Claude Code does its memory. Inspired by how Claude Code's internal memory system structures memories by type, captures both corrections and confirmations, and guides agents to reason about edge cases rather than just recite facts - thus OPENCLAUDE lol.
+
 ## [0.3.0] - 2026-08-10
 
 ### Added
