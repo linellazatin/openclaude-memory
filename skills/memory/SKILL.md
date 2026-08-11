@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.2.0
+version: 0.5.0
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -26,7 +26,7 @@ The plugin registers three native tools. Use these instead of raw Write/Edit too
 
 | Tool | Args | What it does |
 |---|---|---|
-| `write_memory` | `topic`, `content`, `summary`, `pin?` | Creates or appends to a topic file; upserts MEMORY.md index entry |
+| `write_memory` | `topic`, `content`, `summary`, `pin?`, `mode?` | Creates or appends to a topic file; upserts MEMORY.md index entry |
 | `remove_memory` | `topic` | Removes the index entry (refuses if pinned); topic file preserved |
 | `pin_memory` | `topic`, `pin` (bool) | Pins or unpins an index entry |
 
@@ -74,14 +74,9 @@ Save **proactively** — without being asked — when you learn any of the follo
 - A non-obvious project constraint, decision, or deadline emerged (`project` type)
 - You learned where something lives in an external system (`reference` type)
 
-**Do not save:**
+**What to always persist, never persist, and always ask before persisting** is user-configurable via `~/.config/opencode/memory/RULES.jsonc`. The plugin injects these rules into your context under `## Memory Rules` at the start of each session. Follow what is there — not a hardcoded list.
 
-- Code patterns, conventions, or architecture derivable from reading the codebase
-- Git history — `git log` and `git blame` are authoritative
-- Debugging fix recipes — the fix is in the code; the commit message has the context
-- Ephemeral in-session task state (current todos, work-in-progress, plan details)
-- Anything already documented in `AGENTS.md`, `CLAUDE.md`, or project config files
-- Large code blocks — summarize the insight or link to the file path instead
+If `## Memory Rules` is not in your current context, read `~/.config/opencode/memory/RULES.jsonc` directly before deciding whether to save.
 
 ## Reading memory
 
