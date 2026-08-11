@@ -30,6 +30,59 @@ The plugin registers three native tools. Use these instead of raw Write/Edit too
 | `remove_memory` | `topic` | Removes the index entry (refuses if pinned); topic file preserved |
 | `pin_memory` | `topic`, `pin` (bool) | Pins or unpins an index entry |
 
+## Memory Types
+
+When calling `write_memory`, assign the topic to one of four categories. Set the type in the topic file's frontmatter by including it in your `content` block:
+
+```yaml
+metadata:
+  node_type: memory
+  type: feedback   # user | feedback | project | reference
+```
+
+| Type | What it stores | When to save | Body structure |
+|---|---|---|---|
+| `user` | Who the user is: role, expertise, preferences, tools, goals | When you learn something about the user that should change how you work with them in future sessions | Plain prose |
+| `feedback` | How to approach work — corrections AND validated approaches | When corrected ("don't do X") OR when something non-obvious works well ("yes, keep doing that") | Rule → **Why:** → **How to apply:** |
+| `project` | Ongoing work, decisions, constraints, deadlines | When you learn a non-obvious constraint, decision, or stakeholder requirement | Fact → **Why:** → **How to apply:** |
+| `reference` | Pointers to external systems | When you learn where information lives (repos, boards, dashboards, channels, issue trackers) | Plain prose |
+
+For `feedback` and `project` types, structure the body like this:
+
+```
+Rule or fact statement.
+
+**Why:** The incident or preference that prompted this.
+**How to apply:** When it kicks in and edge-case guidance.
+```
+
+Example:
+
+```markdown
+Don't mock the database in integration tests.
+
+**Why:** Prior incident where mock/prod divergence masked a broken migration — mocked tests passed, prod deploy failed.
+**How to apply:** Any time tests touch data persistence — always use the real DB, even in CI.
+```
+
+## When to save
+
+Save **proactively** — without being asked — when you learn any of the following mid-session:
+
+- Something about the user that should change how you work with them in future sessions (`user` type)
+- An approach was corrected or a non-obvious approach was confirmed (`feedback` type)
+- A non-obvious project constraint, decision, or deadline emerged (`project` type)
+- You learned where something lives in an external system (`reference` type)
+
+**Do not save:**
+
+- Code patterns, conventions, or architecture derivable from reading the codebase
+- Git history — `git log` and `git blame` are authoritative
+- Debugging fix recipes — the fix is in the code; the commit message has the context
+- Ephemeral in-session task state (current todos, work-in-progress, plan details)
+- Anything already documented in `AGENTS.md`, `CLAUDE.md`, or project config files
+- Large code blocks — summarize the insight or link to the file path instead
+
 ## Reading memory
 
 `MEMORY.md` is injected into your context by the plugin on the first turn of each session, every `inject_every_n_turns` turns (default: 5), and immediately after any memory tool call. If it is not in your current context, read it directly:
@@ -61,6 +114,14 @@ Call `write_memory` with:
 - `content`: the full detail content to write
 - `summary`: a one-line summary for the index
 - `pin`: `true` if the topic is permanent (hardware, user identity, core workflows)
+- `mode`: `"append"` (default) or `"replace"` — see "Updating an existing topic" below
+
+Set `description` in the frontmatter (included in your `content`) as a **relevance trigger** — the sentence that would cause you to load this file in a future conversation. Not a summary of what it says; a trigger for *when* to read it.
+
+```
+Bad:  "Notes about the user's PostgreSQL setup"
+Good: "Read when the user asks about database config, connection issues, or migration errors"
+```
 
 The plugin will:
 1. Derive a slug filename from the topic name (lowercase, hyphens)
@@ -69,7 +130,10 @@ The plugin will:
 
 ### Updating an existing topic
 
-Call `write_memory` with the same `topic` name. The plugin appends the new content under a `## YYYY-MM-DDTHH:MM:SS±HH:MM` datetime heading and updates `last_updated` in the file's frontmatter. The index date is updated automatically.
+Call `write_memory` with the same `topic` name and one of two modes:
+
+- `mode: "append"` (default) — adds the new content under a `## YYYY-MM-DDTHH:MM:SS±HH:MM` heading. Use for new information that extends an existing topic. The full history is preserved.
+- `mode: "replace"` — overwrites the body, preserving frontmatter and advancing `last_updated`. Use when existing content is stale and the new content fully supersedes it. No dated heading is added.
 
 ### Index discipline
 
@@ -85,6 +149,26 @@ Use `pin_memory({ topic, pin: true })` to pin. Use `pin_memory({ topic, pin: fal
 Use `[pin]` for topics that should never be cleaned up: hardware specs, user identity, core workflows, permanent reference material.
 
 Never remove `[pin]` from an entry unless the user explicitly asks.
+
+### Cross-linking
+
+In a topic file body, use `[[slug]]` to reference a related memory:
+
+```
+See also: [[postgresql-setup]], [[user-profile]]
+```
+
+Where `slug` is the topic's filename without `.md` (e.g. `postgresql-setup` for `postgresql-setup.md`). A `[[slug]]` that doesn't match an existing file yet is valid — it marks something worth writing later.
+
+## Freshness verification
+
+Before acting on anything named in a memory — a file path, function name, config flag, or external URL — verify it still exists:
+
+- **File path** → `Read` or `Glob` to confirm the file is there
+- **Function or symbol** → `grep` for the name in the codebase
+- **Config key or flag** → check the relevant config file
+
+A memory that names a specific file or function is a claim made when the memory was written. It may have been renamed, removed, or never merged. Trust what you observe now over what the memory says. If the named thing is gone, update or remove the memory rather than acting on stale information.
 
 ## Staleness flags
 

@@ -29,9 +29,12 @@ const INITIAL_RULES_JSONC = `{
   ],
   // What to never persist
   "never_persist": [
-    "Session-specific context that won't apply to future sessions",
-    "Opinions or preferences not confirmed by the user",
-    "Large blocks of code — summarize instead, or link to the file path"
+    "Code patterns, conventions, or architecture derivable from reading the codebase",
+    "Git history — use git log/blame instead",
+    "Debugging fix recipes — the fix is in the code; the commit message has the context",
+    "Ephemeral in-session task state (todos, current work-in-progress)",
+    "Anything already documented in AGENTS.md, CLAUDE.md, or project config files",
+    "Large code blocks — summarize the insight or link to the file path instead"
   ],
   // Always ask before persisting (non-overridable)
   "always_ask": [
@@ -376,10 +379,11 @@ const tools = {
         content: { type: 'string', description: 'The content to write or append to the topic file' },
         summary: { type: 'string', description: 'One-line summary for the MEMORY.md index entry' },
         pin:     { type: 'boolean', description: 'Pin this entry so it is never a cleanup candidate', default: false },
+        mode:    { type: 'string', enum: ['append', 'replace'], description: 'append (default): add content under a new date heading. replace: overwrite the body, keeping frontmatter and advancing last_updated.', default: 'append' },
       },
     },
     async execute(args) {
-      const { topic, content, summary, pin } = args;
+      const { topic, content, summary, pin, mode = 'append' } = args;
 
       ensureMemoryDir();
 
@@ -405,6 +409,17 @@ const tools = {
         const now = nowIso();
         const frontmatter = `---\nname: ${topic}\ndescription: ${summary}\ncreated: ${now}\nlast_updated: ${now}\nmetadata:\n  node_type: memory\n---\n\n`;
         fs.writeFileSync(topicPath, frontmatter + content + '\n', 'utf8');
+      } else if (mode === 'replace') {
+        const now = nowIso();
+        const existing = fs.readFileSync(topicPath, 'utf8');
+        const fmMatch = existing.match(/^(---\n[\s\S]*?\n---\n)/);
+        let fm = fmMatch ? fmMatch[1] : '';
+        if (fm.includes('last_updated:')) {
+          fm = fm.replace(/^(last_updated:\s*).*$/m, `$1${now}`);
+        } else if (fm.includes('created:')) {
+          fm = fm.replace(/^(created:.*)$/m, `$1\nlast_updated: ${now}`);
+        }
+        fs.writeFileSync(topicPath, fm + '\n' + content + '\n', 'utf8');
       } else {
         const now = nowIso();
         const existing = fs.readFileSync(topicPath, 'utf8');
