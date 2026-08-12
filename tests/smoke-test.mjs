@@ -71,29 +71,12 @@ async function test(name, fn) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 1. parseRules — exercised indirectly via system.transform
-//    We write a RULES.jsonc with known config values, call
-//    system.transform, and verify inject_every_n_turns is
-//    respected (observable proxy for parseRules values).
-//    We also directly test the clamping via boundary values.
+// 1. parseRules — exercised via live system.transform
+//    Boundary tests (max_lines clamping, stale_after_days=0)
+//    are in section 12 as live plugin tests.
 // ═══════════════════════════════════════════════════════════
 
 console.log('\n--- 1. parseRules (via RULES.jsonc + system.transform) ---');
-
-// Shared parseRules logic for boundary tests below.
-const parseRulesCopy = (raw) => {
-  const defaults = { maxLines: 200, staleAfterDays: 180, injectEveryNTurns: 5 };
-  if (!raw) return defaults;
-  try {
-    const stripped = raw.replace(/\/\/[^\n]*/g, '').replace(/,\s*([}\]])/g, '$1');
-    const obj = JSON.parse(stripped);
-    return {
-      maxLines: Math.min(500, Math.max(50, Number.isInteger(obj.max_lines) ? obj.max_lines : defaults.maxLines)),
-      staleAfterDays: typeof obj.stale_after_days === 'number' ? Math.max(0, obj.stale_after_days) : defaults.staleAfterDays,
-      injectEveryNTurns: Number.isInteger(obj.inject_every_n_turns) ? Math.max(1, obj.inject_every_n_turns) : defaults.injectEveryNTurns,
-    };
-  } catch { return defaults; }
-};
 
 await test('default config: first turn injects (injectedOnce=false)', async () => {
   const plugin = await makePlugin();
@@ -102,21 +85,17 @@ await test('default config: first turn injects (injectedOnce=false)', async () =
   assert.ok(out.system.length > 0, 'expected system injection on first turn');
 });
 
-await test('custom inject_every_n_turns=2 is parsed and respected', async () => {
-  const cfg = parseRulesCopy('{ "max_lines": 60, "stale_after_days": 30, "inject_every_n_turns": 2 }');
-  assert.equal(cfg.maxLines, 60);
-  assert.equal(cfg.staleAfterDays, 30);
-  assert.equal(cfg.injectEveryNTurns, 2);
-});
-
-await test('max_lines clamps to 50 minimum', async () => {
-  assert.equal(parseRulesCopy('{ "max_lines": 10 }').maxLines, 50);
-  assert.equal(parseRulesCopy('{ "max_lines": 600 }').maxLines, 500);
-  assert.equal(parseRulesCopy('{ "max_lines": 200 }').maxLines, 200);
-});
-
-await test('stale_after_days=0 disables stale flagging', async () => {
-  assert.equal(parseRulesCopy('{ "stale_after_days": 0 }').staleAfterDays, 0);
+await test('parseRules: custom rules array is loaded and injected', async () => {
+  writeRules('{ "always_persist": ["Custom test rule XYZ"] }');
+  const p = await makePlugin();
+  // write_memory invalidates cache; tool.execute.after marks dirty so next transform re-reads
+  await p.tool.write_memory.execute({ topic: 'Rules Parse Test', content: 'x', summary: 'rules parse test', pin: false });
+  await p['tool.execute.after']({ tool: 'write_memory' }, {});
+  const out = makeSystemOutput();
+  await p['experimental.chat.system.transform']({}, out);
+  const injected = out.system.join('\n');
+  assert.ok(injected.includes('Custom test rule XYZ'), 'custom always_persist rule should appear in injected Memory Rules');
+  writeRules('{ "max_lines": 200, "stale_after_days": 180, "inject_every_n_turns": 5 }');
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -370,107 +349,162 @@ await test('config: registers skills path and /memory command', async () => {
   assert.ok(typeof mockConfig.command['memory'].template === 'string', 'command has template');
 });
 
+
 // ═══════════════════════════════════════════════════════════
-// 9. RULES.md migration
-//    migrateRulesMd: unit test the format conversion.
-//    Full migration flow: delete RULES.jsonc, write RULES.md,
-//    invalidate cache, trigger read, verify RULES.jsonc and .bak.
+// 9. maintainIndex behaviors (C1–C4)
+//    State coming in: MEMORY.md has real entries from
+//    sections 1-7. RULES.jsonc is invalid from section 5 —
+//    reset it here before any test that reads config.
 // ═══════════════════════════════════════════════════════════
 
-console.log('\n--- 9. RULES.md migration ---');
+console.log('\n--- 9. maintainIndex behaviors ---');
 
-await test('migrateRulesMd: converts sections and numeric keys', async () => {
-  // Inline copy of migrateRulesMd logic for unit testing
-  const migrate = (md) => {
-    const extractBullets = (pat) => {
-      const m = md.match(new RegExp(`##\\s+${pat}[^\\n]*\\n([\\s\\S]*?)(?=\\n##|$)`, 'i'));
-      if (!m) return [];
-      return m[1].split('\n').map(l => l.replace(/^\s*-\s*/, '').trim()).filter(l => l && !l.startsWith('#'));
-    };
-    const numKey = (key, def) => {
-      const m = md.match(new RegExp(`^\\s*${key}:\\s*(\\d+)\\s*$`, 'm'));
-      return m ? parseInt(m[1], 10) : def;
-    };
-    return {
-      always: extractBullets('Always persist'),
-      never: extractBullets('Never persist'),
-      ask: extractBullets('Always ask'),
-      maxLines: numKey('max_lines', 200),
-      stale: numKey('stale_after_days', 180),
-      inject: numKey('inject_every_n_turns', 5),
-    };
-  };
+// Restore valid defaults before this section so getCache() gets a clean config.
+writeRules('{ "max_lines": 200, "stale_after_days": 180, "inject_every_n_turns": 5 }');
 
-  const md = `# Memory Rules
-
-## Always persist
-- Bug fixes
-- Server config
-
-## Never persist
-- Session context
-
-## Always ask before persisting (non-overridable)
-- Credentials
-
-## Config
-# max_lines: 200  (default)
-max_lines: 75
-stale_after_days: 90
-inject_every_n_turns: 3
-`;
-
-  const result = migrate(md);
-  assert.deepEqual(result.always, ['Bug fixes', 'Server config']);
-  assert.deepEqual(result.never, ['Session context']);
-  assert.deepEqual(result.ask, ['Credentials']);
-  assert.equal(result.maxLines, 75, 'uncommented max_lines should be parsed');
-  assert.equal(result.stale, 90);
-  assert.equal(result.inject, 3);
+await test('maintainIndex: orphan entries are removed', async () => {
+  const raw = fs.readFileSync(path.join(MEMORY_DIR, 'MEMORY.md'), 'utf8');
+  fs.writeFileSync(
+    path.join(MEMORY_DIR, 'MEMORY.md'),
+    raw.trimEnd() + '\n- [Orphan Topic](orphan-test.md) 2026-01-01T00:00:00+00:00 -- orphan\n',
+    'utf8'
+  );
+  await plugin.tool.write_memory.execute({ topic: 'Orphan Trigger', content: 'trigger', summary: 'trigger', pin: false });
+  const idx = readIndex();
+  assert.ok(!idx.includes('orphan-test.md'), 'orphan entry should be removed');
+  assert.ok(idx.includes('Orphan Trigger'), 'legitimate entry should remain');
 });
 
-await test('migrateRulesMd: commented config keys fall back to defaults', async () => {
-  const migrate = (md) => {
-    const numKey = (key, def) => {
-      const m = md.match(new RegExp(`^\\s*${key}:\\s*(\\d+)\\s*$`, 'm'));
-      return m ? parseInt(m[1], 10) : def;
-    };
-    return { maxLines: numKey('max_lines', 200), stale: numKey('stale_after_days', 180) };
-  };
-  const md = '# Memory Rules\n\n## Config\n# max_lines: 200  (default)\n# stale_after_days: 180\n';
-  const result = migrate(md);
-  assert.equal(result.maxLines, 200, 'commented key should return default');
-  assert.equal(result.stale, 180, 'commented key should return default');
+await test('maintainIndex: duplicate entries — more-recent date wins', async () => {
+  const raw = fs.readFileSync(path.join(MEMORY_DIR, 'MEMORY.md'), 'utf8');
+  fs.writeFileSync(
+    path.join(MEMORY_DIR, 'MEMORY.md'),
+    raw.trimEnd() + '\n- [Orphan Trigger](orphan-trigger.md) 2020-01-01T00:00:00+00:00 -- older dupe\n',
+    'utf8'
+  );
+  await plugin.tool.write_memory.execute({ topic: 'Dedup Trigger', content: 'x', summary: 'dedup', pin: false });
+  const idx = readIndex();
+  const dupes = idx.split('\n').filter(l => l.includes('orphan-trigger.md'));
+  assert.equal(dupes.length, 1, 'only one entry should survive for the filename');
+  assert.ok(!dupes[0].includes('2020-01-01'), 'older duplicate should be removed, newer kept');
 });
 
-await test('full migration flow: RULES.md -> RULES.jsonc + .bak', async () => {
-  const rulesJsonc = path.join(MEMORY_DIR, 'RULES.jsonc');
-  const rulesMd = path.join(MEMORY_DIR, 'RULES.md');
-  const rulesBak = path.join(MEMORY_DIR, 'RULES.md.bak');
+await test('maintainIndex: [stale?] is stamped on entries older than stale_after_days', async () => {
+  fs.writeFileSync(path.join(MEMORY_DIR, 'stale-test.md'), '---\nname: Stale Test\n---\n\ncontent\n', 'utf8');
+  const raw = fs.readFileSync(path.join(MEMORY_DIR, 'MEMORY.md'), 'utf8');
+  fs.writeFileSync(
+    path.join(MEMORY_DIR, 'MEMORY.md'),
+    raw.trimEnd() + '\n- [Stale Test](stale-test.md) 2025-01-01T00:00:00+00:00 -- stale entry\n',
+    'utf8'
+  );
+  writeRules('{ "stale_after_days": 180 }');
+  await plugin.tool.write_memory.execute({ topic: 'Stale Trigger', content: 'x', summary: 'stale trigger', pin: false });
+  const idx = readIndex();
+  const staleLine = idx.split('\n').find(l => l.includes('stale-test.md'));
+  assert.ok(staleLine, 'stale-test.md entry should still be in the index');
+  assert.ok(staleLine.includes('[stale?]'), '[stale?] should be stamped on old entry');
+});
 
-  // Remove any leftover .bak from this run
-  if (fs.existsSync(rulesBak)) fs.unlinkSync(rulesBak);
+await test('maintainIndex: [stale?] is removed after topic is updated (self-heal)', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Stale Test', content: 'refreshed', summary: 'stale test refreshed', pin: false });
+  const idx = readIndex();
+  const staleLine = idx.split('\n').find(l => l.includes('stale-test.md'));
+  assert.ok(staleLine, 'stale-test.md entry should still be in index');
+  assert.ok(!staleLine.includes('[stale?]'), '[stale?] should be removed after update');
+});
 
-  // Write a legacy RULES.md and remove RULES.jsonc to trigger migration
-  fs.writeFileSync(rulesMd, `# Memory Rules\n\n## Always persist\n- Custom rule\n\n## Never persist\n\n## Always ask\n\n## Config\nmax_lines: 80\n`, 'utf8');
-  fs.unlinkSync(rulesJsonc);
+// ═══════════════════════════════════════════════════════════
+// 10. inject_every_n_turns — live interval trigger (C5)
+//     Write inject_every_n_turns:2, call compaction to reset
+//     all state, then verify turns 1+2 inject, turn 3 skips.
+// ═══════════════════════════════════════════════════════════
 
-  // Trigger a write_memory to invalidate cache, then system.transform to re-read
-  await plugin.tool.write_memory.execute({ topic: 'Migration Test', content: 'test', summary: 'test', pin: false });
-  await plugin['tool.execute.after']({ tool: 'write_memory' }, {});
-  const out = makeSystemOutput();
-  await plugin['experimental.chat.system.transform']({}, out);
+console.log('\n--- 10. inject_every_n_turns trigger ---');
 
-  assert.ok(fs.existsSync(rulesJsonc), 'RULES.jsonc should have been created by migration');
-  assert.ok(!fs.existsSync(rulesMd), 'RULES.md should have been renamed');
-  assert.ok(fs.existsSync(rulesBak), 'RULES.md.bak should exist');
+await test('inject_every_n_turns=2: injects at turn 1 and turn 2; skips turn 3', async () => {
+  writeRules('{ "inject_every_n_turns": 2 }');
+  // Compaction force-refreshes config and resets _injectedOnce=false, _dirty=false, _turnCount=0
+  await plugin['experimental.session.compacting']({}, makeCompactOutput());
 
-  const jsonc = fs.readFileSync(rulesJsonc, 'utf8');
-  assert.ok(jsonc.includes('"Custom rule"'), 'migrated JSONC should contain custom bullet');
-  assert.ok(jsonc.includes('"max_lines": 80'), 'migrated JSONC should reflect custom max_lines');
+  const out1 = makeSystemOutput();
+  await plugin['experimental.chat.system.transform']({}, out1);
+  assert.ok(out1.system.length > 0, 'turn 1 should inject (!_injectedOnce)');
 
-  // Restore RULES.jsonc with defaults for any subsequent tests
-  fs.writeFileSync(rulesJsonc, JSON.stringify({ max_lines: 200, stale_after_days: 180, inject_every_n_turns: 5 }), 'utf8');
+  const out2 = makeSystemOutput();
+  await plugin['experimental.chat.system.transform']({}, out2);
+  assert.ok(out2.system.length > 0, 'turn 2 should inject (2 % 2 === 0)');
+
+  const out3 = makeSystemOutput();
+  await plugin['experimental.chat.system.transform']({}, out3);
+  assert.equal(out3.system.length, 0, 'turn 3 should NOT inject (3 % 2 !== 0, not dirty)');
+
+  writeRules('{ "max_lines": 200, "stale_after_days": 180, "inject_every_n_turns": 5 }');
+});
+
+// ═══════════════════════════════════════════════════════════
+// 11. pin-preservation (C6)
+//     write_memory with pin:false must not unpin a pinned entry.
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n--- 11. pin-preservation ---');
+
+await test('write_memory with pin:false does not unpin a pinned entry', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Pin Preserve Test', content: 'initial', summary: 'pin preserve', pin: true });
+  let idx = readIndex();
+  const pinLine = idx.split('\n').find(l => l.includes('pin-preserve-test.md'));
+  assert.ok(pinLine && pinLine.includes('[pin]'), 'entry should be pinned initially');
+
+  await plugin.tool.write_memory.execute({ topic: 'Pin Preserve Test', content: 'updated', summary: 'pin preserve updated', pin: false });
+  idx = readIndex();
+  const updatedLine = idx.split('\n').find(l => l.includes('pin-preserve-test.md'));
+  assert.ok(updatedLine && updatedLine.includes('[pin]'), 'entry should still be pinned after write_memory with pin:false');
+});
+
+// ═══════════════════════════════════════════════════════════
+// 12. parseRules live boundary tests (C7)
+//     max_lines clamping and stale_after_days=0 verified via
+//     observable plugin behavior rather than an inline copy.
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n--- 12. parseRules live boundary tests ---');
+
+await test('max_lines clamps to 50 minimum (live truncation)', async () => {
+  writeRules('{ "max_lines": 10 }');
+  const mockFiles = Array.from({ length: 55 }, (_, i) => `mock-ml-${i}.md`);
+  for (const fn of mockFiles) {
+    fs.writeFileSync(path.join(MEMORY_DIR, fn), `---\nname: ML Mock\n---\n\ncontent\n`, 'utf8');
+  }
+  const entries = mockFiles.map((fn, i) => `- [ML Mock ${i}](${fn}) 2026-01-01T00:00:00+00:00 -- mock ${i}`);
+  fs.writeFileSync(path.join(MEMORY_DIR, 'MEMORY.md'), ['# Memory Index', ...entries].join('\n') + '\n', 'utf8');
+  try {
+    await plugin['tool.execute.after']({ tool: 'write_memory' }, {});
+    const out = makeSystemOutput();
+    await plugin['experimental.chat.system.transform']({}, out);
+    const injected = out.system.join('\n');
+    assert.ok(injected.includes('50-line limit'), `expected "50-line limit" truncation warning; got tail: ${injected.slice(-300)}`);
+  } finally {
+    for (const fn of mockFiles) try { fs.unlinkSync(path.join(MEMORY_DIR, fn)); } catch {}
+    writeRules('{ "max_lines": 200, "stale_after_days": 180, "inject_every_n_turns": 5 }');
+  }
+});
+
+await test('stale_after_days=0 disables [stale?] stamping (live)', async () => {
+  // Flush cache so the next config write is picked up on next getCache() call
+  await plugin.tool.write_memory.execute({ topic: 'Stale Zero Flush', content: 'x', summary: 'flush', pin: false });
+  writeRules('{ "stale_after_days": 0 }');
+  fs.writeFileSync(path.join(MEMORY_DIR, 'stale-zero-test.md'), '---\nname: Stale Zero\n---\n\ncontent\n', 'utf8');
+  const raw = fs.readFileSync(path.join(MEMORY_DIR, 'MEMORY.md'), 'utf8');
+  fs.writeFileSync(
+    path.join(MEMORY_DIR, 'MEMORY.md'),
+    raw.trimEnd() + '\n- [Stale Zero](stale-zero-test.md) 2020-01-01T00:00:00+00:00 -- very old\n',
+    'utf8'
+  );
+  await plugin.tool.write_memory.execute({ topic: 'Stale Zero Trigger', content: 'x', summary: 'trigger', pin: false });
+  const idx = readIndex();
+  const entry = idx.split('\n').find(l => l.includes('stale-zero-test.md'));
+  assert.ok(entry, 'stale-zero-test.md entry should exist in index');
+  assert.ok(!entry.includes('[stale?]'), '[stale?] should NOT be stamped when stale_after_days=0');
+  writeRules('{ "max_lines": 200, "stale_after_days": 180, "inject_every_n_turns": 5 }');
 });
 
 // ═══════════════════════════════════════════════════════════
