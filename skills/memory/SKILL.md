@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.5.0
+version: 0.5.2
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -32,13 +32,7 @@ The plugin registers three native tools. Use these instead of raw Write/Edit too
 
 ## Memory Types
 
-When calling `write_memory`, assign the topic to one of four categories. Set the type in the topic file's frontmatter by including it in your `content` block:
-
-```yaml
-metadata:
-  node_type: memory
-  type: feedback   # user | feedback | project | reference
-```
+When calling `write_memory`, assign the topic to one of four categories. Types are an organizing convention for deciding *when* and *how* to write — the plugin does not enforce them and does not write a `type:` frontmatter field automatically.
 
 | Type | What it stores | When to save | Body structure |
 |---|---|---|---|
@@ -111,12 +105,14 @@ Call `write_memory` with:
 - `pin`: `true` if the topic is permanent (hardware, user identity, core workflows)
 - `mode`: `"append"` (default) or `"replace"` — see "Updating an existing topic" below
 
-Set `description` in the frontmatter (included in your `content`) as a **relevance trigger** — the sentence that would cause you to load this file in a future conversation. Not a summary of what it says; a trigger for *when* to read it.
+The `summary` argument is written as `description:` in the file's YAML frontmatter by the plugin. Write it as a **relevance trigger** — the sentence that would cause you to load this file in a future conversation. Not a summary of what the file says; a trigger for *when* to read it.
 
 ```
 Bad:  "Notes about the user's PostgreSQL setup"
 Good: "Read when the user asks about database config, connection issues, or migration errors"
 ```
+
+Do not embed a `description:` key in the `content` argument — content is written to the file body, not frontmatter.
 
 The plugin will:
 1. Derive a slug filename from the topic name (lowercase, hyphens)
@@ -129,6 +125,8 @@ Call `write_memory` with the same `topic` name and one of two modes:
 
 - `mode: "append"` (default) — adds the new content under a `## YYYY-MM-DDTHH:MM:SS±HH:MM` heading. Use for new information that extends an existing topic. The full history is preserved.
 - `mode: "replace"` — overwrites the body, preserving frontmatter and advancing `last_updated`. Use when existing content is stale and the new content fully supersedes it. No dated heading is added.
+
+**Pin-preservation**: passing `pin: false` to `write_memory` on an already-pinned entry does NOT unpin it — the existing `[pin]` is preserved. Use `pin_memory({ topic, pin: false })` to explicitly unpin.
 
 ### Index discipline
 
@@ -188,7 +186,7 @@ When you see `[stale?]` entries in the index, you can:
 
 ## When the cap is hit
 
-If the injected `## Global Memory` block contains a truncation warning (`memory truncated`), the index has exceeded the configured line limit and must be trimmed. Steps:
+If the injected `## Global Memory` block contains a truncation warning (`memory truncated`), the index has exceeded either the configured line limit (`max_lines`, default 200) or the hard 25 KB byte cap. Either condition triggers truncation and the same trim procedure below. Steps:
 
 1. Read `MEMORY.md` in full to assess all entries.
 2. Identify entries that are candidates for removal. Check in this order:
@@ -199,6 +197,12 @@ If the injected `## Global Memory` block contains a truncation warning (`memory 
 3. If all entries are still valid but the count is high, consolidate: merge two closely related topic files into one using `write_memory`, then `remove_memory` on the now-redundant entry.
 4. Topic file content is never deleted — only index lines are removed.
 5. Re-read `MEMORY.md` after trimming to confirm it is under the configured limit.
+
+## TUI browser
+
+The optional TUI plugin (`ocl-memory-tui.mjs`, registered in `tui.jsonc`) provides an interactive memory browser at `ctrl+alt+m`. From it you can view, pin/unpin, and remove index entries without an LLM turn.
+
+TUI mutations (pin/unpin, remove) write a `.invalidate` sentinel file to the memory directory. On the next agent interaction, the server plugin detects the sentinel, discards its cache, and re-reads the index from disk. Changes made via the TUI are therefore visible after the next agent turn — not instantly within the current one.
 
 ## Persist rules
 

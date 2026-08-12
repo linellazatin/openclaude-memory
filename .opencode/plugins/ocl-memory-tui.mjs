@@ -7,6 +7,7 @@ const MEMORY_DIR = path.join(
   'opencode', 'memory'
 );
 const MEMORY_INDEX = path.join(MEMORY_DIR, 'MEMORY.md');
+const DIRTY_SENTINEL = path.join(MEMORY_DIR, '.invalidate');
 
 // Parse MEMORY.md into structured entries.
 // Line format: - [Name](file.md) [pin] YYYY-MM-DDTHH:MM:SS±HH:MM [stale?] -- summary
@@ -41,12 +42,14 @@ function setPin(filename, pin) {
     return line;
   });
   fs.writeFileSync(MEMORY_INDEX, updated.join('\n'), 'utf8');
+  try { fs.writeFileSync(DIRTY_SENTINEL, '', 'utf8'); } catch {}
 }
 
 // Remove the index line matched by filename (topic file on disk is preserved).
 function removeEntry(filename) {
   const lines = fs.readFileSync(MEMORY_INDEX, 'utf8').split('\n');
   fs.writeFileSync(MEMORY_INDEX, lines.filter(l => !l.includes(`](${filename})`)).join('\n'), 'utf8');
+  try { fs.writeFileSync(DIRTY_SENTINEL, '', 'utf8'); } catch {}
 }
 
 // Read topic file: strip YAML frontmatter, return first 10 lines of body content.

@@ -5,6 +5,15 @@
 
 OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
+> ## v0.5.2 - Quick clean-up and updates after hotfix (sorry)
+> - did some code clean-ups (most of which is for the migration function from legacy .md config to .jsonc)
+> - added some caching refresh after index file changes (useful for next agent turn)
+> - fixed SKILL description, clarified memory types, added references to new TUI features
+> - added 8 test cases, covering mostly index maintenance
+> - will add super short updates here moving forward
+> 
+> see [CHANGELOG.md](CHANGELOG.md) for more details
+
 ## Why
 
 I built this because I genuinely like how Claude Code handles memory: no complex algorithms, no external LLM for heavy lifting, no vector databases. It just works — the agent reads a markdown file and acts on it. Simple, transparent, effective.

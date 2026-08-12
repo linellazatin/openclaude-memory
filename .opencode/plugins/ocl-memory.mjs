@@ -8,7 +8,7 @@ const MEMORY_DIR = path.join(
 );
 const MEMORY_INDEX = path.join(MEMORY_DIR, 'MEMORY.md');
 const MEMORY_RULES = path.join(MEMORY_DIR, 'RULES.jsonc');
-const MEMORY_RULES_LEGACY = path.join(MEMORY_DIR, 'RULES.md');
+const DIRTY_SENTINEL = path.join(MEMORY_DIR, '.invalidate');
 
 const MAX_LINES = 200;
 const MAX_BYTES = 25 * 1024;
@@ -70,6 +70,12 @@ let _dirty = false;
 let _turnCount = 0;
 
 function getCache(forceRefresh = false) {
+  // If TUI mutated MEMORY.md directly, it writes a sentinel file to signal us.
+  if (_cache && !forceRefresh && fs.existsSync(DIRTY_SENTINEL)) {
+    try { fs.unlinkSync(DIRTY_SENTINEL); } catch {}
+    _cache = null;
+    _dirty = true;
+  }
   if (!_cache || forceRefresh) {
     const rules = readMemoryRules();
     const config = parseRules(rules);
@@ -131,61 +137,10 @@ function ensureMemoryDir() {
   fs.mkdirSync(MEMORY_DIR, { recursive: true });
 }
 
-// Converts legacy RULES.md content to a RULES.jsonc string.
-// Extracts bullet lists from known sections and uncommented numeric config keys.
-function migrateRulesMd(md) {
-  const extractBullets = (sectionPattern) => {
-    const m = md.match(new RegExp(`##\\s+${sectionPattern}[^\\n]*\\n([\\s\\S]*?)(?=\\n##|$)`, 'i'));
-    if (!m) return [];
-    return m[1].split('\n')
-      .map(l => l.replace(/^\s*-\s*/, '').trim())
-      .filter(l => l && !l.startsWith('#'));
-  };
-
-  const numKey = (key, def) => {
-    const m = md.match(new RegExp(`^\\s*${key}:\\s*(\\d+)\\s*$`, 'm'));
-    return m ? parseInt(m[1], 10) : def;
-  };
-
-  const arr = (items) => items.length
-    ? '[\n' + items.map(i => `    ${JSON.stringify(i)}`).join(',\n') + '\n  ]'
-    : '[]';
-
-  const always = extractBullets('Always persist');
-  const never = extractBullets('Never persist');
-  const ask = extractBullets('Always ask');
-  const maxLines = numKey('max_lines', 200);
-  const stale = numKey('stale_after_days', 180);
-  const inject = numKey('inject_every_n_turns', 5);
-
-  return `{
-  // What to always persist
-  "always_persist": ${arr(always)},
-  // What to never persist
-  "never_persist": ${arr(never)},
-  // Always ask before persisting (non-overridable)
-  "always_ask": ${arr(ask)},
-  // max_lines: valid range 50–500
-  "max_lines": ${maxLines},
-  // stale_after_days: 0 = disable age flagging
-  "stale_after_days": ${stale},
-  // inject_every_n_turns: re-inject memory every N user prompts; 1 = every prompt
-  "inject_every_n_turns": ${inject}
-}
-`;
-}
-
 function readMemoryRules() {
   try {
     if (!fs.existsSync(MEMORY_RULES)) {
       ensureMemoryDir();
-      if (fs.existsSync(MEMORY_RULES_LEGACY)) {
-        const md = fs.readFileSync(MEMORY_RULES_LEGACY, 'utf8');
-        const jsonc = migrateRulesMd(md);
-        fs.writeFileSync(MEMORY_RULES, jsonc, 'utf8');
-        fs.renameSync(MEMORY_RULES_LEGACY, MEMORY_RULES_LEGACY + '.bak');
-        return jsonc;
-      }
       fs.writeFileSync(MEMORY_RULES, INITIAL_RULES_JSONC, 'utf8');
       return INITIAL_RULES_JSONC;
     }
@@ -204,9 +159,11 @@ function readMemoryIndex(maxLines) {
     }
     const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
     const lines = raw.split('\n');
-    if (lines.length > maxLines || Buffer.byteLength(raw) > MAX_BYTES) {
-      const truncated = lines.slice(0, maxLines).join('\n');
-      return truncated + `\n\n<!-- memory truncated: MEMORY.md exceeds ${maxLines}-line limit; shorten the index -->`;
+    if (lines.length > maxLines) {
+      return lines.slice(0, maxLines).join('\n') + `\n\n<!-- memory truncated: MEMORY.md exceeds ${maxLines}-line limit; shorten the index -->`;
+    }
+    if (Buffer.byteLength(raw) > MAX_BYTES) {
+      return lines.slice(0, maxLines).join('\n') + `\n\n<!-- memory truncated: MEMORY.md exceeds 25 KB size limit; shorten the index -->`;
     }
     return raw;
   } catch {
@@ -253,67 +210,50 @@ function daysSince(dateStr) {
 
 function maintainIndex(lines, config) {
   const { staleAfterDays } = config;
-  const seen = new Map(); // filename -> index in lines array (for duplicate detection)
-  const result = [];
 
+  // Pass 1: for each filename, pick the entry with the most-recent date; skip orphans.
+  const best = new Map(); // filename -> raw line (winner)
   for (const line of lines) {
     const parsed = parseIndexLine(line);
-    if (!parsed) {
-      result.push(line);
-      continue;
-    }
+    if (!parsed) continue;
+    const { filename } = parsed;
+    if (!fs.existsSync(path.join(MEMORY_DIR, filename))) continue;
+    const date = (parsed.rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
+    const prev = best.get(filename);
+    const prevDate = prev ? ((parseIndexLine(prev).rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '') : '';
+    if (!prev || date > prevDate) best.set(filename, line);
+  }
 
-    const { filename, prefix, mid } = parsed;
-    let rest = parsed.rest;
+  // Pass 2: rebuild preserving non-entry lines; emit each winner once at first occurrence.
+  const emitted = new Set();
+  const result = [];
+  for (const line of lines) {
+    const parsed = parseIndexLine(line);
+    if (!parsed) { result.push(line); continue; }
+    const { filename } = parsed;
+    if (!best.has(filename) || emitted.has(filename)) continue;
+    emitted.add(filename);
 
-    // Orphan check
-    const fullPath = path.join(MEMORY_DIR, filename);
-    if (!fs.existsSync(fullPath)) {
-      // Remove this line entirely
-      continue;
-    }
-
-    // Duplicate check: keep the one with the more recent date
-    if (seen.has(filename)) {
-      const existingIdx = seen.get(filename);
-      const existingLine = result[existingIdx];
-      const existingDate = (existingLine.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
-      const thisDate = (rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
-      if (thisDate > existingDate) {
-        // Replace the existing one with this one
-        result[existingIdx] = null; // mark for removal
-        seen.set(filename, result.length);
-      } else {
-        // Drop this line
-        continue;
-      }
-    } else {
-      seen.set(filename, result.length);
-    }
-
-    // [stale?] stamping — skip pinned entries
+    // Apply stale stamping to the winner's rest
+    const winner = parseIndexLine(best.get(filename));
+    let rest = winner.rest;
     const isPinned = rest.includes('[pin]');
     if (!isPinned && staleAfterDays > 0) {
       const dateMatch = rest.match(/(\d{4}-\d{2}-\d{2}(?:T[\d:.+-]+)?)/);
       if (dateMatch) {
         const age = daysSince(dateMatch[1]);
         if (age !== null && age > staleAfterDays) {
-          // Stamp [stale?] after the date/datetime token if not already present
-          if (!rest.includes('[stale?]')) {
-            rest = rest.replace(dateMatch[1], dateMatch[1] + ' [stale?]');
-          }
+          if (!rest.includes('[stale?]')) rest = rest.replace(dateMatch[1], dateMatch[1] + ' [stale?]');
         } else {
-          // Remove [stale?] if present (self-heal)
           rest = rest.replace(' [stale?]', '');
         }
       }
     }
 
-    result.push(prefix + parsed.name + mid + rest);
+    result.push(winner.prefix + winner.name + winner.mid + rest);
   }
 
-  // Remove nulls from duplicate elimination
-  return result.filter(l => l !== null);
+  return result;
 }
 
 // --- Shared index search helper ---
