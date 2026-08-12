@@ -372,15 +372,11 @@ const tools = {
   write_memory: {
     description: 'Write or update a memory topic. Creates a new topic file or appends to an existing one. Updates the MEMORY.md index automatically. Use this instead of raw Write/Edit tools for all memory operations.',
     args: {
-      type: 'object',
-      required: ['topic', 'content', 'summary'],
-      properties: {
-        topic:   { type: 'string', description: 'Topic name, e.g. "PostgreSQL Setup" or "Homelab Server"' },
-        content: { type: 'string', description: 'The content to write or append to the topic file' },
-        summary: { type: 'string', description: 'One-line summary for the MEMORY.md index entry' },
-        pin:     { type: 'boolean', description: 'Pin this entry so it is never a cleanup candidate', default: false },
-        mode:    { type: 'string', enum: ['append', 'replace'], description: 'append (default): add content under a new date heading. replace: overwrite the body, keeping frontmatter and advancing last_updated.', default: 'append' },
-      },
+      topic:   { type: 'string', description: 'Topic name, e.g. "PostgreSQL Setup" or "Homelab Server"' },
+      content: { type: 'string', description: 'The content to write or append to the topic file' },
+      summary: { type: 'string', description: 'One-line summary for the MEMORY.md index entry' },
+      pin:     { type: 'boolean', description: 'Pin this entry so it is never a cleanup candidate', default: false },
+      mode:    { type: 'string', enum: ['append', 'replace'], description: 'append (default): add content under a new date heading. replace: overwrite the body, keeping frontmatter and advancing last_updated.', default: 'append' },
     },
     async execute(args) {
       const { topic, content, summary, pin, mode = 'append' } = args;
@@ -452,11 +448,7 @@ const tools = {
   remove_memory: {
     description: 'Remove a topic entry from the MEMORY.md index. The topic file on disk is preserved. Pinned entries cannot be removed.',
     args: {
-      type: 'object',
-      required: ['topic'],
-      properties: {
-        topic: { type: 'string', description: 'Topic name or partial filename to search for (case-insensitive)' },
-      },
+      topic: { type: 'string', description: 'Topic name or partial filename to search for (case-insensitive)' },
     },
     async execute(args) {
       const { topic } = args;
@@ -500,12 +492,8 @@ const tools = {
   pin_memory: {
     description: 'Pin or unpin a memory index entry. Pinned entries are never flagged as stale and cannot be removed.',
     args: {
-      type: 'object',
-      required: ['topic', 'pin'],
-      properties: {
-        topic: { type: 'string', description: 'Topic name or partial filename to search for (case-insensitive)' },
-        pin:   { type: 'boolean', description: 'true to pin, false to unpin' },
-      },
+      topic: { type: 'string', description: 'Topic name or partial filename to search for (case-insensitive)' },
+      pin:   { type: 'boolean', description: 'true to pin, false to unpin' },
     },
     async execute(args) {
       const { topic, pin } = args;
