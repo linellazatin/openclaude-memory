@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.2] - 2026-08-12
+
+### Changed
+
+- `maintainIndex`: replaced single-pass null-placeholder approach with a clean two-pass implementation. Pass 1 builds a `Map<filename, best_raw_line>` (most-recent date wins, orphan files excluded). Pass 2 rebuilds the array emitting each winner once at its first-occurrence position. No null values in the result, no `.filter()` call. Behavior is equivalent for well-formed indexes.
+- `readMemoryIndex`: split the byte/line truncation guard into two separate checks — line-limit fires emit "exceeds N-line limit"; byte-limit fires emit "exceeds 25 KB size limit". Previously both paths emitted the line-limit message.
+- `getCache()`: added `.invalidate` sentinel check — if the TUI plugin (separate process) wrote the sentinel after a mutation, the server plugin discards its cache and sets `_dirty=true` on the next turn, ensuring TUI changes are visible to the agent after one interaction.
+- `ocl-memory-tui.mjs`: `setPin` and `removeEntry` now write a `.invalidate` sentinel file after mutating `MEMORY.md`, triggering a server-plugin cache refresh on the next agent turn.
+
+### Removed
+
+- `migrateRulesMd` function (~50 lines): dead code since v0.3.0 — any install that ran once post-v0.3.0 has already migrated via the `.bak` rename and the function can never re-run. Removed cleanly.
+- `MEMORY_RULES_LEGACY` constant (no longer needed after migration removal).
+
+### Fixed (SKILL.md)
+
+- `summary` arg vs `description:` frontmatter confusion: `summary` is what the plugin writes as `description:` in frontmatter — documented correctly. Removed the misleading instruction to embed `description:` in the `content` block.
+- Memory types framing: types are an agent organizing convention, not plugin-enforced frontmatter fields. Removed the YAML snippet that implied setting `type:` in content.
+- Added 25 KB hard byte cap to the "When the cap is hit" section — previously only the `max_lines` limit was mentioned.
+- Pin-preservation asymmetry documented: `write_memory` with `pin: false` on a pinned entry preserves the pin; use `pin_memory({ pin: false })` to explicitly unpin.
+- Added TUI browser section: `ctrl+alt+m` keybinding, `.invalidate` sentinel cache-refresh behavior, visibility timing.
+- `version` field bumped to `0.5.2`.
+
+### Tests
+
+- Removed `parseRulesCopy` inline function copy from section 1; replaced with live observable-behavior tests (sections 12, and new section 1 test 2).
+- Added 8 new tests covering `maintainIndex` orphan removal, duplicate deduplication, `[stale?]` stamping and self-heal, `inject_every_n_turns` interval trigger, `write_memory` pin-preservation, and `max_lines`/`stale_after_days=0` live boundary tests. Total: 26 tests (was 20).
+
 ## [0.5.1] - 2026-08-12 (HOTFIX)
 
 ### Fixed
