@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-08-12 (HOTFIX)
+
+### Fixed
+
+- `write_memory`, `remove_memory`, `pin_memory` tools broken since `cdb4752` (Aug 10, "config restructure" - simplification - sorry). That commit removed the `zod` import and replaced all tool `args` with a wrapped JSON Schema object (`{ type: 'object', required: [...], properties: {...} }`). opencode's plugin registry detects Zod schemas by checking for a `_zod` property on each value — if none are found, it falls back to `legacyJsonSchema()`, which expects a **flat** `{ paramName: JSONSchema7Definition }` map. The wrapped envelope caused the registry to treat `type`, `required`, and `properties` as the parameter names instead; `execute(args)` was then called with all actual args (`topic`, `content`, `summary`, etc.) as `undefined`, producing `undefined is not an object (evaluating 'topic.toLowerCase')` at runtime. Fixed by stripping the outer wrapper and passing the flat property map directly — matching what `legacyJsonSchema()` expects.
+
 ## [0.5.0] - 2026-08-12
 
 ### Added — TUI memory browser
