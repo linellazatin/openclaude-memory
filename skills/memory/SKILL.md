@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.5.2
+version: 0.5.3
 author: Lines
 license: MIT
 platforms: [linux, macos]

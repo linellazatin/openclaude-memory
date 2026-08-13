@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.3] - 2026-08-14
+
+### Changed
+
+- README: added "How opencode keeps memory in context" section — clarifies system prompt persistence vs. re-injection, compaction behavior, and `inject_every_n_turns` framing (controls external-edit refresh speed, not memory presence).
+- README: fixed stale phrasing throughout — removed "keeping memory salient" and "more continuously visible" framings that implied memory was at risk of being lost between turns.
+- README: documented that `inject_every_n_turns: 0` is silently clamped to `1` (not a disable); `9999` is the practical way to suppress periodic re-injection.
+- AGENTS.md: added two Quirks entries — injection hook names and firing conditions; `.invalidate` sentinel cross-process cache-busting mechanism.
+
 ## [0.5.2] - 2026-08-12
 
 ### Changed
