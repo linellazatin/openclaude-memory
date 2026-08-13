@@ -5,6 +5,11 @@
 
 OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
+> ## v0.5.3 - README update only - no struct/function changes
+> - added new section on `how opencode handles memory` - which is a fairly nice read, considering I'm new in these kinds of stuff
+> - bumped up minor version to push the above new section (with some statement re-alignments in README as well) to the public; this reframes what `inject_every_n_turns` actually does
+> - will probably stack a few updates here, if they're as short as these 2 here
+> 
 > ## v0.5.2 - Quick clean-up and updates after hotfix (sorry)
 > - did some code clean-ups (most of which is for the migration function from legacy .md config to .jsonc)
 > - added some caching refresh after index file changes (useful for next agent turn)
@@ -49,9 +54,51 @@ Just files, structure, and an agent that knows where to look.
 
 > If you've ever spent hours configuring a sophisticated memory stack only to realize you just wanted your coding agent to remember yesterday's bug fix, this project is for you.
 
+## How opencode keeps memory in context
+
+A common misconception: that the injected memory index would become "stale" in context as the conversation grows. This is not how opencode works.
+
+### System prompt persistence
+
+opencode builds a system prompt at the start of each session. When this plugin fires its `experimental.chat.system.transform` hook on turn 1, it pushes the `## Global Memory` and `## Memory Rules` blocks into `output.system`. That system prompt is **fixed for the life of the session** — opencode sends it on every LLM call. The agent has the memory index in context on turn 1, turn 10, turn 50. It never disappears mid-session.
+
+There is no token overhead per turn from persistence — the system prompt is part of the request structure, not the conversation messages. You are not paying to "re-send" it each turn; opencode handles this at the API level.
+
+### What re-injection actually does
+
+The plugin re-injects memory on three conditions (not just turn 1):
+
+1. **First turn** — cold load and initial injection.
+2. **After any memory tool call** — `write_memory`, `remove_memory`, or `pin_memory` mutate `MEMORY.md`. The dirty flag is set and the next turn injects the updated index so the agent sees the change it just made.
+3. **Every `inject_every_n_turns` turns** (default: 5) — the plugin re-reads `MEMORY.md` from disk and re-injects. This is **not** to keep memory present (it already is); it is to pick up **external edits** — manual edits to `MEMORY.md`, changes made via the TUI browser, or edits from another process.
+
+If you never edit memory files manually and only use memory tools, condition 3 is mostly a no-op. The index that was injected on turn 1 is already current.
+
+### Compaction
+
+When opencode triggers automatic context compaction (context overflow prevention), it fires the `experimental.session.compacting` hook. The plugin:
+
+1. Force-reads `MEMORY.md` fresh from disk and pushes it into `output.context` — the compaction summary includes current memory state.
+2. Resets `_injectedOnce`, `_dirty`, and `_turnCount` to zero.
+
+After compaction, opencode replaces the agent's context window. The first turn of the new context re-injects memory into the fresh system prompt — the same as session start. Memory does not get lost across compaction.
+
+### Summary
+
+| Scenario | Memory in context? |
+|---|---|
+| Turn 1 | Injected for the first time |
+| Turn 2–4 | Still present via system prompt (no re-injection needed) |
+| Turn 5 (default N=5) | Re-injected from disk (freshness check, not presence) |
+| After `write_memory` / `remove_memory` / `pin_memory` | Re-injected with updated content |
+| After TUI browser edit | Re-injected on next periodic turn or tool call |
+| After context compaction | Re-injected on first post-compaction turn |
+
+The `inject_every_n_turns` config value controls how quickly external edits are reflected — it has no effect on whether memory is present. Raise it to save tokens on long sessions; lower it if you frequently edit `MEMORY.md` outside the agent.
+
 ## How it works
 
-1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `RULES.jsonc` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection then repeats every `inject_every_n_turns` turns (default: 5) and immediately after any memory tool mutation, keeping memory salient without paying the token cost every turn.
+1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `RULES.jsonc` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection then repeats every `inject_every_n_turns` turns (default: 5) and immediately after any memory tool mutation, not to keep memory present (it persists in the system prompt for the whole session automatically) but to pick up external edits to `MEMORY.md` without re-reading disk every turn.
 2. **Topic files**: `MEMORY.md` is a concise index (one line per topic). Detail lives in separate topic files (`~/.config/opencode/memory/<topic>.md`), loaded on-demand by the agent when it needs more context.
 3. **Native tools**: The plugin registers `write_memory`, `remove_memory`, and `pin_memory` tools. The agent calls these instead of raw file operations — the plugin guarantees consistent format, frontmatter, and index maintenance every time. After each tool call the cache is invalidated and a dirty flag is set, so the next turn re-injects the updated index.
 4. **Auto-writes**: The agent writes to memory proactively — without being asked — when it learns something worth keeping: user preferences, feedback on how to approach work, project constraints, or pointers to external systems. Memories are typed (`user`, `feedback`, `project`, `reference`), and structured entries include a `Why:` + `How to apply:` section so the agent can reason about edge cases, not just recite facts. Reliability varies by model; see [Model compatibility](#model-compatibility).
@@ -114,7 +161,7 @@ Change `"max_lines"` to set a custom index size limit. The plugin clamps values 
 
 Change `"stale_after_days"` to control when entries are flagged as stale. Set to `0` to disable age flagging entirely.
 
-Change `"inject_every_n_turns"` to tune how often the memory index is re-injected into the system prompt. The default of `5` means the index appears on turn 1, turn 6, turn 11, and so on — plus immediately after any memory tool call. Set to `1` to restore every-turn injection (original behavior). Higher values save more tokens on long sessions; lower values keep memory more continuously visible. The minimum is `1`.
+Change `"inject_every_n_turns"` to tune how often the memory index is re-injected into the system prompt. The default of `5` means the index is refreshed on turn 1, turn 6, turn 11, and so on — plus immediately after any memory tool call. Set to `1` to re-inject every turn. Higher values save tokens; lower values pick up external edits to `MEMORY.md` more quickly. The minimum is `1` — setting `0` is silently clamped to `1` (not treated as "disable"). To effectively disable periodic re-injection, set a very high value such as `9999`; re-injection will still fire after any memory tool mutation.
 
 The plugin injects this file into every session's system prompt under a `## Memory Rules` header. `RULES.jsonc` is the single source of truth for persist rules — no other configuration needed.
 
@@ -188,7 +235,7 @@ openclaude-memory/
 
 | File | Role |
 |---|---|
-| `ocl-memory.mjs` | Loads `MEMORY.md` and `RULES.jsonc` into an in-process cache on first turn; injects into system prompt. Re-injects only when a memory tool mutated the index since the last turn. Invalidates cache and sets dirty flag after every tool call. Forces fresh read and resets injection state on compaction. Registers `write_memory`, `remove_memory`, `pin_memory` tools. Runs index maintenance (orphan removal, duplicate removal, `[stale?]` stamping) after every tool call. Auto-creates files on first run. Caps injection at configured lines / 25 KB. |
+| `ocl-memory.mjs` | Loads `MEMORY.md` and `RULES.jsonc` into an in-process cache on first turn; injects into system prompt. Memory persists in the system prompt for the whole session — re-injection fires after tool mutations and every `inject_every_n_turns` turns (default: 5) to pick up external edits, not to keep memory present. Invalidates cache and sets dirty flag after every tool call. Forces fresh read and resets injection state on compaction. Registers `write_memory`, `remove_memory`, `pin_memory` tools. Runs index maintenance (orphan removal, duplicate removal, `[stale?]` stamping) after every tool call. Auto-creates files on first run. Caps injection at configured lines / 25 KB. |
 | `ocl-memory-tui.mjs` | TUI plugin — registered in `tui.jsonc`. Registers `ctrl+alt+m` keybinding. Provides an interactive, arrow-key-navigable browser over the memory index — view topic content, pin/unpin, and remove entries. All actions are direct file I/O; no LLM turn required. |
 | `memory.md` (command) | `/memory` shows the index (retained - with LLM turn). `/memory <text>` stores a fact via `write_memory`. `/memory pin <topic>` pins via `pin_memory`. `/memory unpin <topic>` unpins. `/memory remove <topic>` removes via `remove_memory`. |
 | `SKILL.md` | Loaded on-demand by the agent — full instructions for memory tools, format, index discipline, staleness handling, and cap remediation. |
@@ -198,7 +245,7 @@ openclaude-memory/
 **In scope:**
 
 - Flat markdown persistence (`MEMORY.md` + topic files)
-- System prompt injection on first turn and after memory tool mutations only (not every turn)
+- System prompt injection on first turn, every `inject_every_n_turns` turns (default: 5), and immediately after any memory tool mutation
 - Native plugin tools for write, remove, and pin operations
 - TUI memory browser (`ctrl+alt+m`): interactive, arrow-key-navigable browser
 - Automatic writes triggered by agent activity (issues solved, infra discovered, commands identified, hardware/model facts)
@@ -293,7 +340,7 @@ opencode may create one or both directories depending on how the specifier was r
 
 ## Token overhead
 
-The plugin injects the `MEMORY.md` index and rendered `RULES.jsonc` (behavioral rules only, as markdown) into the system prompt on the first turn of each session, and again only when a memory tool mutated the index since the last turn. All other turns receive no injection. Cost scales with index size, but only pays on turns where injection actually occurs:
+The plugin injects the `MEMORY.md` index and rendered `RULES.jsonc` (behavioral rules only, as markdown) into the system prompt on the first turn of each session. Memory then persists in the system prompt automatically for the session — re-injection fires every `inject_every_n_turns` turns (default: 5) to pick up external edits, and immediately after any memory tool mutation to reflect the change just made. All other turns receive no injection. Cost scales with index size, but only pays on turns where injection actually occurs:
 
 
 | State                                            | Est. tokens / injection |
@@ -319,7 +366,7 @@ As of v0.2.0, two complementary optimizations apply (carried forward in v0.3.0):
   - Every `inject_every_n_turns` turns thereafter (default: 5 — so turns 1, 6, 11, 16...)
   - Any turn immediately following a memory tool mutation (`write_memory`, `remove_memory`, `pin_memory`)
 
-All other turns receive no injection. Users can tune `inject_every_n_turns` in `RULES.jsonc` — lower values (e.g. `2`) keep memory more continuously visible at higher token cost; higher values (e.g. `10`) maximize savings at the cost of less frequent refreshes. In addition to this, the tool injects current `MEMORY.md` and rendered `RULES.jsonc` content into the compaction context so memory survives context compression cleanly.
+All other turns receive no injection. Users can tune `inject_every_n_turns` in `RULES.jsonc` — lower values (e.g. `2`) pick up external edits to `MEMORY.md` more quickly; higher values (e.g. `10`) reduce token overhead at the cost of slower refresh. In addition to this, the tool injects current `MEMORY.md` and rendered `RULES.jsonc` content into the compaction context so memory survives context compression cleanly.
 
 > **Note:** TUI memory browser actions (pin/unpin/remove via `ctrl+alt+m`) write `MEMORY.md` directly without going through the server plugin. This bypasses the cache and dirty flag — the same caveat as manual file edits. Changes made via the TUI will not appear in the injected system prompt until the next tool call, the next periodic re-injection turn, or a compaction event.
 
