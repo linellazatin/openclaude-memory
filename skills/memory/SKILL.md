@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.5.3
+version: 0.6.0
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -15,9 +15,11 @@ metadata:
 Global memory persists across all opencode sessions. It lives at:
 
 ```
-~/.config/opencode/memory/
-├── MEMORY.md              # index — injected into every session automatically
-└── <topic>.md             # detail files — read on-demand
+~/.config/opencode/
+├── memory.jsonc            # persist rules and config — always local, never shared
+└── memory/                 # or ~/.agents/memory/ if "shared_dir": true in memory.jsonc
+    ├── MEMORY.md            # index — injected into every session automatically
+    └── <topic>.md           # detail files — read on-demand
 ```
 
 ## Available tools
@@ -68,9 +70,9 @@ Save **proactively** — without being asked — when you learn any of the follo
 - A non-obvious project constraint, decision, or deadline emerged (`project` type)
 - You learned where something lives in an external system (`reference` type)
 
-**What to always persist, never persist, and always ask before persisting** is user-configurable via `~/.config/opencode/memory/RULES.jsonc`. The plugin injects these rules into your context under `## Memory Rules` at the start of each session. Follow what is there — not a hardcoded list.
+**What to always persist, never persist, and always ask before persisting** is user-configurable via `~/.config/opencode/memory.jsonc`. The plugin injects these rules into your context under `## Memory Rules` at the start of each session. Follow what is there — not a hardcoded list.
 
-If `## Memory Rules` is not in your current context, read `~/.config/opencode/memory/RULES.jsonc` directly before deciding whether to save.
+If `## Memory Rules` is not in your current context, read `~/.config/opencode/memory.jsonc` directly before deciding whether to save.
 
 ## Reading memory
 
@@ -130,7 +132,7 @@ Call `write_memory` with the same `topic` name and one of two modes:
 
 ### Index discipline
 
-- `MEMORY.md` must stay under the configured `max_lines` limit (default 200; set via `"max_lines"` in `RULES.jsonc`). One line per topic.
+- `MEMORY.md` must stay under the configured `max_lines` limit (default 300; set via `"max_lines"` in `memory.jsonc`). One line per topic.
 - Never expand an index entry beyond one line. Put detail in the topic file.
 - After any write, verify `MEMORY.md` line count and trim if needed.
 - Entries with `[pin]` are exempt from all cleanup and staleness logic — never suggest removing them.
@@ -165,7 +167,7 @@ A memory that names a specific file or function is a claim made when the memory 
 
 ## Staleness flags
 
-The plugin stamps `[stale?]` on index entries older than `stale_after_days` (default 180, configurable via `"stale_after_days"` in `RULES.jsonc`). The flag appears in the index line, after the date:
+The plugin stamps `[stale?]` on index entries older than `stale_after_days` (default 180, configurable via `"stale_after_days"` in `memory.jsonc`). The flag appears in the index line, after the date:
 
 ```
 - [Topic Name](file.md) 2025-11-01T09:53:38+08:00 [stale?] -- summary
@@ -186,7 +188,7 @@ When you see `[stale?]` entries in the index, you can:
 
 ## When the cap is hit
 
-If the injected `## Global Memory` block contains a truncation warning (`memory truncated`), the index has exceeded either the configured line limit (`max_lines`, default 200) or the hard 25 KB byte cap. Either condition triggers truncation and the same trim procedure below. Steps:
+If the injected `## Global Memory` block contains a truncation warning (`memory truncated`), the index has exceeded either the configured line limit (`max_lines`, default 300) or the hard 50 KB byte cap. Either condition triggers truncation and the same trim procedure below. Steps:
 
 1. Read `MEMORY.md` in full to assess all entries.
 2. Identify entries that are candidates for removal. Check in this order:
@@ -202,10 +204,26 @@ If the injected `## Global Memory` block contains a truncation warning (`memory 
 
 The optional TUI plugin (`ocl-memory-tui.mjs`, registered in `tui.jsonc`) provides an interactive memory browser at `ctrl+alt+m`. From it you can view, pin/unpin, and remove index entries without an LLM turn.
 
-TUI mutations (pin/unpin, remove) write a `.invalidate` sentinel file to the memory directory. On the next agent interaction, the server plugin detects the sentinel, discards its cache, and re-reads the index from disk. Changes made via the TUI are therefore visible after the next agent turn — not instantly within the current one.
+TUI mutations (pin/unpin, remove) write a `.invalidate` sentinel file to the memory directory (whichever one is active — local or shared). On the next agent interaction, the server plugin detects the sentinel, discards its cache, and re-reads the index from disk. Changes made via the TUI are therefore visible after the next agent turn — not instantly within the current one.
+
+The TUI resolves `shared_dir` the same way the server plugin does — both read `memory.jsonc` through the same shared internal module, so they always agree on which directory (local or `~/.agents/memory/`) is active. The TUI re-reads this fresh every time the browser is opened, so it picks up `shared_dir` changes immediately.
+
+## Cross-tool shared memory (`shared_dir`)
+
+Setting `"shared_dir": true` in `memory.jsonc` moves `MEMORY.md` and topic files to `~/.agents/memory/` — a location other memory-aware tools (e.g. pi's `openpi-memory`) can also read and write, using the same on-disk format. `memory.jsonc` itself always stays local regardless of this setting.
+
+The first time `shared_dir` resolves `true`, existing local memory is copied — never moved — into the shared directory. Originals stay untouched in `~/.config/opencode/memory/`. This carry-over runs once. Toggling `shared_dir` off and back on does not re-run it or reconcile any drift that happened while it was off — treat it as a one-way move.
+
+Writes to the shared directory are protected by a cross-process advisory lock (`.lock` file) so this tool and another tool sharing the directory don't corrupt the index with interleaved writes.
+
+## Consolidation
+
+`/memory consolidate` reviews the current conversation for facts that match `always_persist` in `memory.jsonc` but haven't been written yet, calls `write_memory` for each, and writes or updates a `Last Session Recap` topic (`last-session-recap.md`, `mode: "replace"`, unpinned — it's meant to be overwritten every session, not accumulated).
+
+Setting `"consolidate_on_compact": true` in `memory.jsonc` runs the same consolidation automatically after opencode's automatic (threshold-triggered) compaction, replacing opencode's default synthetic "continue" message. To avoid re-scanning the whole conversation, the consolidation turn is seeded with the compaction summary opencode just generated, and it tells the agent to resume any pending work from the summary's "Next Move" section afterwards — so consolidation persists the session's facts without abandoning an in-progress task. Default is `false` — opencode already sends that default continue message on its own; this setting only matters if you want a consolidation pass to run instead. **This only fires on automatic (overflow-triggered) compaction.** Manual `/compact` does not trigger consolidation — run `/memory consolidate` explicitly if you compact manually and want the same effect.
 
 ## Persist rules
 
-Your persist rules are in `~/.config/opencode/memory/RULES.jsonc` and are injected into your context under `## Memory Rules` on the first turn, every `inject_every_n_turns` turns, and after memory tool calls. Follow them.
+Your persist rules are in `~/.config/opencode/memory.jsonc` and are injected into your context under `## Memory Rules` on the first turn, every `inject_every_n_turns` turns, and after memory tool calls. Follow them.
 
-If no `## Memory Rules` block is in your context, read `~/.config/opencode/memory/RULES.jsonc` directly.
+If no `## Memory Rules` block is in your context, read `~/.config/opencode/memory.jsonc` directly.

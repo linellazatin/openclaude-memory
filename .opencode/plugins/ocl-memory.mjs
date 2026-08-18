@@ -1,60 +1,44 @@
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
+import {
+  MEMORY_DIR, MEMORY_CONFIG,
+  stripJsonc, readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel,
+  ensureMemoryDir, atomicWriteFileSync, sleep, acquireLock, releaseLock, maybeCarryOverToSharedDir,
+} from './ocl-memory-shared.mjs';
 
-const MEMORY_DIR = path.join(
-  process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
-  'opencode', 'memory'
-);
-const MEMORY_INDEX = path.join(MEMORY_DIR, 'MEMORY.md');
-const MEMORY_RULES = path.join(MEMORY_DIR, 'RULES.jsonc');
-const DIRTY_SENTINEL = path.join(MEMORY_DIR, '.invalidate');
-
-const MAX_LINES = 200;
-const MAX_BYTES = 25 * 1024;
-const DEFAULT_STALE_DAYS = 180;
-const DEFAULT_INJECT_INTERVAL = 5;
+const MAX_BYTES = 50 * 1024;
 
 const INITIAL_MEMORY = `# Memory Index
 
 `;
 
-const INITIAL_RULES_JSONC = `{
-  // What to always persist
-  "always_persist": [
-    "Any issue solved or fixed",
-    "Server or infrastructure configuration discovered or changed",
-    "Reusable commands or workflows identified",
-    "Hardware, model, or environment facts learned"
-  ],
-  // What to never persist
-  "never_persist": [
-    "Code patterns, conventions, or architecture derivable from reading the codebase",
-    "Git history — use git log/blame instead",
-    "Debugging fix recipes — the fix is in the code; the commit message has the context",
-    "Ephemeral in-session task state (todos, current work-in-progress)",
-    "Anything already documented in AGENTS.md, CLAUDE.md, or project config files",
-    "Large code blocks — summarize the insight or link to the file path instead"
-  ],
-  // Always ask before persisting (non-overridable)
-  "always_ask": [
-    "Credentials, tokens, API keys",
-    "Personal data",
-    "Anything the user marks as private or ephemeral"
-  ],
-  // max_lines: valid range 50–500
-  "max_lines": 200,
-  // stale_after_days: 0 = disable age flagging
-  "stale_after_days": 180,
-  // inject_every_n_turns: re-inject memory every N user prompts; 1 = every prompt
-  "inject_every_n_turns": 5
-}
-`;
+const CONSOLIDATION_PROMPT = `Review the current conversation for facts, decisions, or discoveries that match the "always_persist" rules in ${MEMORY_CONFIG} but have not yet been written to memory. For each one found, call write_memory with an appropriate topic, content, summary, and pin value.
+
+Then write or update a topic named "Last Session Recap" (filename last-session-recap.md) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
+
+If nothing new was found to persist, say so plainly and do not call any tools.`;
+
+// Consolidation prompt used after automatic compaction. Instead of asking the
+// agent to re-scan the whole conversation (the compaction LLM already did that),
+// it feeds the just-generated compaction summary as the input. One fewer full
+// scan. It also tells the agent to resume any pending work afterwards, so
+// consolidation does not silently abandon an in-progress task.
+const buildCompactConsolidationPrompt = (summary) => `The conversation was just compacted. Below is the compaction summary of the work so far.
+
+<compaction-summary>
+${summary}
+</compaction-summary>
+
+Based on the summary above, identify any facts, decisions, or discoveries that match the "always_persist" rules in ${MEMORY_CONFIG} but have not yet been written to memory. For each one, call write_memory with an appropriate topic, content, summary, and pin value.
+
+Then write or update a topic named "Last Session Recap" (filename last-session-recap.md) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
+
+After consolidating, continue with any pending work described in the summary's "Next Move" section. If there is no pending work, stop.`;
 
 // --- In-process cache ---
 // Loaded once per session (or after any tool mutation / compaction).
-// Avoids re-reading RULES.jsonc and MEMORY.md on every turn.
-// Caveat: manual edits to RULES.jsonc or MEMORY.md between turns are not
+// Avoids re-reading memory.jsonc and MEMORY.md on every turn.
+// Caveat: manual edits to memory.jsonc or MEMORY.md between turns are not
 // reflected until the next tool call or compaction event.
 // process-global state; safe for single-user plugin.
 // Upgrade path: per-session Map keyed by session ID if multi-session needed.
@@ -71,17 +55,21 @@ let _turnCount = 0;
 
 function getCache(forceRefresh = false) {
   // If TUI mutated MEMORY.md directly, it writes a sentinel file to signal us.
-  if (_cache && !forceRefresh && fs.existsSync(DIRTY_SENTINEL)) {
-    try { fs.unlinkSync(DIRTY_SENTINEL); } catch {}
+  // The sentinel lives alongside whichever dir was active last time we
+  // resolved (_cache.memDir) — matches wherever the TUI actually wrote it.
+  if (_cache && !forceRefresh && fs.existsSync(getDirtySentinel(_cache.memDir))) {
+    try { fs.unlinkSync(getDirtySentinel(_cache.memDir)); } catch {}
     _cache = null;
     _dirty = true;
   }
   if (!_cache || forceRefresh) {
     const rules = readMemoryRules();
     const config = parseRules(rules);
+    maybeCarryOverToSharedDir(config);
     const renderedRules = renderRulesForInjection(rules);
-    const content = readMemoryIndex(config.maxLines);
-    _cache = { renderedRules, config, content };
+    const memDir = getMemoryDir(config);
+    const content = readMemoryIndex(config.maxLines, memDir);
+    _cache = { renderedRules, config, content, memDir };
   }
   return _cache;
 }
@@ -90,26 +78,7 @@ function invalidateCache() {
   _cache = null;
 }
 
-// --- Config parsing ---
-
-const stripJsonc = raw => raw.replace(/\/\/[^\n]*/g, '').replace(/,\s*([}\]])/g, '$1');
-
-function parseRules(raw) {
-  const defaults = { maxLines: MAX_LINES, staleAfterDays: DEFAULT_STALE_DAYS, injectEveryNTurns: DEFAULT_INJECT_INTERVAL };
-  if (!raw) return defaults;
-  try {
-    const obj = JSON.parse(stripJsonc(raw));
-    return {
-      maxLines: Math.min(500, Math.max(50, Number.isInteger(obj.max_lines) ? obj.max_lines : defaults.maxLines)),
-      staleAfterDays: typeof obj.stale_after_days === 'number' ? Math.max(0, obj.stale_after_days) : defaults.staleAfterDays,
-      injectEveryNTurns: Number.isInteger(obj.inject_every_n_turns) ? Math.max(1, obj.inject_every_n_turns) : defaults.injectEveryNTurns,
-    };
-  } catch {
-    return defaults;
-  }
-}
-
-// Transforms RULES.jsonc content into markdown for agent injection.
+// Transforms memory.jsonc content into markdown for agent injection.
 // Renders only the behavioral array keys (always_persist, never_persist, always_ask)
 // as markdown bullet lists. Scalar config keys are plugin internals — not injected.
 // Falls back to raw content if parsing fails (e.g. heavily customised JSONC).
@@ -131,39 +100,21 @@ function renderRulesForInjection(raw) {
   }
 }
 
-// --- File I/O helpers ---
-
-function ensureMemoryDir() {
-  fs.mkdirSync(MEMORY_DIR, { recursive: true });
-}
-
-function readMemoryRules() {
+function readMemoryIndex(maxLines, memDir) {
   try {
-    if (!fs.existsSync(MEMORY_RULES)) {
-      ensureMemoryDir();
-      fs.writeFileSync(MEMORY_RULES, INITIAL_RULES_JSONC, 'utf8');
-      return INITIAL_RULES_JSONC;
-    }
-    return fs.readFileSync(MEMORY_RULES, 'utf8');
-  } catch {
-    return null;
-  }
-}
-
-function readMemoryIndex(maxLines) {
-  try {
-    if (!fs.existsSync(MEMORY_INDEX)) {
-      ensureMemoryDir();
-      fs.writeFileSync(MEMORY_INDEX, INITIAL_MEMORY, 'utf8');
+    const indexPath = path.join(memDir, 'MEMORY.md');
+    if (!fs.existsSync(indexPath)) {
+      ensureMemoryDir(memDir);
+      atomicWriteFileSync(indexPath, INITIAL_MEMORY);
       return INITIAL_MEMORY;
     }
-    const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
+    const raw = fs.readFileSync(indexPath, 'utf8');
     const lines = raw.split('\n');
     if (lines.length > maxLines) {
       return lines.slice(0, maxLines).join('\n') + `\n\n<!-- memory truncated: MEMORY.md exceeds ${maxLines}-line limit; shorten the index -->`;
     }
     if (Buffer.byteLength(raw) > MAX_BYTES) {
-      return lines.slice(0, maxLines).join('\n') + `\n\n<!-- memory truncated: MEMORY.md exceeds 25 KB size limit; shorten the index -->`;
+      return lines.slice(0, maxLines).join('\n') + `\n\n<!-- memory truncated: MEMORY.md exceeds ${Math.round(MAX_BYTES / 1024)} KB size limit; shorten the index -->`;
     }
     return raw;
   } catch {
@@ -208,7 +159,7 @@ function daysSince(dateStr) {
 // Handles: orphan removal, duplicate removal, [stale?] stamping/removal.
 // Does NOT run on session load — file only mutated when agent calls a tool.
 
-function maintainIndex(lines, config) {
+function maintainIndex(lines, config, memDir = MEMORY_DIR) {
   const { staleAfterDays } = config;
 
   // Pass 1: for each filename, pick the entry with the most-recent date; skip orphans.
@@ -217,7 +168,7 @@ function maintainIndex(lines, config) {
     const parsed = parseIndexLine(line);
     if (!parsed) continue;
     const { filename } = parsed;
-    if (!fs.existsSync(path.join(MEMORY_DIR, filename))) continue;
+    if (!fs.existsSync(path.join(memDir, filename))) continue;
     const date = (parsed.rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
     const prev = best.get(filename);
     const prevDate = prev ? ((parseIndexLine(prev).rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '') : '';
@@ -321,67 +272,73 @@ const tools = {
     async execute(args) {
       const { topic, content, summary, pin, mode = 'append' } = args;
 
-      ensureMemoryDir();
+      const { config } = getCache();
+      const memDir = getMemoryDir(config);
+      const memIndex = getMemoryIndex(config);
+      ensureMemoryDir(memDir);
 
-      // Read index once — reuse for topic-name lookup and upsert
-      const rawIndex = fs.existsSync(MEMORY_INDEX)
-        ? fs.readFileSync(MEMORY_INDEX, 'utf8')
-        : INITIAL_MEMORY;
+      const lockPath = await acquireLock(memDir);
+      try {
+        // Read index once — reuse for topic-name lookup and upsert
+        const rawIndex = fs.existsSync(memIndex)
+          ? fs.readFileSync(memIndex, 'utf8')
+          : INITIAL_MEMORY;
 
-      // Check if an existing index entry matches this topic name — use its filename if so
-      let filename = toSlug(topic) + '.md';
-      for (const line of rawIndex.split('\n')) {
-        const parsed = parseIndexLine(line);
-        if (parsed && parsed.name.toLowerCase() === topic.toLowerCase()) {
-          filename = parsed.filename;
-          break;
+        // Check if an existing index entry matches this topic name — use its filename if so
+        let filename = toSlug(topic) + '.md';
+        for (const line of rawIndex.split('\n')) {
+          const parsed = parseIndexLine(line);
+          if (parsed && parsed.name.toLowerCase() === topic.toLowerCase()) {
+            filename = parsed.filename;
+            break;
+          }
         }
-      }
-      const topicPath = path.join(MEMORY_DIR, filename);
+        const topicPath = path.join(memDir, filename);
 
-      let isNew = false;
-      if (!fs.existsSync(topicPath)) {
-        isNew = true;
-        const now = nowIso();
-        const frontmatter = `---\nname: ${topic}\ndescription: ${summary}\ncreated: ${now}\nlast_updated: ${now}\nmetadata:\n  node_type: memory\n---\n\n`;
-        fs.writeFileSync(topicPath, frontmatter + content + '\n', 'utf8');
-      } else if (mode === 'replace') {
-        const now = nowIso();
-        const existing = fs.readFileSync(topicPath, 'utf8');
-        const fmMatch = existing.match(/^(---\n[\s\S]*?\n---\n)/);
-        let fm = fmMatch ? fmMatch[1] : '';
-        if (fm.includes('last_updated:')) {
-          fm = fm.replace(/^(last_updated:\s*).*$/m, `$1${now}`);
-        } else if (fm.includes('created:')) {
-          fm = fm.replace(/^(created:.*)$/m, `$1\nlast_updated: ${now}`);
-        }
-        fs.writeFileSync(topicPath, fm + '\n' + content + '\n', 'utf8');
-      } else {
-        const now = nowIso();
-        const existing = fs.readFileSync(topicPath, 'utf8');
-        let body;
-        if (existing.includes('last_updated:')) {
-          body = existing.replace(/^(last_updated:\s*).*$/m, `$1${now}`);
-        } else if (existing.includes('created:')) {
-          body = existing.replace(/^(created:.*)$/m, `$1\nlast_updated: ${now}`);
+        let isNew = false;
+        if (!fs.existsSync(topicPath)) {
+          isNew = true;
+          const now = nowIso();
+          const frontmatter = `---\nname: ${topic}\ndescription: ${summary}\ncreated: ${now}\nlast_updated: ${now}\nmetadata:\n  node_type: memory\n---\n\n`;
+          atomicWriteFileSync(topicPath, frontmatter + content + '\n');
+        } else if (mode === 'replace') {
+          const now = nowIso();
+          const existing = fs.readFileSync(topicPath, 'utf8');
+          const fmMatch = existing.match(/^(---\n[\s\S]*?\n---\n)/);
+          let fm = fmMatch ? fmMatch[1] : '';
+          if (fm.includes('last_updated:')) {
+            fm = fm.replace(/^(last_updated:\s*).*$/m, `$1${now}`);
+          } else if (fm.includes('created:')) {
+            fm = fm.replace(/^(created:.*)$/m, `$1\nlast_updated: ${now}`);
+          }
+          atomicWriteFileSync(topicPath, fm + '\n' + content + '\n');
         } else {
-          body = existing;
+          const now = nowIso();
+          const existing = fs.readFileSync(topicPath, 'utf8');
+          let body;
+          if (existing.includes('last_updated:')) {
+            body = existing.replace(/^(last_updated:\s*).*$/m, `$1${now}`);
+          } else if (existing.includes('created:')) {
+            body = existing.replace(/^(created:.*)$/m, `$1\nlast_updated: ${now}`);
+          } else {
+            body = existing;
+          }
+          atomicWriteFileSync(topicPath, body + `\n## ${now}\n\n` + content + '\n');
         }
-        fs.writeFileSync(topicPath, body + `\n## ${now}\n\n` + content + '\n', 'utf8');
+
+        // Update index
+        let lines = rawIndex.split('\n');
+
+        lines = upsertIndexLine(lines, filename, topic, summary, pin);
+        lines = maintainIndex(lines, config, memDir);
+
+        atomicWriteFileSync(memIndex, lines.join('\n'));
+        invalidateCache(); // nuke cache so the next caller re-reads the fresh index
+
+        return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${memIndex}\nEntry: [${topic}](${filename}) ${nowIso()} -- ${summary}`;
+      } finally {
+        releaseLock(lockPath);
       }
-
-      // Update index
-      let lines = rawIndex.split('\n');
-
-      lines = upsertIndexLine(lines, filename, topic, summary, pin);
-
-      const { config } = getCache(); // read config before invalidating
-      lines = maintainIndex(lines, config);
-
-      fs.writeFileSync(MEMORY_INDEX, lines.join('\n'), 'utf8');
-      invalidateCache(); // nuke cache so the next caller re-reads the fresh index
-
-      return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${MEMORY_INDEX}\nEntry: [${topic}](${filename}) ${nowIso()} -- ${summary}`;
     },
   },
 
@@ -394,38 +351,46 @@ const tools = {
       const { topic } = args;
       const search = topic.toLowerCase();
 
-      if (!fs.existsSync(MEMORY_INDEX)) {
+      const { config } = getCache();
+      const memDir = getMemoryDir(config);
+      const memIndex = getMemoryIndex(config);
+
+      if (!fs.existsSync(memIndex)) {
         return 'No memory index found.';
       }
 
-      const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
-      const lines = raw.split('\n');
+      const lockPath = await acquireLock(memDir);
+      try {
+        const raw = fs.readFileSync(memIndex, 'utf8');
+        const lines = raw.split('\n');
 
-      const found = findIndexEntry(lines, search);
-      if (!found) {
-        return `No matching entry found for "${topic}".`;
+        const found = findIndexEntry(lines, search);
+        if (!found) {
+          return `No matching entry found for "${topic}".`;
+        }
+        const { idx: foundIdx, parsed } = found;
+
+        if (parsed.rest.includes('[pin]')) {
+          return `Entry is pinned and cannot be removed. Use pin_memory with pin: false to unpin it first.`;
+        }
+
+        const removedLine = lines[foundIdx];
+        lines.splice(foundIdx, 1);
+
+        const maintained = maintainIndex(lines, config, memDir);
+
+        atomicWriteFileSync(memIndex, maintained.join('\n'));
+        invalidateCache();
+
+        const topicFile = path.join(memDir, parsed.filename);
+        const fileNote = fs.existsSync(topicFile)
+          ? `Topic file ${parsed.filename} still exists on disk.`
+          : `Topic file ${parsed.filename} was not found on disk.`;
+
+        return `Index entry removed: ${removedLine.trim()}\n${fileNote}`;
+      } finally {
+        releaseLock(lockPath);
       }
-      const { idx: foundIdx, parsed } = found;
-
-      if (parsed.rest.includes('[pin]')) {
-        return `Entry is pinned and cannot be removed. Use pin_memory with pin: false to unpin it first.`;
-      }
-
-      const removedLine = lines[foundIdx];
-      lines.splice(foundIdx, 1);
-
-      const { config } = getCache();
-      const maintained = maintainIndex(lines, config);
-
-      fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
-      invalidateCache();
-
-      const topicFile = path.join(MEMORY_DIR, parsed.filename);
-      const fileNote = fs.existsSync(topicFile)
-        ? `Topic file ${parsed.filename} still exists on disk.`
-        : `Topic file ${parsed.filename} was not found on disk.`;
-
-      return `Index entry removed: ${removedLine.trim()}\n${fileNote}`;
     },
   },
 
@@ -439,48 +404,82 @@ const tools = {
       const { topic, pin } = args;
       const search = topic.toLowerCase();
 
-      if (!fs.existsSync(MEMORY_INDEX)) {
+      const { config } = getCache();
+      const memDir = getMemoryDir(config);
+      const memIndex = getMemoryIndex(config);
+
+      if (!fs.existsSync(memIndex)) {
         return 'No memory index found.';
       }
 
-      const raw = fs.readFileSync(MEMORY_INDEX, 'utf8');
-      const lines = raw.split('\n');
+      const lockPath = await acquireLock(memDir);
+      try {
+        const raw = fs.readFileSync(memIndex, 'utf8');
+        const lines = raw.split('\n');
 
-      const found = findIndexEntry(lines, search);
-      if (!found) {
-        return `No matching entry found for "${topic}".`;
+        const found = findIndexEntry(lines, search);
+        if (!found) {
+          return `No matching entry found for "${topic}".`;
+        }
+        const { idx: foundIdx, parsed } = found;
+
+        const line = lines[foundIdx];
+        const alreadyPinned = parsed.rest.includes('[pin]');
+
+        if (pin && alreadyPinned) return `Already pinned: ${line.trim()}`;
+        if (!pin && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
+
+        const newRest = pin
+          ? ' [pin]' + parsed.rest
+          : parsed.rest.replace(/\s*\[pin\]/, '');
+
+        const before = line.trim();
+        lines[foundIdx] = parsed.prefix + parsed.name + parsed.mid + newRest;
+        const after = lines[foundIdx].trim();
+
+        const maintained = maintainIndex(lines, config, memDir);
+
+        atomicWriteFileSync(memIndex, maintained.join('\n'));
+        invalidateCache();
+
+        return `${pin ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
+      } finally {
+        releaseLock(lockPath);
       }
-      const { idx: foundIdx, parsed } = found;
-
-      const line = lines[foundIdx];
-      const alreadyPinned = parsed.rest.includes('[pin]');
-
-      if (pin && alreadyPinned) return `Already pinned: ${line.trim()}`;
-      if (!pin && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
-
-      const newRest = pin
-        ? ' [pin]' + parsed.rest
-        : parsed.rest.replace(/\s*\[pin\]/, '');
-
-      const before = line.trim();
-      lines[foundIdx] = parsed.prefix + parsed.name + parsed.mid + newRest;
-      const after = lines[foundIdx].trim();
-
-      const { config } = getCache();
-      const maintained = maintainIndex(lines, config);
-
-      fs.writeFileSync(MEMORY_INDEX, maintained.join('\n'), 'utf8');
-      invalidateCache();
-
-      return `${pin ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
     },
   },
 };
 
 // --- Plugin export ---
 
-export default async () => {
+export default async (input) => {
+  const client = input && input.client;
   const skillsDir = new URL('../../skills', import.meta.url).pathname;
+
+  // Fetch the text of the most recent compaction summary for a session.
+  // opencode stores it as an assistant message with `summary === true`.
+  // Returns the joined text, or null if none found / the call fails.
+  const fetchLatestCompactionSummary = async (sessionID) => {
+    try {
+      const res = await client.session.messages({ path: { id: sessionID } });
+      const messages = (res && res.data) || res;
+      if (!Array.isArray(messages)) return null;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m && m.info && m.info.role === 'assistant' && m.info.summary === true) {
+          const text = (m.parts || [])
+            .filter((p) => p && p.type === 'text' && p.text)
+            .map((p) => p.text)
+            .join('\n')
+            .trim();
+          return text || null;
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
 
   return {
     config: async (config) => {
@@ -491,21 +490,29 @@ export default async () => {
         config.skills.paths.push(skillsDir);
       }
 
+      // Resolve the active memory dir/index once at startup for display in the
+      // command template. If shared_dir is toggled later, this stays stale
+      // until the next restart — same one-time-resolution behavior the rest
+      // of the plugin already has for config.
+      const { config: memConfig } = getCache();
+      const activeDir = getMemoryDir(memConfig);
+      const activeIndex = getMemoryIndex(memConfig);
+
       // Register /memory command
       if (!config.command) config.command = {};
       config.command['memory'] = {
-        description: '/memory → show index | /memory <text> → store | /memory pin <topic> → pin | /memory unpin <topic> → unpin | /memory remove <topic> → remove entry',
-        template: `Memory dir: ${MEMORY_DIR}
-Memory index: ${MEMORY_INDEX}
+        description: '/memory → show index | /memory <text> → store | /memory pin <topic> → pin | /memory unpin <topic> → unpin | /memory remove <topic> → remove entry | /memory consolidate → consolidate session',
+        template: `Memory dir: ${activeDir}
+Memory index: ${activeIndex}
 
 Arguments: $ARGUMENTS
 
 ## No arguments: show index
 
-Read ${MEMORY_INDEX}. Display each entry as a table with columns: Topic (name only — no markdown links, no filenames), Date, Pinned (yes/no), Stale (yes/no). List all .md files in ${MEMORY_DIR}. Do not write anything.
+Read ${activeIndex}. Display each entry as a table with columns: Topic (name only — no markdown links, no filenames), Date, Pinned (yes/no), Stale (yes/no). List all .md files in ${activeDir}. Do not write anything.
 
 After listing, append this legend:
-Tip: /memory <text> to store  |  /memory pin <topic> to pin  |  /memory unpin <topic> to unpin  |  /memory remove <topic> to remove
+Tip: /memory <text> to store  |  /memory pin <topic> to pin  |  /memory unpin <topic> to unpin  |  /memory remove <topic> to remove  |  /memory consolidate to consolidate this session
 
 ## Arguments start with "remove ": remove an index entry
 
@@ -524,14 +531,18 @@ The text after "pin " is the topic to find. Call the pin_memory tool:
 The text after "unpin " is the topic to find. Call the pin_memory tool:
   pin_memory({ topic: "<the text after 'unpin '>", pin: false })
 
-## Arguments provided (not starting with "pin ", "unpin ", or "remove "): store a memory
+## Arguments are exactly "consolidate": consolidate memory from this session
+
+${CONSOLIDATION_PROMPT}
+
+## Arguments provided (not starting with "pin ", "unpin ", or "remove ", and not exactly "consolidate"): store a memory
 
 Treat the arguments as a fact or note to persist. Decide the topic, a slug filename, a one-line summary, and whether the topic is permanent (hardware, user identity, core workflows = pin it). Then call the write_memory tool:
   write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false> })
 
 The tool creates a new topic file or appends to an existing one, and updates the MEMORY.md index automatically.
 
-Any text including single words is treated literally as content to store. Do not interpret "show", "list", or similar words as subcommands unless the full argument starts with "pin ", "unpin ", or "remove ".`,
+Any text including single words is treated literally as content to store. Do not interpret "show", "list", or similar words as subcommands unless the full argument starts with "pin ", "unpin ", or "remove ", or is exactly "consolidate".`,
       };
     },
 
@@ -552,16 +563,16 @@ Any text including single words is treated literally as content to store. Do not
     // All other turns skip injection, saving tokens while keeping memory salient.
     'experimental.chat.system.transform': async (_input, output) => {
       _turnCount++;
-      const { renderedRules, content, config } = getCache();
+      const { renderedRules, content, config, memDir } = getCache();
       const shouldInject = !_injectedOnce || _dirty || (_turnCount % config.injectEveryNTurns === 0);
 
       if (shouldInject) {
         if (content) {
-          output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${MEMORY_DIR}\n\n${content}`);
+          output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
         }
 
         if (renderedRules) {
-          output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_RULES} to customise.\n\n${renderedRules}`);
+          output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
         }
 
         _injectedOnce = true;
@@ -586,6 +597,37 @@ Any text including single words is treated literally as content to store. Do not
       _injectedOnce = false;
       _dirty = false;
       _turnCount = 0;
+    },
+
+    // After automatic compaction, opencode sends a synthetic "continue"
+    // message by default (output.enabled defaults to true, native behavior).
+    // If consolidate_on_compact is enabled, suppress that default and run a
+    // consolidation pass instead — seeded with the compaction summary opencode
+    // just generated, so the agent does not re-scan the whole conversation, and
+    // told to resume pending work so an in-progress task is not abandoned.
+    //
+    // This hook is gated by `input.auto === true` inside opencode's
+    // compaction.ts — manual /compact sets auto=false and never reaches here.
+    // consolidate_on_compact therefore only fires on overflow-triggered
+    // (automatic) compaction. Users who compact manually and want consolidation
+    // must run /memory consolidate explicitly. Known gap; no near-term fix.
+    'experimental.compaction.autocontinue': async (hookInput, output) => {
+      const { config } = getCache();
+      if (!config.consolidateOnCompact || !client) return;
+      output.enabled = false;
+      try {
+        const summary = await fetchLatestCompactionSummary(hookInput.sessionID);
+        const text = summary
+          ? buildCompactConsolidationPrompt(summary)
+          : CONSOLIDATION_PROMPT;
+        await client.session.prompt({
+          path: { id: hookInput.sessionID },
+          body: { parts: [{ type: 'text', text }] },
+        });
+      } catch {
+        // best-effort — fall back to the native continue if the prompt call fails
+        output.enabled = true;
+      }
     },
   };
 };
