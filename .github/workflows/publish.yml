@@ -21,13 +21,7 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
-
-      - run: npm install -g npm@latest
-
-      - run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ''
-
+      
       - name: Extract changelog for this version
         id: changelog
         run: |
@@ -41,3 +35,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           body: ${{ steps.changelog.outputs.notes }}
+
+      - run: npm install -g npm@latest
+
+      - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ''
+
+      
