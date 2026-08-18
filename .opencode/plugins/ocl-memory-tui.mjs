@@ -1,20 +1,26 @@
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
+import {
+  readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel,
+  atomicWriteFileSync, acquireLock, releaseLock, maybeCarryOverToSharedDir,
+} from './ocl-memory-shared.mjs';
 
-const MEMORY_DIR = path.join(
-  process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
-  'opencode', 'memory'
-);
-const MEMORY_INDEX = path.join(MEMORY_DIR, 'MEMORY.md');
-const DIRTY_SENTINEL = path.join(MEMORY_DIR, '.invalidate');
+// Resolves which directory (local or shared, per memory.jsonc's shared_dir)
+// is currently active. Called once per browser session (each ctrl+alt+m
+// press) — cheap, low-frequency, so no caching is needed here (unlike the
+// server plugin, which re-reads far more often).
+function resolveActiveDir() {
+  const config = parseRules(readMemoryRules());
+  maybeCarryOverToSharedDir(config);
+  return { memDir: getMemoryDir(config), memIndex: getMemoryIndex(config) };
+}
 
 // Parse MEMORY.md into structured entries.
 // Line format: - [Name](file.md) [pin] YYYY-MM-DDTHH:MM:SS±HH:MM [stale?] -- summary
-function parseIndex() {
-  if (!fs.existsSync(MEMORY_INDEX)) return [];
+function parseIndex(memIndex) {
+  if (!fs.existsSync(memIndex)) return [];
   const entries = [];
-  for (const line of fs.readFileSync(MEMORY_INDEX, 'utf8').split('\n')) {
+  for (const line of fs.readFileSync(memIndex, 'utf8').split('\n')) {
     const m = line.match(/^- \[([^\]]+)\]\(([^)]+)\)(.*)/);
     if (!m) continue;
     const rest = m[3];
@@ -32,29 +38,41 @@ function parseIndex() {
   return entries;
 }
 
-// Toggle [pin] on the index line matched by filename.
-function setPin(filename, pin) {
-  const lines = fs.readFileSync(MEMORY_INDEX, 'utf8').split('\n');
-  const updated = lines.map(line => {
-    if (!line.includes(`](${filename})`)) return line;
-    if (pin)  return line.includes('[pin]') ? line : line.replace(/(\]\([^)]+\))/, '$1 [pin]');
-    if (!pin) return line.replace(/\s*\[pin\]/, '');
-    return line;
-  });
-  fs.writeFileSync(MEMORY_INDEX, updated.join('\n'), 'utf8');
-  try { fs.writeFileSync(DIRTY_SENTINEL, '', 'utf8'); } catch {}
+// Toggle [pin] on the index line matched by filename. Locked + atomic, same
+// pattern as the server plugin's tools — matters once shared_dir puts other
+// processes/tools in the same directory.
+async function setPin(memDir, memIndex, filename, pin) {
+  const lockPath = await acquireLock(memDir);
+  try {
+    const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
+    const updated = lines.map(line => {
+      if (!line.includes(`](${filename})`)) return line;
+      if (pin)  return line.includes('[pin]') ? line : line.replace(/(\]\([^)]+\))/, '$1 [pin]');
+      if (!pin) return line.replace(/\s*\[pin\]/, '');
+      return line;
+    });
+    atomicWriteFileSync(memIndex, updated.join('\n'));
+    try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
+  } finally {
+    releaseLock(lockPath);
+  }
 }
 
 // Remove the index line matched by filename (topic file on disk is preserved).
-function removeEntry(filename) {
-  const lines = fs.readFileSync(MEMORY_INDEX, 'utf8').split('\n');
-  fs.writeFileSync(MEMORY_INDEX, lines.filter(l => !l.includes(`](${filename})`)).join('\n'), 'utf8');
-  try { fs.writeFileSync(DIRTY_SENTINEL, '', 'utf8'); } catch {}
+async function removeEntry(memDir, memIndex, filename) {
+  const lockPath = await acquireLock(memDir);
+  try {
+    const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
+    atomicWriteFileSync(memIndex, lines.filter(l => !l.includes(`](${filename})`)).join('\n'));
+    try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
+  } finally {
+    releaseLock(lockPath);
+  }
 }
 
 // Read topic file: strip YAML frontmatter, return first 10 lines of body content.
-function readTopic(filename) {
-  const p = path.join(MEMORY_DIR, filename);
+function readTopic(memDir, filename) {
+  const p = path.join(memDir, filename);
   if (!fs.existsSync(p)) return '(topic file not found on disk)';
   let body = fs.readFileSync(p, 'utf8');
 
@@ -71,8 +89,9 @@ function readTopic(filename) {
 }
 
 const tui = async (api) => {
-  function showBrowser() {
-    const entries = parseIndex();
+  async function showBrowser() {
+    const { memDir, memIndex } = resolveActiveDir();
+    const entries = parseIndex(memIndex);
     api.ui.dialog.setSize('large');
     api.ui.dialog.replace(() => api.ui.DialogSelect({
       title:       `Memory (${entries.length} ${entries.length === 1 ? 'entry' : 'entries'})`,
@@ -82,11 +101,11 @@ const tui = async (api) => {
         description: [e.summary, e.date].filter(Boolean).join('  '),
         value:       e,
       })),
-      onSelect: opt => showActions(opt.value),
+      onSelect: opt => showActions(opt.value, memDir, memIndex),
     }));
   }
 
-  function showActions(entry) {
+  function showActions(entry, memDir, memIndex) {
     api.ui.dialog.replace(() => api.ui.DialogSelect({
       title:      entry.name,
       skipFilter: true,
@@ -115,24 +134,22 @@ const tui = async (api) => {
           case 'view':
             api.ui.dialog.replace(() => api.ui.DialogAlert({
               title:     entry.name,
-              message:   readTopic(entry.filename),
-              onConfirm: () => setTimeout(() => showActions(entry), 0),
+              message:   readTopic(memDir, entry.filename),
+              onConfirm: () => setTimeout(() => showActions(entry, memDir, memIndex), 0),
             }));
             break;
           case 'pin':
-            setPin(entry.filename, true);
-            showBrowser();
+            setPin(memDir, memIndex, entry.filename, true).then(showBrowser);
             break;
           case 'unpin':
-            setPin(entry.filename, false);
-            showBrowser();
+            setPin(memDir, memIndex, entry.filename, false).then(showBrowser);
             break;
           case 'remove':
             api.ui.dialog.replace(() => api.ui.DialogConfirm({
               title:     'Remove from index',
               message:   `Remove "${entry.name}" from the memory index?\n\nThe topic file is preserved on disk.`,
-              onConfirm: () => { removeEntry(entry.filename); showBrowser(); },
-              onCancel:  () => showActions(entry),
+              onConfirm: () => { removeEntry(memDir, memIndex, entry.filename).then(showBrowser); },
+              onCancel:  () => showActions(entry, memDir, memIndex),
             }));
             break;
           case 'back':
@@ -159,4 +176,5 @@ const tui = async (api) => {
   api.lifecycle.onDispose(disposeLayer);
 };
 
+export { parseIndex, setPin, removeEntry, readTopic, resolveActiveDir };
 export default { id: 'ocl-memory-tui', tui };
