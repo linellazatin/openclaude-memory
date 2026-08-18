@@ -5,6 +5,12 @@
 
 OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
+>
+> ## UPCOMING MAJOR structural change
+> - see what's coming @ [openpi-memory v0.3.0](https://github.com/linellazatin/openpi-memory) `shared_dir` integration (opt-in) with **openclaude-memory**
+> - config file will be renamed & relocated to opencode config dir
+>
+
 > ## v0.5.3 - README update only - no struct/function changes
 > - added new section on `how opencode handles memory` - which is a fairly nice read, considering I'm new in these kinds of stuff
 > - bumped up minor version to push the above new section (with some statement re-alignments in README as well) to the public; this reframes what `inject_every_n_turns` actually does
