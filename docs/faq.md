@@ -6,7 +6,7 @@
 
 - `consolidate_on_compact` only fires on **automatic** (overflow-triggered) compaction, never on manual `/compact` — confirmed by source analysis this session; see the dedicated FAQ entry below.
 - `shared_dir` is a one-time, one-directional migration, not a live toggle — see the FAQ entry on toggling below. Directories can silently drift once you flip it back and forth.
-- Injection state (`_cache`, `_injectedOnce`, `_dirty`, `_turnCount` in `ocl-memory.mjs`; `_carryOverChecked` in `ocl-memory-shared.mjs`) is process-global module state. Safe for the standard single opencode process per session; not designed for multiple processes sharing one plugin instance.
+- Injection state (`_cache`, `_injectedOnce`, `_dirty`, `_turnCount` in `ocl-memory.mjs`; `_carryOverChecked` in `ocl-memory-shared.mjs`) is process-global module state. Safe for opencode's current model (one process per session).
 
 ## FAQ (post-0.6.0)
 
