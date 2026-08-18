@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-08-18
+
+Mirrors several features from the pi coding agent port ([`openpi-memory`](https://github.com/linellazatin/openpi-memory)) back into this project.
+
+### Added
+
+- **`shared_dir`**: opt-in cross-tool memory store at `~/.agents/memory/`. First enable copies local memory across (non-destructive). See [docs/shared-directory.md](docs/shared-directory.md).
+- **Cross-process advisory lock + atomic writes**: guards concurrent writes from this tool and other processes sharing the directory; all file writes now go through temp-file-then-rename.
+- **Config relocated to `memory.jsonc`**: moved from `memory/RULES.jsonc` to `~/.config/opencode/memory.jsonc`. Legacy installs auto-migrate on first read (`RULES.jsonc.bak` kept). See [docs/configuration.md](docs/configuration.md).
+- **`/memory consolidate`**: scans the session for unpersisted facts, writes each, and updates a `Last Session Recap` topic.
+- **`consolidate_on_compact`**: when `true`, replaces opencode's post-compaction auto-continue with a consolidation pass seeded by the compaction summary. Only fires on automatic compaction (not manual `/compact`). See [docs/faq.md](docs/faq.md).
+- **TUI follows `shared_dir`**: both plugins now share path/config resolution via `ocl-memory-shared.mjs`; TUI mutations use the same lock + atomic-write path as the server tools.
+- Larger defaults: byte cap 25 KB → 50 KB; `max_lines` default 200 → 300, clamp `[50, 500]` → `[50, 1000]`.
+
+### Changed
+
+- Plugin factory captures `input.client` for `client.session.prompt(...)` / `client.session.messages(...)` (consolidation).
+- 22 new tests (26 → 48).
+
+
 ## [0.5.3] - 2026-08-14
 
 ### Changed
