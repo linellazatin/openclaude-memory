@@ -6,6 +6,9 @@
 OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
 >
+> ## v0.6.1 HOTFIX on shared_dir
+> - **`shared_dir` carry-over now merges** instead of skipping when the shared dir already has content from another memory system of ours (e.g. openpi-memory wrote first) — collisions resolved by content comparison, differing files get a `-oclm` suffix
+>
 > ## v0.6.0 - MAJOR structural change (shared_dir, consolidation, config relocation)
 > - config relocated: `~/.config/opencode/memory/RULES.jsonc` → `~/.config/opencode/memory.jsonc` (legacy installs migrate automatically, old file kept as `.bak`)
 > - `shared_dir` (opt-in): move `MEMORY.md` + topic files to `~/.agents/memory/` so our sibling tool (e.g. [openpi-memory](https://github.com/linellazatin/openpi-memory)) can share the same memory store — cross-process file lock + atomic writes included; the TUI browser (`ctrl+alt+m`) follows it too
@@ -13,18 +16,10 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 > - bumped defaults: `max_lines` 200 → 300, byte cap 25 KB → 50 KB
 > - 22 new tests (26 → 48)
 >
-
 > ## v0.5.3 - README update only - no struct/function changes
 > - added new section on `how opencode handles memory` - which is a fairly nice read, considering I'm new in these kinds of stuff
 > - bumped up minor version to push the above new section (with some statement re-alignments in README as well) to the public; this reframes what `inject_every_n_turns` actually does
 > - will probably stack a few updates here, if they're as short as these 2 here
-> 
-> ## v0.5.2 - Quick clean-up and updates after hotfix (sorry)
-> - did some code clean-ups (most of which is for the migration function from legacy .md config to .jsonc)
-> - added some caching refresh after index file changes (useful for next agent turn)
-> - fixed SKILL description, clarified memory types, added references to new TUI features
-> - added 8 test cases, covering mostly index maintenance
-> - will add super short updates here moving forward
 > 
 > see [CHANGELOG](CHANGELOG.md) for more details
 

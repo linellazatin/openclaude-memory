@@ -19,11 +19,19 @@ No. The config rename (`RULES.jsonc` → `memory.jsonc`) and the `shared_dir` ca
 Read the `shared_dir` value directly from `~/.config/opencode/memory.jsonc` — it's the only place this is configured, and it's read fresh from disk whenever the in-process cache is invalidated (not cached indefinitely). You can also infer it indirectly: if `~/.agents/memory/MEMORY.md` exists, `shared_dir` has been `true` at least once.
 
 **Q: I opted in to `shared_dir`. Where did my memories go — are my old files gone?**
-Your old files are untouched at `~/.config/opencode/memory/`. Opting in copies (never moves) `MEMORY.md` and topic files into `~/.agents/memory/`. The originals stay exactly where they were — no separate backup dir is created, since the copy means nothing is lost anyway.
+Your old files are untouched at `~/.config/opencode/memory/`. Opting in merges (never moves) `MEMORY.md` and topic files into `~/.agents/memory/`. The originals stay exactly where they were — no separate backup dir is created, since the copy means nothing is lost anyway.
+
+**Q: I opted into `shared_dir` and another tool (e.g. openpi-memory) already had memories there — what happens to mine?**
+They're merged in, not skipped. openpi-memory and openclaude-memory use the identical on-disk format, so the carry-over reads your local `MEMORY.md` and, for each entry:
+- If the topic file doesn't already exist in the shared dir, it's copied in under its original name and its index line is appended.
+- If a file with the same name already exists there with **identical** content, nothing happens — it's already synced.
+- If a file with the same name already exists there with **different** content (a genuine slug collision between the two tools), your local copy is renamed with a `-oclm` suffix (e.g. `docker-setup.md` → `docker-setup-oclm.md`) and indexed under that name with your original topic title. The other tool's file at the original name is left completely untouched.
+
+This runs once per opencode process the first time `shared_dir` resolves `true` — and after the first *successful* merge, never runs its full scan again for this install: a `.shared-dir-migrated` sentinel file written into the local memory dir short-circuits every future process start straight to a single existence check, instead of re-scanning and re-comparing every local entry. Because every subsequent write goes straight to the shared dir once `shared_dir` is on, a later session re-checking the same already-merged state finds nothing new to do — it doesn't re-copy files or grow `-oclm-2`, `-oclm-3` suffixes on repeat. See [Opting in when the shared dir already has content](shared-directory.md#opting-in-when-the-shared-dir-already-has-content) for a full worked example. Note this fix is one-directional: if openpi-memory opts in *after* opencode has already populated the shared dir, openpi-memory's own carry-over does not yet merge — that would need an equivalent change on that project's side.
 
 **Q: If I opt in, then opt out, then opt in again — does everything stay in sync?**
-**No — this is the biggest watch-out.** Toggling `shared_dir` is a one-time, one-directional migration, not a live sync:
-- The carry-over from `~/.config/opencode/memory/` → `~/.agents/memory/` only ever runs once per process, guarded by "does the shared `MEMORY.md` already exist." Once it's run, it never runs again, even if you toggle off and back on.
+**No — this is the biggest watch-out.** Toggling `shared_dir` is a one-time migration per install, not a live sync:
+- The carry-over from `~/.config/opencode/memory/` → `~/.agents/memory/` only ever runs its full merge scan once *ever* for a given local install (guarded by an in-process flag, and — across process restarts — by a sentinel file). Once it has succeeded once, it never re-runs, even if you toggle off and back on.
 - There is **no reverse migration**. Opting out doesn't copy anything from `~/.agents/memory/` back to `~/.config/opencode/memory/` — it just changes which directory gets read/written going forward.
 - This means the two directories can silently drift apart: writes made while `shared_dir: true` are invisible once you flip it back to `false`, and vice versa. Nothing is deleted, but whichever directory isn't currently active becomes a stale snapshot.
 
