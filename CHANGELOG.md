@@ -2,13 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-08-19 HOTFIX++
+
+### Added
+
+- **Merge-aware `shared_dir` carry-over**: first enable now merges with pre-existing shared-dir content instead of silently skipping. Collisions resolved by content comparison; differing-content files renamed with `-oclm` suffix. Idempotent across multiple process starts, and now skips the full merge scan entirely on every process after the first successful one, via a `.shared-dir-migrated` sentinel file in the local memory dir. See [docs/shared-directory.md](docs/shared-directory.md).
+- **TUI follows `shared_dir`**: TUI plugin reads `memory.jsonc` fresh on every open and resolves the active directory dynamically. Mutations (pin/unpin/remove) use the same cross-process lock and atomic writes as the server tools.
+- **`ocl-memory-shared.mjs`**: pure-logic module shared by both plugins — path/config resolution, locking, atomic writes, carry-over. Eliminates duplication and ensures TUI and server plugin always agree on the active directory.
+- **Consolidation seeded by compaction summary**: `consolidate_on_compact` now fetches the most recent compaction summary (already in 0.6.0, just clarified in changelog) and seeds the consolidation prompt from it, rather than re-scanning the full conversation. Falls back to full-scan if no summary is found.
+
+### Changed
+
+- Removed redundant backup-dir creation from carry-over (originals stay in local dir untouched; a copy-not-move operation needs no separate backup).
+- 22 new tests (26 → 48); all 48 pass.
+
 ## [0.6.0] - 2026-08-18
 
 Mirrors several features from the pi coding agent port ([`openpi-memory`](https://github.com/linellazatin/openpi-memory)) back into this project.
 
 ### Added
 
-- **`shared_dir`**: opt-in cross-tool memory store at `~/.agents/memory/`. First enable copies local memory across (non-destructive). See [docs/shared-directory.md](docs/shared-directory.md).
+- **`shared_dir`**: opt-in cross-tool memory store at `~/.agents/memory/`. First enable merges with any pre-existing content there (from another tool, or a prior run) instead of skipping — collisions are resolved by content comparison, renaming only when needed. See [docs/shared-directory.md](docs/shared-directory.md).
 - **Cross-process advisory lock + atomic writes**: guards concurrent writes from this tool and other processes sharing the directory; all file writes now go through temp-file-then-rename.
 - **Config relocated to `memory.jsonc`**: moved from `memory/RULES.jsonc` to `~/.config/opencode/memory.jsonc`. Legacy installs auto-migrate on first read (`RULES.jsonc.bak` kept). See [docs/configuration.md](docs/configuration.md).
 - **`/memory consolidate`**: scans the session for unpersisted facts, writes each, and updates a `Last Session Recap` topic.
