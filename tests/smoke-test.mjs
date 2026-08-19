@@ -41,6 +41,7 @@ process.on('exit', () => {
 // --- Import plugin (after env vars are set) ---
 const { default: pluginFactory } = await import('../.opencode/plugins/ocl-memory.mjs');
 const tui = await import('../.opencode/plugins/ocl-memory-tui.mjs');
+const shared = await import('../.opencode/plugins/ocl-memory-shared.mjs');
 
 // Helper: instantiate plugin and get the hooks object. Pass { client } to
 // exercise the consolidation autocontinue path.
@@ -963,6 +964,162 @@ await test('Integration: TUI and server plugin resolve the identical active dir/
 
   writeRules('{ "shared_dir": false }');
 });
+
+// ═══════════════════════════════════════════════════════════
+// 18. v0.6.2 hardening fixes (memory-systems-comparison-v3 gap analysis)
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n--- 18. hardening fixes (stripJsonc, slug collisions, arg validation, pin coercion, path traversal) ---');
+
+// Section 17 ends by flipping shared_dir back to false via writeRules(), but
+// _cache is module-level (shared across all plugin instances) and a plain
+// writeRules() call doesn't invalidate it — force a fresh read now so every
+// test below reliably resolves against the local dir, not a stale shared-dir
+// cache left over from section 17's last forced refresh.
+await plugin['experimental.session.compacting']({}, makeCompactOutput());
+
+// --- stripJsonc / parseRules string-literal awareness ---
+
+await test('stripJsonc: does not truncate a "//" inside a string value', () => {
+  const raw = '{ "always_ask": ["See https://example.com for details"] }';
+  const stripped = shared.stripJsonc(raw);
+  assert.ok(stripped.includes('https://example.com'), `URL should survive intact; got: ${stripped}`);
+  assert.doesNotThrow(() => JSON.parse(stripped), 'result should still be valid JSON');
+});
+
+await test('stripJsonc: still strips a real // comment outside a string', () => {
+  const raw = '{ // a real comment\n  "max_lines": 250\n}';
+  const stripped = shared.stripJsonc(raw);
+  assert.ok(!stripped.includes('a real comment'), 'real comment should be stripped');
+  assert.equal(JSON.parse(stripped).max_lines, 250);
+});
+
+await test('parseRules: a URL in a config string value no longer silently falls back to defaults', () => {
+  const raw = '{ "always_ask": ["See https://example.com for details"], "max_lines": 250 }';
+  const config = shared.parseRules(raw);
+  assert.equal(config.maxLines, 250, 'custom max_lines should survive — old stripJsonc would have corrupted parsing and silently reverted to the 300 default');
+});
+
+await test('parseRules: logs via console.error on a genuine parse failure instead of failing silently', () => {
+  const originalError = console.error;
+  const calls = [];
+  console.error = (...args) => calls.push(args);
+  try {
+    const config = shared.parseRules('{ this is not valid json at all');
+    assert.equal(config.maxLines, 300, 'should still fall back to defaults on a genuine parse failure');
+    assert.ok(calls.length > 0, 'console.error should be called on parse failure');
+  } finally {
+    console.error = originalError;
+  }
+});
+
+// --- write_memory: colliding filename slugs ---
+
+await test('write_memory: colliding slugs from different topic names get distinct files, not merged', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'API Setup!', content: 'first topic content', summary: 'first', pin: false });
+  await plugin.tool.write_memory.execute({ topic: 'api-setup', content: 'second topic content', summary: 'second', pin: false });
+
+  assert.ok(fs.existsSync(path.join(MEMORY_DIR, 'api-setup.md')), 'first topic file should exist under the plain slug');
+  assert.ok(fs.existsSync(path.join(MEMORY_DIR, 'api-setup-2.md')), 'second (colliding) topic should get a numeric-suffixed filename');
+
+  const firstContent = fs.readFileSync(path.join(MEMORY_DIR, 'api-setup.md'), 'utf8');
+  const secondContent = fs.readFileSync(path.join(MEMORY_DIR, 'api-setup-2.md'), 'utf8');
+  assert.ok(firstContent.includes('first topic content'), 'first topic file should be untouched');
+  assert.ok(!firstContent.includes('second topic content'), "first topic file must not contain the colliding topic's content");
+  assert.ok(secondContent.includes('second topic content'), 'second topic file should have its own content');
+
+  const index = readIndex();
+  assert.ok(index.includes('[API Setup!](api-setup.md)'), 'first index entry keeps its own name/filename');
+  assert.ok(index.includes('[api-setup](api-setup-2.md)'), 'second index entry uses the bumped filename with its own name');
+});
+
+await test('write_memory: re-writing the same topic name still updates its existing file (no false-positive collision)', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'API Setup!', content: 'updated content', summary: 'first updated', mode: 'replace', pin: false });
+  assert.ok(!fs.existsSync(path.join(MEMORY_DIR, 'api-setup-3.md')), 're-writing an existing topic name must not bump a new suffixed filename');
+  const content = fs.readFileSync(path.join(MEMORY_DIR, 'api-setup.md'), 'utf8');
+  assert.ok(content.includes('updated content'), 'existing file should be updated in place');
+});
+
+// --- Tool argument validation ---
+
+await test('write_memory: rejects missing/invalid topic, content, or summary with a clean error', async () => {
+  const r1 = await plugin.tool.write_memory.execute({ content: 'x', summary: 'y', pin: false });
+  assert.ok(r1.includes('topic is required'), `missing topic should return a clean error; got: ${r1}`);
+  const r2 = await plugin.tool.write_memory.execute({ topic: 'T', summary: 'y', pin: false });
+  assert.ok(r2.includes('content is required'), `missing content should return a clean error; got: ${r2}`);
+  const r3 = await plugin.tool.write_memory.execute({ topic: 'T', content: 'x', pin: false });
+  assert.ok(r3.includes('summary is required'), `missing summary should return a clean error; got: ${r3}`);
+});
+
+await test('remove_memory: rejects missing/invalid topic with a clean error instead of throwing', async () => {
+  const r = await plugin.tool.remove_memory.execute({});
+  assert.ok(r.includes('topic is required'), `missing topic should return a clean error, not throw; got: ${r}`);
+});
+
+await test('pin_memory: rejects missing/invalid topic with a clean error instead of throwing', async () => {
+  const r = await plugin.tool.pin_memory.execute({ pin: true });
+  assert.ok(r.includes('topic is required'), `missing topic should return a clean error, not throw; got: ${r}`);
+});
+
+// --- pin boolean coercion ---
+
+await test('pin_memory: string "false" behaves as false, not JS-truthy', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Pin Coercion Test', content: 'x', summary: 'y', pin: false });
+  await plugin.tool.pin_memory.execute({ topic: 'Pin Coercion Test', pin: 'false' });
+  const line = readIndex().split('\n').find(l => l.includes('Pin Coercion Test'));
+  assert.ok(line && !line.includes('[pin]'), `entry must remain unpinned after pin:"false"; got line: ${line}`);
+});
+
+await test('write_memory: string "false" for pin does not pin a new entry', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Write Pin Coercion', content: 'x', summary: 'y', pin: 'false' });
+  const line = readIndex().split('\n').find(l => l.includes('Write Pin Coercion'));
+  assert.ok(line && !line.includes('[pin]'), `string "false" must not pin the entry; got line: ${line}`);
+});
+
+await test('pin_memory: string "true" still pins (backward compatible with prior truthy behavior)', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Pin String True Test', content: 'x', summary: 'y', pin: false });
+  await plugin.tool.pin_memory.execute({ topic: 'Pin String True Test', pin: 'true' });
+  const line = readIndex().split('\n').find(l => l.includes('Pin String True Test'));
+  assert.ok(line && line.includes('[pin]'), `string "true" should still pin; got line: ${line}`);
+  await plugin.tool.pin_memory.execute({ topic: 'Pin String True Test', pin: false });
+});
+
+// --- Path traversal guard on filenames read back from MEMORY.md ---
+
+await test('isSafeFilename: rejects path separators and .. segments, accepts plain filenames', () => {
+  assert.equal(shared.isSafeFilename('normal-topic.md'), true);
+  assert.equal(shared.isSafeFilename('../../../etc/passwd'), false);
+  assert.equal(shared.isSafeFilename('sub/dir.md'), false);
+  assert.equal(shared.isSafeFilename('..\\windows\\path.md'), false);
+});
+
+await test('remove_memory: refuses to act on an entry with an unsafe filename instead of touching the path', async () => {
+  const memIndexPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(memIndexPath, 'utf8');
+  fs.writeFileSync(memIndexPath, before.replace(/\n+$/, '') + '\n- [Evil Entry](../../../../etc/passwd) 2026-01-01T00:00:00+00:00 -- corrupted entry\n', 'utf8');
+
+  const result = await plugin.tool.remove_memory.execute({ topic: 'Evil Entry' });
+  assert.ok(result.includes('unsafe filename'), `expected an unsafe-filename refusal; got: ${result}`);
+
+  const after = fs.readFileSync(memIndexPath, 'utf8');
+  assert.ok(after.includes('Evil Entry'), 'the corrupted entry should be left untouched by remove_memory, not silently removed');
+
+  // Clean it back up via maintainIndex's own drop-unsafe-entry path (exercised next).
+  fs.writeFileSync(memIndexPath, before, 'utf8');
+});
+
+await test('maintainIndex (via write_memory): drops an unsafe-filename index entry like an orphan', async () => {
+  const memIndexPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(memIndexPath, 'utf8');
+  fs.writeFileSync(memIndexPath, before.replace(/\n+$/, '') + '\n- [Evil Entry 2](../../../../etc/shadow) 2026-01-01T00:00:00+00:00 -- corrupted entry\n', 'utf8');
+
+  // Any write_memory call runs maintainIndex, which should drop the unsafe entry.
+  await plugin.tool.write_memory.execute({ topic: 'Maintain Trigger', content: 'x', summary: 'trigger', pin: false });
+
+  const after = readIndex();
+  assert.ok(!after.includes('Evil Entry 2'), 'unsafe-filename entry should be dropped by maintainIndex, same as an orphan');
+});
+
 
 // ═══════════════════════════════════════════════════════════
 // Results
