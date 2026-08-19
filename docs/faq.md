@@ -2,11 +2,16 @@
 
 [Back to README](../README.md)
 
-## Known limitations
+## Known limitations (for now)
 
 - `consolidate_on_compact` only fires on **automatic** (overflow-triggered) compaction, never on manual `/compact` — confirmed by source analysis this session; see the dedicated FAQ entry below.
 - `shared_dir` is a one-time, one-directional migration, not a live toggle — see the FAQ entry on toggling below. Directories can silently drift once you flip it back and forth.
 - Injection state (`_cache`, `_injectedOnce`, `_dirty`, `_turnCount` in `ocl-memory.mjs`; `_carryOverChecked` in `ocl-memory-shared.mjs`) is process-global module state. Safe for opencode's current model (one process per session).
+- The `shared_dir` first-enable carry-over and every tool's write lock can both silently proceed without holding the lock if contention exceeds a 500ms timeout — a narrow race window, only relevant to genuinely concurrent first-time enablement or heavy concurrent write load. Self-healing for the topic files themselves; an index line can be lost in the rare case where it fires.
+- `shared_dir` toggles can leave the in-process cache checking the previous directory's dirty-sentinel for one cycle before self-healing on the next tool call or forced refresh — a narrow, self-healing window, not a persistent bug.
+- The cross-process lock's stale-lock reclaim is time-based only (10s, via file mtime) with no process-liveness check, and its `wx`-flag atomicity may not hold on some older NFS-mounted home directories. Both are accepted trade-offs for a single-user, best-effort lock design, not bugs with a planned fix (for now).
+- `shared_dir` interop with other tools (e.g. openpi-memory) is uncoordinated at the bookkeeping level: each tool tracks its own migration sentinel and uses its own collision suffix (this plugin's `-oclm` vs. openpi-memory's `-opim`), invisible to the other. Day-to-day reads/writes/locking still work correctly across tools — only the one-time carry-over bookkeeping is tool-private.
+- This plugin has no equivalent to Claude Code's per-subagent memory scoping (a dedicated `MEMORY.md` per subagent via `memory:` frontmatter) — memory here is a single global store. opencode currently exposes no hook surface for per-subagent memory that this plugin could attach to.
 
 ## FAQ (post-0.6.0)
 

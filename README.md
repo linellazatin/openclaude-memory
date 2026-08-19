@@ -6,6 +6,12 @@
 OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
 >
+> ## v0.6.2 — bugfixes & hardening
+> - filename slug collisions no longer silently merge two topics into one file
+> - `stripJsonc` no longer breaks on `//` in config values (URLs etc) — now warns instead of silently resetting to defaults
+> - memory tools reject bad/missing args cleanly instead of throwing
+> - closed a path-traversal gap on filenames read back from `MEMORY.md`
+>
 > ## v0.6.1 HOTFIX on shared_dir
 > - **`shared_dir` carry-over now merges** instead of skipping when the shared dir already has content from another memory system of ours (e.g. openpi-memory wrote first) — collisions resolved by content comparison, differing files get a `-oclm` suffix
 >
@@ -16,11 +22,6 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 > - bumped defaults: `max_lines` 200 → 300, byte cap 25 KB → 50 KB
 > - 22 new tests (26 → 48)
 >
-> ## v0.5.3 - README update only - no struct/function changes
-> - added new section on `how opencode handles memory` - which is a fairly nice read, considering I'm new in these kinds of stuff
-> - bumped up minor version to push the above new section (with some statement re-alignments in README as well) to the public; this reframes what `inject_every_n_turns` actually does
-> - will probably stack a few updates here, if they're as short as these 2 here
-> 
 > see [CHANGELOG](CHANGELOG.md) for more details
 
 ## Table of contents
