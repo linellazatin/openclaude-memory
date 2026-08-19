@@ -171,7 +171,51 @@ export function releaseLock(lockPath) {
   try { fs.unlinkSync(lockPath); } catch {}
 }
 
-export const stripJsonc = raw => raw.replace(/\/\/[^\n]*/g, '').replace(/,\s*([}\]])/g, '$1');
+export const stripJsonc = raw => {
+  // String-literal-aware JSONC comment stripper. A naive `//`-strip regex
+  // would truncate a config value containing a URL (e.g. "https://example.com")
+  // mid-string, corrupting the JSON. This tracks quote state so `//` (and the
+  // trailing-comma cleanup below) only strip outside of string literals.
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      out += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '/' && raw[i + 1] === '/') {
+      i += 2;
+      while (i < raw.length && raw[i] !== '\n') i++;
+      i--; // land back on '\n' (or raw.length) so the for-loop's i++ is correct
+      continue;
+    }
+    out += ch;
+  }
+  return out.replace(/,\s*([}\]])/g, '$1');
+};
+
+// Rejects filenames that could escape memDir (path separators, `..` segments).
+// toSlug() already prevents these on the write path for brand-new topics, but
+// a filename read back from an existing MEMORY.md index line is otherwise
+// trusted verbatim — apply this before using such a filename in any path.join
+// or file operation.
+export function isSafeFilename(filename) {
+  return typeof filename === 'string'
+    && filename.length > 0
+    && !filename.includes('/')
+    && !filename.includes('\\')
+    && !filename.includes('..');
+}
 
 export function parseRules(raw) {
   const defaults = {
@@ -191,7 +235,8 @@ export function parseRules(raw) {
       sharedDir: typeof obj.shared_dir === 'boolean' ? obj.shared_dir : defaults.sharedDir,
       consolidateOnCompact: typeof obj.consolidate_on_compact === 'boolean' ? obj.consolidate_on_compact : defaults.consolidateOnCompact,
     };
-  } catch {
+  } catch (err) {
+    console.error('[openclaude-memory] memory.jsonc failed to parse, using defaults:', err.message);
     return defaults;
   }
 }
@@ -213,7 +258,8 @@ export function readMemoryRules() {
     ensureMemoryDir(CONFIG_ROOT);
     atomicWriteFileSync(MEMORY_CONFIG, INITIAL_RULES_JSONC);
     return INITIAL_RULES_JSONC;
-  } catch {
+  } catch (err) {
+    console.error('[openclaude-memory] failed to read/write memory config:', err.message);
     return null;
   }
 }
@@ -271,6 +317,7 @@ function mergeLocalIntoSharedDir(sharedDir) {
   for (const line of localLines) {
     const parsed = parseIndexLine(line);
     if (!parsed) continue; // headers/blanks — destination keeps its own
+    if (!isSafeFilename(parsed.filename)) continue; // corrupted/unsafe entry — drop like an orphan
     const srcPath = path.join(MEMORY_DIR, parsed.filename);
     if (!fs.existsSync(srcPath)) continue; // orphaned local entry, skip
 

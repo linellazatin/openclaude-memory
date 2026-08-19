@@ -4,6 +4,7 @@ import {
   MEMORY_DIR, MEMORY_CONFIG, INITIAL_MEMORY, parseIndexLine,
   stripJsonc, readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel,
   ensureMemoryDir, atomicWriteFileSync, sleep, acquireLock, releaseLock, maybeCarryOverToSharedDir,
+  isSafeFilename,
 } from './ocl-memory-shared.mjs';
 
 const MAX_BYTES = 50 * 1024;
@@ -152,6 +153,7 @@ function maintainIndex(lines, config, memDir = MEMORY_DIR) {
     const parsed = parseIndexLine(line);
     if (!parsed) continue;
     const { filename } = parsed;
+    if (!isSafeFilename(filename)) continue; // corrupted/unsafe entry — drop like an orphan
     if (!fs.existsSync(path.join(memDir, filename))) continue;
     const date = (parsed.rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
     const prev = best.get(filename);
@@ -255,6 +257,10 @@ const tools = {
     },
     async execute(args) {
       const { topic, content, summary, pin, mode = 'append' } = args;
+      if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
+      if (typeof content !== 'string') return 'Error: content is required and must be a string.';
+      if (typeof summary !== 'string') return 'Error: summary is required and must be a string.';
+      const pinBool = pin === true || pin === 'true';
 
       const { config } = await getCache();
       const memDir = getMemoryDir(config);
@@ -270,11 +276,25 @@ const tools = {
 
         // Check if an existing index entry matches this topic name — use its filename if so
         let filename = toSlug(topic) + '.md';
+        let matchedExisting = false;
         for (const line of rawIndex.split('\n')) {
           const parsed = parseIndexLine(line);
           if (parsed && parsed.name.toLowerCase() === topic.toLowerCase()) {
             filename = parsed.filename;
+            matchedExisting = true;
             break;
+          }
+        }
+
+        // Genuinely new topic (no existing entry matched by name) whose slug
+        // collides with an unrelated file already on disk — bump a numeric
+        // suffix instead of silently sharing/overwriting that file's content.
+        if (!matchedExisting) {
+          const base = filename.replace(/\.md$/, '');
+          let n = 2;
+          while (fs.existsSync(path.join(memDir, filename))) {
+            filename = `${base}-${n}.md`;
+            n++;
           }
         }
         const topicPath = path.join(memDir, filename);
@@ -313,7 +333,7 @@ const tools = {
         // Update index
         let lines = rawIndex.split('\n');
 
-        lines = upsertIndexLine(lines, filename, topic, summary, pin);
+        lines = upsertIndexLine(lines, filename, topic, summary, pinBool);
         lines = maintainIndex(lines, config, memDir);
 
         atomicWriteFileSync(memIndex, lines.join('\n'));
@@ -333,6 +353,7 @@ const tools = {
     },
     async execute(args) {
       const { topic } = args;
+      if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
       const search = topic.toLowerCase();
 
       const { config } = await getCache();
@@ -353,6 +374,10 @@ const tools = {
           return `No matching entry found for "${topic}".`;
         }
         const { idx: foundIdx, parsed } = found;
+
+        if (!isSafeFilename(parsed.filename)) {
+          return `Entry has an unsafe filename (${parsed.filename}) and was not modified. This may indicate a corrupted index — inspect it manually.`;
+        }
 
         if (parsed.rest.includes('[pin]')) {
           return `Entry is pinned and cannot be removed. Use pin_memory with pin: false to unpin it first.`;
@@ -386,7 +411,9 @@ const tools = {
     },
     async execute(args) {
       const { topic, pin } = args;
+      if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
       const search = topic.toLowerCase();
+      const pinBool = pin === true || pin === 'true';
 
       const { config } = await getCache();
       const memDir = getMemoryDir(config);
@@ -410,10 +437,10 @@ const tools = {
         const line = lines[foundIdx];
         const alreadyPinned = parsed.rest.includes('[pin]');
 
-        if (pin && alreadyPinned) return `Already pinned: ${line.trim()}`;
-        if (!pin && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
+        if (pinBool && alreadyPinned) return `Already pinned: ${line.trim()}`;
+        if (!pinBool && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
 
-        const newRest = pin
+        const newRest = pinBool
           ? ' [pin]' + parsed.rest
           : parsed.rest.replace(/\s*\[pin\]/, '');
 
@@ -426,7 +453,7 @@ const tools = {
         atomicWriteFileSync(memIndex, maintained.join('\n'));
         invalidateCache();
 
-        return `${pin ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
+        return `${pinBool ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
       } finally {
         releaseLock(lockPath);
       }
