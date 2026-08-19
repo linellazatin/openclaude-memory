@@ -9,9 +9,9 @@ import {
 // is currently active. Called once per browser session (each ctrl+alt+m
 // press) — cheap, low-frequency, so no caching is needed here (unlike the
 // server plugin, which re-reads far more often).
-function resolveActiveDir() {
+async function resolveActiveDir() {
   const config = parseRules(readMemoryRules());
-  maybeCarryOverToSharedDir(config);
+  await maybeCarryOverToSharedDir(config);
   return { memDir: getMemoryDir(config), memIndex: getMemoryIndex(config) };
 }
 
@@ -90,7 +90,7 @@ function readTopic(memDir, filename) {
 
 const tui = async (api) => {
   async function showBrowser() {
-    const { memDir, memIndex } = resolveActiveDir();
+    const { memDir, memIndex } = await resolveActiveDir();
     const entries = parseIndex(memIndex);
     api.ui.dialog.setSize('large');
     api.ui.dialog.replace(() => api.ui.DialogSelect({

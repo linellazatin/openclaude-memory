@@ -1,16 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 import {
-  MEMORY_DIR, MEMORY_CONFIG,
+  MEMORY_DIR, MEMORY_CONFIG, INITIAL_MEMORY, parseIndexLine,
   stripJsonc, readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel,
   ensureMemoryDir, atomicWriteFileSync, sleep, acquireLock, releaseLock, maybeCarryOverToSharedDir,
 } from './ocl-memory-shared.mjs';
 
 const MAX_BYTES = 50 * 1024;
-
-const INITIAL_MEMORY = `# Memory Index
-
-`;
 
 const CONSOLIDATION_PROMPT = `Review the current conversation for facts, decisions, or discoveries that match the "always_persist" rules in ${MEMORY_CONFIG} but have not yet been written to memory. For each one found, call write_memory with an appropriate topic, content, summary, and pin value.
 
@@ -53,7 +49,7 @@ let _injectedOnce = false;
 let _dirty = false;
 let _turnCount = 0;
 
-function getCache(forceRefresh = false) {
+async function getCache(forceRefresh = false) {
   // If TUI mutated MEMORY.md directly, it writes a sentinel file to signal us.
   // The sentinel lives alongside whichever dir was active last time we
   // resolved (_cache.memDir) — matches wherever the TUI actually wrote it.
@@ -65,7 +61,7 @@ function getCache(forceRefresh = false) {
   if (!_cache || forceRefresh) {
     const rules = readMemoryRules();
     const config = parseRules(rules);
-    maybeCarryOverToSharedDir(config);
+    await maybeCarryOverToSharedDir(config);
     const renderedRules = renderRulesForInjection(rules);
     const memDir = getMemoryDir(config);
     const content = readMemoryIndex(config.maxLines, memDir);
@@ -123,20 +119,8 @@ function readMemoryIndex(maxLines, memDir) {
 }
 
 // --- Index line parsing ---
-
-// Parses a single index line into parts. Returns null if not a memory entry line.
-// Line format: - [Topic Name](file.md) [pin] YYYY-MM-DD [stale?] -- summary
-function parseIndexLine(line) {
-  const match = line.match(/^(\s*-\s+\[)([^\]]+)(\]\()([^)]+)(\))(.*)/);
-  if (!match) return null;
-  return {
-    prefix: match[1],      // "- ["
-    name: match[2],         // "Topic Name"
-    mid: match[3] + match[4] + match[5], // "](file.md)"
-    filename: match[4],     // "file.md"
-    rest: match[6],         // " [pin] YYYY-MM-DD [stale?] -- summary"
-  };
-}
+// parseIndexLine now lives in ocl-memory-shared.mjs (needed there for the
+// shared_dir merge logic too) — imported above.
 
 function nowIso() {
   const now = new Date();
@@ -272,7 +256,7 @@ const tools = {
     async execute(args) {
       const { topic, content, summary, pin, mode = 'append' } = args;
 
-      const { config } = getCache();
+      const { config } = await getCache();
       const memDir = getMemoryDir(config);
       const memIndex = getMemoryIndex(config);
       ensureMemoryDir(memDir);
@@ -351,7 +335,7 @@ const tools = {
       const { topic } = args;
       const search = topic.toLowerCase();
 
-      const { config } = getCache();
+      const { config } = await getCache();
       const memDir = getMemoryDir(config);
       const memIndex = getMemoryIndex(config);
 
@@ -404,7 +388,7 @@ const tools = {
       const { topic, pin } = args;
       const search = topic.toLowerCase();
 
-      const { config } = getCache();
+      const { config } = await getCache();
       const memDir = getMemoryDir(config);
       const memIndex = getMemoryIndex(config);
 
@@ -494,7 +478,7 @@ export default async (input) => {
       // command template. If shared_dir is toggled later, this stays stale
       // until the next restart — same one-time-resolution behavior the rest
       // of the plugin already has for config.
-      const { config: memConfig } = getCache();
+      const { config: memConfig } = await getCache();
       const activeDir = getMemoryDir(memConfig);
       const activeIndex = getMemoryIndex(memConfig);
 
@@ -563,7 +547,7 @@ Any text including single words is treated literally as content to store. Do not
     // All other turns skip injection, saving tokens while keeping memory salient.
     'experimental.chat.system.transform': async (_input, output) => {
       _turnCount++;
-      const { renderedRules, content, config, memDir } = getCache();
+      const { renderedRules, content, config, memDir } = await getCache();
       const shouldInject = !_injectedOnce || _dirty || (_turnCount % config.injectEveryNTurns === 0);
 
       if (shouldInject) {
@@ -582,7 +566,7 @@ Any text including single words is treated literally as content to store. Do not
 
     'experimental.session.compacting': async (_input, output) => {
       // Force a fresh read so the compaction prompt gets up-to-date memory state.
-      const { renderedRules, content } = getCache(true);
+      const { renderedRules, content } = await getCache(true);
 
       if (content) {
         output.context.push(`## Global Memory (current index)\n\n${content}`);
@@ -612,7 +596,7 @@ Any text including single words is treated literally as content to store. Do not
     // (automatic) compaction. Users who compact manually and want consolidation
     // must run /memory consolidate explicitly. Known gap; no near-term fix.
     'experimental.compaction.autocontinue': async (hookInput, output) => {
-      const { config } = getCache();
+      const { config } = await getCache();
       if (!config.consolidateOnCompact || !client) return;
       output.enabled = false;
       try {

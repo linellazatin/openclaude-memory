@@ -15,6 +15,13 @@ export const CONFIG_ROOT = path.join(
 export const MEMORY_DIR = path.join(CONFIG_ROOT, 'memory');
 export const MEMORY_INDEX = path.join(MEMORY_DIR, 'MEMORY.md');
 export const MEMORY_CONFIG = path.join(CONFIG_ROOT, 'memory.jsonc');
+
+// Marks that this local install's memory has already been merged into the
+// shared dir at least once. Lives in the local dir (not the shared one) —
+// it's a property of the local install, independent of which dir is
+// currently active. Never written on a failed/partial merge, so a failed
+// attempt retries on the next process start.
+export const CARRY_OVER_SENTINEL = path.join(MEMORY_DIR, '.shared-dir-migrated');
 export const MEMORY_CONFIG_LEGACY = path.join(MEMORY_DIR, 'RULES.jsonc'); // pre-0.6.0 location, fallback only
 
 // Shared cross-tool memory store — opt-in via "shared_dir": true in memory.jsonc.
@@ -23,6 +30,24 @@ export const SHARED_MEMORY_DIR = path.join(
   process.env.OCL_SHARED_MEMORY_HOME || os.homedir(),
   '.agents', 'memory'
 );
+
+export const INITIAL_MEMORY = `# Memory Index
+
+`;
+
+// Parses a single index line into parts. Returns null if not a memory entry line.
+// Line format: - [Topic Name](file.md) [pin] YYYY-MM-DD [stale?] -- summary
+export function parseIndexLine(line) {
+  const match = line.match(/^(\s*-\s+\[)([^\]]+)(\]\()([^)]+)(\))(.*)/);
+  if (!match) return null;
+  return {
+    prefix: match[1],      // "- ["
+    name: match[2],         // "Topic Name"
+    mid: match[3] + match[4] + match[5], // "](file.md)"
+    filename: match[4],     // "file.md"
+    rest: match[6],         // " [pin] YYYY-MM-DD [stale?] -- summary"
+  };
+}
 
 const MAX_LINES = 300;
 const DEFAULT_STALE_DAYS = 180;
@@ -193,31 +218,101 @@ export function readMemoryRules() {
   }
 }
 
-// One-way, non-destructive carry-over when shared_dir is first enabled.
-// Copies (never moves) local memory files into the shared dir. Runs at most
-// once per process. Toggling shared_dir off then on again does not re-run
-// this or reconcile drift — deliberate, matching openpi-memory's stance (see
-// AGENTS.md quirk).
-export function maybeCarryOverToSharedDir(config) {
+// Merge-aware carry-over when shared_dir is first enabled. Copies (never
+// moves) local memory files into the shared dir. If the shared dir already
+// has content (from another tool, or a prior run of this one), local entries
+// are merged in rather than skipped — collisions are resolved by content
+// comparison, only renaming (suffix "-oclm") when the same filename holds
+// genuinely different content. Runs at most once ever per local install: the
+// in-process _carryOverChecked flag short-circuits repeat calls within a
+// process, and CARRY_OVER_SENTINEL (a file in the local dir, written only
+// after a fully successful merge) short-circuits it across process restarts
+// too, so a full merge scan never re-runs once it has ever succeeded. Toggling
+// shared_dir off then on again does not re-run this or reconcile drift that
+// happened while it was off — deliberate, matching openpi-memory's stance
+// (see AGENTS.md quirk).
+export async function maybeCarryOverToSharedDir(config) {
   if (!config.sharedDir || _carryOverChecked) return;
   _carryOverChecked = true;
+  if (fs.existsSync(CARRY_OVER_SENTINEL)) return; // already migrated in a prior process
+  if (!fs.existsSync(MEMORY_INDEX)) return; // nothing local to carry over
   try {
     const sharedDir = SHARED_MEMORY_DIR;
-    const sharedIndex = path.join(sharedDir, 'MEMORY.md');
-    if (fs.existsSync(sharedIndex)) return; // shared dir already has content
-    if (!fs.existsSync(MEMORY_INDEX)) return; // nothing local to carry over
-    // Skip transient/internal files; originals stay in MEMORY_DIR untouched
-    // (this is a copy, not a move) so no separate backup dir is needed.
-    const skip = new Set(['.invalidate', '.lock']);
-    const entries = fs.readdirSync(MEMORY_DIR).filter(e => !skip.has(e));
-
-    fs.mkdirSync(sharedDir, { recursive: true });
-    for (const entry of entries) {
-      const srcPath = path.join(MEMORY_DIR, entry);
-      if (fs.statSync(srcPath).isDirectory()) continue;
-      fs.copyFileSync(srcPath, path.join(sharedDir, entry));
+    ensureMemoryDir(sharedDir);
+    const lockPath = await acquireLock(sharedDir);
+    try {
+      mergeLocalIntoSharedDir(sharedDir);
+    } finally {
+      releaseLock(lockPath);
     }
+    fs.writeFileSync(CARRY_OVER_SENTINEL, '');
   } catch {
-    // best-effort — carry-over failure should never break normal operation
+    // best-effort — carry-over failure should never break normal operation;
+    // sentinel intentionally not written on failure so a retry can happen
+    // on the next process start
   }
+}
+
+// Merges the local MEMORY.md's entries and topic files into the shared dir.
+// Entries/files already present under the same name (identical content) or
+// under the canonical "-oclm" suffix (from a prior merge) are skipped —
+// this is what keeps repeated runs (e.g. one per new opencode process) from
+// growing duplicate/renamed copies indefinitely, since local files are frozen
+// the moment shared_dir flips true (every subsequent write goes straight to
+// the shared dir via getMemoryDir(config), never back to the local copy).
+function mergeLocalIntoSharedDir(sharedDir) {
+  const sharedIndexPath = path.join(sharedDir, 'MEMORY.md');
+  const sharedRaw = fs.existsSync(sharedIndexPath) ? fs.readFileSync(sharedIndexPath, 'utf8') : INITIAL_MEMORY;
+  const sharedFilesOnDisk = new Set(fs.readdirSync(sharedDir));
+
+  const localLines = fs.readFileSync(MEMORY_INDEX, 'utf8').split('\n');
+  const appended = [];
+
+  for (const line of localLines) {
+    const parsed = parseIndexLine(line);
+    if (!parsed) continue; // headers/blanks — destination keeps its own
+    const srcPath = path.join(MEMORY_DIR, parsed.filename);
+    if (!fs.existsSync(srcPath)) continue; // orphaned local entry, skip
+
+    const destName = resolveDestName(srcPath, sharedDir, parsed.filename, sharedFilesOnDisk);
+    if (destName === null) continue; // identical content already present under some name — nothing to do
+
+    fs.copyFileSync(srcPath, path.join(sharedDir, destName));
+    sharedFilesOnDisk.add(destName);
+    appended.push(`${parsed.prefix}${parsed.name}](${destName})${parsed.rest}`);
+  }
+
+  if (appended.length) {
+    const merged = sharedRaw.replace(/\n+$/, '') + '\n' + appended.join('\n') + '\n';
+    atomicWriteFileSync(sharedIndexPath, merged);
+  } else if (!fs.existsSync(sharedIndexPath)) {
+    atomicWriteFileSync(sharedIndexPath, sharedRaw); // truly-empty shared dir, no local entries either
+  }
+}
+
+// Decides where a local topic file should land in the shared dir. Returns the
+// destination filename to use, or null if nothing needs to be written
+// (content already present under the original name or the canonical -oclm name).
+function resolveDestName(srcPath, sharedDir, filename, sharedFilesOnDisk) {
+  const originalDest = path.join(sharedDir, filename);
+  if (!fs.existsSync(originalDest)) return filename; // no collision
+
+  if (filesEqual(srcPath, originalDest)) return null; // already there under the same name
+
+  const suffixed = filename.replace(/\.md$/, '-oclm.md');
+  const suffixedDest = path.join(sharedDir, suffixed);
+  if (!fs.existsSync(suffixedDest)) return suffixed;
+  if (filesEqual(srcPath, suffixedDest)) return null; // already migrated under the canonical suffixed name in a prior run
+
+  // Exceedingly rare: even the suffixed name collides with unrelated content. Bump a counter.
+  let n = 2, candidate;
+  do {
+    candidate = filename.replace(/\.md$/, `-oclm-${n}.md`);
+    n++;
+  } while (sharedFilesOnDisk.has(candidate));
+  return candidate;
+}
+
+function filesEqual(pathA, pathB) {
+  return fs.readFileSync(pathA, 'utf8') === fs.readFileSync(pathB, 'utf8');
 }

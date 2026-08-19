@@ -607,16 +607,69 @@ await test('max_lines clamps to 1000 maximum (live truncation)', async () => {
 // ═══════════════════════════════════════════════════════════
 // 15. shared_dir cross-tool store (Phase 3)
 //     Order matters: carry-over only fires once per process
-//     (_carryOverChecked), so the "first enable" test must run
-//     before any other shared_dir=true config write.
+//     (_carryOverChecked) and, after a successful run, never again for this
+//     install (a .shared-dir-migrated sentinel in MEMORY_DIR short-circuits
+//     it across future process starts too) — so the "first enable" test
+//     must run before any other shared_dir=true config write. Because of
+//     that one-shot guard, every merge scenario (no-collision,
+//     identical-content no-op, differing-content rename, already-
+//     migrated idempotency, orphan safety, sentinel write) has to be
+//     exercised within that single test — there is no way to trigger a
+//     second real carry-over later in this process.
 // ═══════════════════════════════════════════════════════════
 
 console.log('\n--- 15. shared_dir cross-tool store ---');
 
-await test('shared_dir: first enable carries over existing local memory (copy, not move)', async () => {
+await test('shared_dir: first enable merges with pre-existing foreign content instead of skipping', async () => {
   const localEntriesBefore = fs.readdirSync(MEMORY_DIR).filter(e => e.endsWith('.md'));
   assert.ok(localEntriesBefore.length > 0, 'expected existing local memory files from prior tests');
   assert.ok(!fs.existsSync(SHARED_MEMORY_DIR), 'shared dir should not exist yet');
+
+  // Create local topics with known, controlled filenames to exercise each
+  // merge scenario deterministically (on top of whatever pre-existing local
+  // files already exist from earlier sections — those exercise the plain
+  // no-collision case implicitly, since none of their filenames exist yet
+  // in the not-yet-created shared dir).
+  await plugin.tool.write_memory.execute({ topic: 'Collision Identical', content: 'identical content', summary: 'identical', pin: false });
+  await plugin.tool.write_memory.execute({ topic: 'Collision Differing', content: 'local differing content', summary: 'differing', pin: false });
+  await plugin.tool.write_memory.execute({ topic: 'Already Migrated', content: 'local already-migrated content', summary: 'already migrated', pin: false });
+  await plugin.tool.write_memory.execute({ topic: 'Orphan Local', content: 'will be deleted', summary: 'orphan', pin: false });
+
+  // Delete the "Orphan Local" topic file directly (not via remove_memory) so
+  // its index entry is left dangling — simulates a local index that already
+  // has an orphan before the merge ever runs.
+  fs.unlinkSync(path.join(MEMORY_DIR, 'orphan-local.md'));
+
+  // Pre-seed the shared dir as if another tool (e.g. openpi-memory) — or a
+  // prior run of this same carry-over — already wrote there.
+  fs.mkdirSync(SHARED_MEMORY_DIR, { recursive: true });
+
+  // 1. No-collision foreign entry: unrelated filename, should survive untouched.
+  fs.writeFileSync(path.join(SHARED_MEMORY_DIR, 'totally-foreign-topic.md'), 'foreign content\n', 'utf8');
+
+  // 2. Identical-content collision: byte-identical to the local file at the same name.
+  fs.copyFileSync(path.join(MEMORY_DIR, 'collision-identical.md'), path.join(SHARED_MEMORY_DIR, 'collision-identical.md'));
+
+  // 3. Differing-content collision: same filename as a local topic, different content.
+  fs.writeFileSync(path.join(SHARED_MEMORY_DIR, 'collision-differing.md'), 'foreign differing content\n', 'utf8');
+
+  // 4. Already-migrated-under-suffix: simulates what the shared dir would look
+  //    like after a prior process already resolved this exact collision —
+  //    foreign content at the original name, and the local content already
+  //    sitting at the canonical "-oclm" name from that earlier merge.
+  fs.writeFileSync(path.join(SHARED_MEMORY_DIR, 'already-migrated.md'), 'foreign already-migrated content\n', 'utf8');
+  fs.copyFileSync(path.join(MEMORY_DIR, 'already-migrated.md'), path.join(SHARED_MEMORY_DIR, 'already-migrated-oclm.md'));
+
+  fs.writeFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), [
+    '# Memory Index',
+    '',
+    '- [Totally Foreign Topic](totally-foreign-topic.md) 2026-01-01T00:00:00+00:00 -- foreign entry',
+    '- [Collision Identical](collision-identical.md) 2026-01-01T00:00:00+00:00 -- identical',
+    '- [Collision Differing](collision-differing.md) 2026-01-01T00:00:00+00:00 -- foreign differing entry',
+    '- [Already Migrated](already-migrated.md) 2026-01-01T00:00:00+00:00 -- foreign already-migrated entry',
+    '- [Already Migrated](already-migrated-oclm.md) 2026-01-01T00:00:00+00:00 -- previously-merged local entry',
+    '',
+  ].join('\n'), 'utf8');
 
   writeRules('{ "shared_dir": true }');
   // Force a fresh config read via compaction — it always calls getCache(true)
@@ -625,15 +678,47 @@ await test('shared_dir: first enable carries over existing local memory (copy, n
   // alone does not invalidate the cache).
   await plugin['experimental.session.compacting']({}, makeCompactOutput());
 
-  assert.ok(fs.existsSync(SHARED_MEMORY_DIR), 'shared dir should now exist');
-  assert.ok(fs.existsSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md')), 'MEMORY.md should be carried over to shared dir');
+  assert.ok(fs.existsSync(SHARED_MEMORY_DIR), 'shared dir should still exist');
+  assert.ok(fs.existsSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md')), 'MEMORY.md should exist in the shared dir');
   // No separate backup dir — files are copied (not moved), so originals in MEMORY_DIR are the backup.
   const backupDir = path.join(MEMORY_DIR, 'memory-backup-before-shared-dir');
   assert.ok(!fs.existsSync(backupDir), 'no separate backup dir should be created — originals stay in place');
   for (const entry of localEntriesBefore) {
     assert.ok(fs.existsSync(path.join(MEMORY_DIR, entry)), `original local file ${entry} should still exist after carry-over (copy, not move)`);
   }
+
+  const sharedIndex = fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), 'utf8');
+  const sharedFiles = fs.readdirSync(SHARED_MEMORY_DIR);
+  const countOccurrences = (str, sub) => str.split(sub).length - 1;
+
+  // 1. No-collision foreign entry preserved untouched.
+  assert.equal(fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'totally-foreign-topic.md'), 'utf8'), 'foreign content\n', 'foreign no-collision file should be untouched');
+  assert.ok(sharedIndex.includes('totally-foreign-topic.md'), 'foreign no-collision index entry should still be present');
+
+  // 2. Identical-content collision is a no-op: no -oclm variant, no duplicate entry.
+  assert.ok(!sharedFiles.includes('collision-identical-oclm.md'), 'identical content should not be renamed');
+  assert.equal(countOccurrences(sharedIndex, '](collision-identical.md)'), 1, 'expected exactly one index entry for collision-identical.md');
+
+  // 3. Differing-content collision renames the local copy; foreign original untouched.
+  const localDifferingContent = fs.readFileSync(path.join(MEMORY_DIR, 'collision-differing.md'), 'utf8');
+  assert.equal(fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'collision-differing.md'), 'utf8'), 'foreign differing content\n', 'foreign file at the original name should be untouched');
+  assert.equal(fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'collision-differing-oclm.md'), 'utf8'), localDifferingContent, 'local content should be copied under the -oclm suffix');
+  assert.ok(sharedIndex.includes('[Collision Differing](collision-differing-oclm.md)'), 'index should have an entry pointing at the -oclm filename with the local topic name');
+
+  // 4. Already-migrated-under-suffix: merge recognizes it and does not re-copy or grow a -2 suffix.
+  assert.ok(!sharedFiles.includes('already-migrated-oclm-2.md'), 'already-migrated content must not grow a numeric suffix on repeat/idempotent merge');
+  assert.equal(fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'already-migrated.md'), 'utf8'), 'foreign already-migrated content\n', 'foreign file at the original name should remain untouched');
+  assert.equal(countOccurrences(sharedIndex, '](already-migrated-oclm.md)'), 1, 'expected exactly one index entry for already-migrated-oclm.md, not duplicated by the merge');
+
+  // 5. Orphan local entry (backing file deleted) is not carried over.
+  assert.ok(!sharedFiles.includes('orphan-local.md'), 'orphaned local entry should not be copied to the shared dir');
+  assert.ok(!sharedIndex.includes('orphan-local.md'), 'orphaned local entry should not appear in the merged shared index');
+
+  // 6. Sentinel written after a successful merge — short-circuits the full
+  // scan on every subsequent process start (see ocl-memory-shared.mjs).
+  assert.ok(fs.existsSync(path.join(MEMORY_DIR, '.shared-dir-migrated')), 'sentinel should be written after a successful merge');
 });
+
 
 await test('shared_dir: writes now land in the shared dir', async () => {
   await plugin.tool.write_memory.execute({ topic: 'Shared Dir Test', content: 'shared content', summary: 'shared dir test', pin: false });
@@ -810,20 +895,20 @@ console.log('\n--- 17. TUI plugin: shared_dir awareness ---');
 
 await test('TUI resolveActiveDir: shared_dir=false resolves to the local dir', async () => {
   writeRules('{ "shared_dir": false }');
-  const { memDir, memIndex } = tui.resolveActiveDir();
+  const { memDir, memIndex } = await tui.resolveActiveDir();
   assert.equal(memDir, MEMORY_DIR, 'should resolve to the local memory dir');
   assert.equal(memIndex, path.join(MEMORY_DIR, 'MEMORY.md'));
 });
 
 await test('TUI resolveActiveDir: shared_dir=true resolves to the shared dir', async () => {
   writeRules('{ "shared_dir": true }');
-  const { memDir, memIndex } = tui.resolveActiveDir();
+  const { memDir, memIndex } = await tui.resolveActiveDir();
   assert.equal(memDir, SHARED_MEMORY_DIR, 'should resolve to the shared memory dir');
   assert.equal(memIndex, path.join(SHARED_MEMORY_DIR, 'MEMORY.md'));
 });
 
 await test('TUI setPin: mutates the shared MEMORY.md and writes the sentinel at the shared path', async () => {
-  const { memDir, memIndex } = tui.resolveActiveDir();
+  const { memDir, memIndex } = await tui.resolveActiveDir();
   const entries = tui.parseIndex(memIndex);
   assert.ok(entries.length > 0, 'expected existing entries in the shared index from prior carry-over');
   const target = entries.find(e => !e.pinned) || entries[0];
@@ -841,7 +926,7 @@ await test('TUI setPin: mutates the shared MEMORY.md and writes the sentinel at 
 });
 
 await test('TUI removeEntry: removes from the shared MEMORY.md, topic file preserved on disk', async () => {
-  const { memDir, memIndex } = tui.resolveActiveDir();
+  const { memDir, memIndex } = await tui.resolveActiveDir();
   const before = tui.parseIndex(memIndex);
   const target = before[0];
 
@@ -853,7 +938,7 @@ await test('TUI removeEntry: removes from the shared MEMORY.md, topic file prese
 });
 
 await test('TUI readTopic: reads a topic file from the resolved (shared) dir', async () => {
-  const { memDir, memIndex } = tui.resolveActiveDir();
+  const { memDir, memIndex } = await tui.resolveActiveDir();
   const entries = tui.parseIndex(memIndex);
   assert.ok(entries.length > 0, 'expected at least one remaining entry');
   const content = tui.readTopic(memDir, entries[0].filename);
@@ -862,7 +947,7 @@ await test('TUI readTopic: reads a topic file from the resolved (shared) dir', a
 
 await test('Integration: TUI and server plugin resolve the identical active dir/index for the same shared_dir config', async () => {
   writeRules('{ "shared_dir": true }');
-  const { memDir: tuiDir, memIndex: tuiIndex } = tui.resolveActiveDir();
+  const { memDir: tuiDir, memIndex: tuiIndex } = await tui.resolveActiveDir();
 
   const plugin = await makePlugin();
   // config hook calls getCache() with no forceRefresh — force a fresh read

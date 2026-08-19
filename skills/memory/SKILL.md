@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.6.0
+version: 0.6.1
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -212,7 +212,7 @@ The TUI resolves `shared_dir` the same way the server plugin does — both read 
 
 Setting `"shared_dir": true` in `memory.jsonc` moves `MEMORY.md` and topic files to `~/.agents/memory/` — a location other memory-aware tools (e.g. pi's `openpi-memory`) can also read and write, using the same on-disk format. `memory.jsonc` itself always stays local regardless of this setting.
 
-The first time `shared_dir` resolves `true`, existing local memory is copied — never moved — into the shared directory. Originals stay untouched in `~/.config/opencode/memory/`. This carry-over runs once. Toggling `shared_dir` off and back on does not re-run it or reconcile any drift that happened while it was off — treat it as a one-way move.
+The first time `shared_dir` resolves `true`, existing local memory is merged into the shared directory — copied, never moved. If another tool (e.g. openpi-memory) already wrote there, local entries are merged in rather than skipped: same-name-different-content collisions get renamed with a `-oclm` suffix; identical content is skipped. Originals stay untouched in `~/.config/opencode/memory/`. This full merge scan runs at most once ever per local install — a sentinel file written after the first successful merge short-circuits every later opencode session straight to a single existence check. Toggling `shared_dir` off and back on does not re-run it or reconcile any drift that happened while it was off — treat it as a one-way move. See [docs/shared-directory.md](../../docs/shared-directory.md) for a worked example.
 
 Writes to the shared directory are protected by a cross-process advisory lock (`.lock` file) so this tool and another tool sharing the directory don't corrupt the index with interleaved writes.
 
