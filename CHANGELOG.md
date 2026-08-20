@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.2] - 2026-08-20
+
+### Fixed
+
+- **Filename slug collisions**: two topics slugifying to the same filename no longer silently merge/overwrite — falls back to a numeric suffix.
+- **`stripJsonc`**: no longer breaks on `//` inside config string values (e.g. URLs); parse failures now log via `console.error` instead of silently reverting to defaults.
+- **Tool argument validation**: all 3 memory tools reject missing/invalid `topic`/`content`/`summary` with a clean error instead of throwing.
+- **`pin` coercion**: strictly boolean now — no longer truthy-matches a stray string `"false"`.
+- **Path traversal guard**: filenames read back from `MEMORY.md` (remove/pin/merge) are validated before any file operation.
+
+### Documentation
+
+- New `docs/faq.md` known-limitations entries: carry-over/lock race window, `shared_dir`-toggle cache staleness, lock/NFS trade-offs, TUI test coverage, cross-tool coordination, subagent-memory parity gap.
+
+### Tests
+
+- 17 new tests (48 → 65). Beyond coverage for each fix above, three previously-untested paths are now covered: the 50 KB byte-cap truncation branch (distinct from the line-cap branch), `resolveDestName`'s `-oclm-2` numeric-suffix fallback on a triple collision, and lock acquisition against a lock genuinely held by a separate OS process (spawned via `child_process`, not simulated in-process).
+
 ## [0.6.1] - 2026-08-19 HOTFIX++
 
 ### Added

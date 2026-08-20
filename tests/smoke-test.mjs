@@ -20,6 +20,7 @@ import assert from 'assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { spawn } from 'child_process';
 
 // --- Temp dir setup (must happen before plugin import) ---
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'ocl-memory-test-'));
@@ -41,6 +42,7 @@ process.on('exit', () => {
 // --- Import plugin (after env vars are set) ---
 const { default: pluginFactory } = await import('../.opencode/plugins/ocl-memory.mjs');
 const tui = await import('../.opencode/plugins/ocl-memory-tui.mjs');
+const shared = await import('../.opencode/plugins/ocl-memory-shared.mjs');
 
 // Helper: instantiate plugin and get the hooks object. Pass { client } to
 // exercise the consolidation autocontinue path.
@@ -604,6 +606,34 @@ await test('max_lines clamps to 1000 maximum (live truncation)', async () => {
 // The next write_memory call anywhere below triggers orphan removal, which
 // purges them automatically — same self-cleaning pattern as section 12.
 
+await test('byte cap (50 KB) triggers truncation independently of the line-count cap', async () => {
+  writeRules('{ "max_lines": 300 }');
+  // Well under the 300-line cap, but each line is long enough that the total
+  // byte size exceeds the 50KB byte cap — exercises the byte-cap branch in
+  // readMemoryIndex(), distinct from the line-cap branch tested above.
+  const longSummary = 'x'.repeat(900);
+  const entries = Array.from({ length: 60 }, (_, i) => `- [Byte Mock ${i}](mock-byte-${i}.md) 2026-01-01T00:00:00+00:00 -- ${longSummary}`);
+  assert.ok(entries.length < 300, 'sanity: line count must stay under the line cap so only the byte cap fires');
+  fs.writeFileSync(path.join(MEMORY_DIR, 'MEMORY.md'), ['# Memory Index', ...entries].join('\n') + '\n', 'utf8');
+  try {
+    // Force a fresh config+content read regardless of leftover in-process
+    // cache state from prior tests (same pattern used for shared_dir tests
+    // in sections 15/17 — a plain writeRules()/tool.execute.after pair is
+    // not guaranteed to invalidate an already-populated cache).
+    await plugin['experimental.session.compacting']({}, makeCompactOutput());
+    const out = makeSystemOutput();
+    await plugin['experimental.chat.system.transform']({}, out);
+    const injected = out.system.join('\n');
+    assert.ok(injected.includes('KB size limit'), `expected byte-cap truncation warning; got tail: ${injected.slice(-300)}`);
+    assert.ok(!injected.includes('300-line limit'), 'byte-cap warning should fire, not the line-cap warning');
+  } finally {
+    writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5 }');
+  }
+});
+// Same self-cleaning note as above — these mock entries also point at
+// nonexistent files and are purged by the next write_memory's orphan removal.
+
+
 // ═══════════════════════════════════════════════════════════
 // 15. shared_dir cross-tool store (Phase 3)
 //     Order matters: carry-over only fires once per process
@@ -613,9 +643,10 @@ await test('max_lines clamps to 1000 maximum (live truncation)', async () => {
 //     must run before any other shared_dir=true config write. Because of
 //     that one-shot guard, every merge scenario (no-collision,
 //     identical-content no-op, differing-content rename, already-
-//     migrated idempotency, orphan safety, sentinel write) has to be
-//     exercised within that single test — there is no way to trigger a
-//     second real carry-over later in this process.
+//     migrated idempotency, numeric-suffix fallback on a triple collision,
+//     orphan safety, sentinel write) has to be exercised within that
+//     single test — there is no way to trigger a second real carry-over
+//     later in this process.
 // ═══════════════════════════════════════════════════════════
 
 console.log('\n--- 15. shared_dir cross-tool store ---');
@@ -633,6 +664,7 @@ await test('shared_dir: first enable merges with pre-existing foreign content in
   await plugin.tool.write_memory.execute({ topic: 'Collision Identical', content: 'identical content', summary: 'identical', pin: false });
   await plugin.tool.write_memory.execute({ topic: 'Collision Differing', content: 'local differing content', summary: 'differing', pin: false });
   await plugin.tool.write_memory.execute({ topic: 'Already Migrated', content: 'local already-migrated content', summary: 'already migrated', pin: false });
+  await plugin.tool.write_memory.execute({ topic: 'Triple Collision', content: 'local triple-collision content', summary: 'triple collision', pin: false });
   await plugin.tool.write_memory.execute({ topic: 'Orphan Local', content: 'will be deleted', summary: 'orphan', pin: false });
 
   // Delete the "Orphan Local" topic file directly (not via remove_memory) so
@@ -660,6 +692,12 @@ await test('shared_dir: first enable merges with pre-existing foreign content in
   fs.writeFileSync(path.join(SHARED_MEMORY_DIR, 'already-migrated.md'), 'foreign already-migrated content\n', 'utf8');
   fs.copyFileSync(path.join(MEMORY_DIR, 'already-migrated.md'), path.join(SHARED_MEMORY_DIR, 'already-migrated-oclm.md'));
 
+  // 5. Triple collision: both the original name and the canonical -oclm name
+  //    already hold different foreign content, forcing the rare numeric-
+  //    suffix bump (resolveDestName's "-oclm-2" fallback path).
+  fs.writeFileSync(path.join(SHARED_MEMORY_DIR, 'triple-collision.md'), 'foreign triple content A\n', 'utf8');
+  fs.writeFileSync(path.join(SHARED_MEMORY_DIR, 'triple-collision-oclm.md'), 'foreign triple content B\n', 'utf8');
+
   fs.writeFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), [
     '# Memory Index',
     '',
@@ -668,6 +706,8 @@ await test('shared_dir: first enable merges with pre-existing foreign content in
     '- [Collision Differing](collision-differing.md) 2026-01-01T00:00:00+00:00 -- foreign differing entry',
     '- [Already Migrated](already-migrated.md) 2026-01-01T00:00:00+00:00 -- foreign already-migrated entry',
     '- [Already Migrated](already-migrated-oclm.md) 2026-01-01T00:00:00+00:00 -- previously-merged local entry',
+    '- [Triple Collision](triple-collision.md) 2026-01-01T00:00:00+00:00 -- foreign triple entry A',
+    '- [Triple Collision](triple-collision-oclm.md) 2026-01-01T00:00:00+00:00 -- foreign triple entry B',
     '',
   ].join('\n'), 'utf8');
 
@@ -710,11 +750,20 @@ await test('shared_dir: first enable merges with pre-existing foreign content in
   assert.equal(fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'already-migrated.md'), 'utf8'), 'foreign already-migrated content\n', 'foreign file at the original name should remain untouched');
   assert.equal(countOccurrences(sharedIndex, '](already-migrated-oclm.md)'), 1, 'expected exactly one index entry for already-migrated-oclm.md, not duplicated by the merge');
 
-  // 5. Orphan local entry (backing file deleted) is not carried over.
+  // 5. Triple collision: both the original name and the canonical -oclm name
+  // are already taken by different foreign content, forcing the rare
+  // numeric-suffix bump.
+  assert.equal(fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'triple-collision.md'), 'utf8'), 'foreign triple content A\n', 'foreign file at the original name should remain untouched');
+  assert.equal(fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'triple-collision-oclm.md'), 'utf8'), 'foreign triple content B\n', 'foreign file at the canonical -oclm name should remain untouched');
+  const localTripleContent = fs.readFileSync(path.join(MEMORY_DIR, 'triple-collision.md'), 'utf8');
+  assert.equal(fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'triple-collision-oclm-2.md'), 'utf8'), localTripleContent, 'local content should be copied under the -oclm-2 fallback name when both the original and -oclm names are already taken by different content');
+  assert.ok(sharedIndex.includes('[Triple Collision](triple-collision-oclm-2.md)'), 'index should have an entry pointing at the -oclm-2 filename with the local topic name');
+
+  // 6. Orphan local entry (backing file deleted) is not carried over.
   assert.ok(!sharedFiles.includes('orphan-local.md'), 'orphaned local entry should not be copied to the shared dir');
   assert.ok(!sharedIndex.includes('orphan-local.md'), 'orphaned local entry should not appear in the merged shared index');
 
-  // 6. Sentinel written after a successful merge — short-circuits the full
+  // 7. Sentinel written after a successful merge — short-circuits the full
   // scan on every subsequent process start (see ocl-memory-shared.mjs).
   assert.ok(fs.existsSync(path.join(MEMORY_DIR, '.shared-dir-migrated')), 'sentinel should be written after a successful merge');
 });
@@ -760,6 +809,52 @@ await test('shared_dir: fresh (non-stale) lock causes proceed-without-lock after
   assert.ok(elapsed >= 400, `expected the call to wait out the ~500ms acquire timeout, took ${elapsed}ms`);
 
   fs.unlinkSync(lockPath); // cleanup the external lock we created
+});
+
+await test('shared_dir: acquireLock waits out a lock genuinely held by another OS process', async () => {
+  // The two tests above simulate contention with a pre-created lock file in
+  // the same process — this one spawns a real second Node process that
+  // holds the lock file for a controlled duration, so the main process's
+  // acquireLock() genuinely polls against another process's lock rather
+  // than a static fixture.
+  const lockPath = path.join(SHARED_MEMORY_DIR, '.lock');
+  const holdMs = 250;
+  const helperPath = path.join(TMP, 'lock-holder.mjs');
+  fs.writeFileSync(helperPath, [
+    "import fs from 'fs';",
+    'const [lockPath, holdMs] = [process.argv[2], Number(process.argv[3])];',
+    "fs.writeFileSync(lockPath, '', 'utf8');",
+    'await new Promise(r => setTimeout(r, holdMs));',
+    'fs.unlinkSync(lockPath);',
+  ].join('\n'), 'utf8');
+
+  const child = spawn(process.execPath, [helperPath, lockPath, String(holdMs)], { stdio: 'ignore' });
+  const childDone = new Promise((resolve, reject) => {
+    child.on('exit', code => (code === 0 ? resolve() : reject(new Error(`lock-holder exited with code ${code}`))));
+    child.on('error', reject);
+  });
+
+  // Give the child a head start so its lock file genuinely exists before
+  // the main process attempts to acquire it.
+  await new Promise(r => setTimeout(r, 50));
+  assert.ok(fs.existsSync(lockPath), 'expected the child process to have created the real lock file by now');
+
+  const start = Date.now();
+  const result = await plugin.tool.write_memory.execute({ topic: 'Lock Race Winner', content: 'won the race', summary: 'race winner', pin: false });
+  const elapsed = Date.now() - start;
+  await childDone;
+
+  assert.ok(result.includes('created') || result.includes('updated'), 'write should succeed after waiting out a lock held by a real separate process');
+  // Comfortably above a no-contention write, comfortably below the ~500ms
+  // acquire timeout — proves the main process waited for and then acquired
+  // the real lock, rather than winning immediately or timing out unguarded.
+  assert.ok(elapsed >= 150 && elapsed < 480, `expected the write to wait for the child's real lock release (~${holdMs}ms) without hitting the full acquire timeout, took ${elapsed}ms`);
+  assert.ok(!fs.existsSync(lockPath), 'lock file should not exist after both processes have finished');
+
+  const sharedIndexAfter = fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), 'utf8');
+  assert.ok(sharedIndexAfter.includes('Lock Race Winner'), 'the write that waited for the real lock should have landed in the index');
+
+  fs.unlinkSync(helperPath);
 });
 
 // Disable shared_dir before moving on — later sections assume the local dir.
@@ -963,6 +1058,162 @@ await test('Integration: TUI and server plugin resolve the identical active dir/
 
   writeRules('{ "shared_dir": false }');
 });
+
+// ═══════════════════════════════════════════════════════════
+// 18. v0.6.2 hardening fixes (memory-systems-comparison-v3 gap analysis)
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n--- 18. hardening fixes (stripJsonc, slug collisions, arg validation, pin coercion, path traversal) ---');
+
+// Section 17 ends by flipping shared_dir back to false via writeRules(), but
+// _cache is module-level (shared across all plugin instances) and a plain
+// writeRules() call doesn't invalidate it — force a fresh read now so every
+// test below reliably resolves against the local dir, not a stale shared-dir
+// cache left over from section 17's last forced refresh.
+await plugin['experimental.session.compacting']({}, makeCompactOutput());
+
+// --- stripJsonc / parseRules string-literal awareness ---
+
+await test('stripJsonc: does not truncate a "//" inside a string value', () => {
+  const raw = '{ "always_ask": ["See https://example.com for details"] }';
+  const stripped = shared.stripJsonc(raw);
+  assert.ok(stripped.includes('https://example.com'), `URL should survive intact; got: ${stripped}`);
+  assert.doesNotThrow(() => JSON.parse(stripped), 'result should still be valid JSON');
+});
+
+await test('stripJsonc: still strips a real // comment outside a string', () => {
+  const raw = '{ // a real comment\n  "max_lines": 250\n}';
+  const stripped = shared.stripJsonc(raw);
+  assert.ok(!stripped.includes('a real comment'), 'real comment should be stripped');
+  assert.equal(JSON.parse(stripped).max_lines, 250);
+});
+
+await test('parseRules: a URL in a config string value no longer silently falls back to defaults', () => {
+  const raw = '{ "always_ask": ["See https://example.com for details"], "max_lines": 250 }';
+  const config = shared.parseRules(raw);
+  assert.equal(config.maxLines, 250, 'custom max_lines should survive — old stripJsonc would have corrupted parsing and silently reverted to the 300 default');
+});
+
+await test('parseRules: logs via console.error on a genuine parse failure instead of failing silently', () => {
+  const originalError = console.error;
+  const calls = [];
+  console.error = (...args) => calls.push(args);
+  try {
+    const config = shared.parseRules('{ this is not valid json at all');
+    assert.equal(config.maxLines, 300, 'should still fall back to defaults on a genuine parse failure');
+    assert.ok(calls.length > 0, 'console.error should be called on parse failure');
+  } finally {
+    console.error = originalError;
+  }
+});
+
+// --- write_memory: colliding filename slugs ---
+
+await test('write_memory: colliding slugs from different topic names get distinct files, not merged', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'API Setup!', content: 'first topic content', summary: 'first', pin: false });
+  await plugin.tool.write_memory.execute({ topic: 'api-setup', content: 'second topic content', summary: 'second', pin: false });
+
+  assert.ok(fs.existsSync(path.join(MEMORY_DIR, 'api-setup.md')), 'first topic file should exist under the plain slug');
+  assert.ok(fs.existsSync(path.join(MEMORY_DIR, 'api-setup-2.md')), 'second (colliding) topic should get a numeric-suffixed filename');
+
+  const firstContent = fs.readFileSync(path.join(MEMORY_DIR, 'api-setup.md'), 'utf8');
+  const secondContent = fs.readFileSync(path.join(MEMORY_DIR, 'api-setup-2.md'), 'utf8');
+  assert.ok(firstContent.includes('first topic content'), 'first topic file should be untouched');
+  assert.ok(!firstContent.includes('second topic content'), "first topic file must not contain the colliding topic's content");
+  assert.ok(secondContent.includes('second topic content'), 'second topic file should have its own content');
+
+  const index = readIndex();
+  assert.ok(index.includes('[API Setup!](api-setup.md)'), 'first index entry keeps its own name/filename');
+  assert.ok(index.includes('[api-setup](api-setup-2.md)'), 'second index entry uses the bumped filename with its own name');
+});
+
+await test('write_memory: re-writing the same topic name still updates its existing file (no false-positive collision)', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'API Setup!', content: 'updated content', summary: 'first updated', mode: 'replace', pin: false });
+  assert.ok(!fs.existsSync(path.join(MEMORY_DIR, 'api-setup-3.md')), 're-writing an existing topic name must not bump a new suffixed filename');
+  const content = fs.readFileSync(path.join(MEMORY_DIR, 'api-setup.md'), 'utf8');
+  assert.ok(content.includes('updated content'), 'existing file should be updated in place');
+});
+
+// --- Tool argument validation ---
+
+await test('write_memory: rejects missing/invalid topic, content, or summary with a clean error', async () => {
+  const r1 = await plugin.tool.write_memory.execute({ content: 'x', summary: 'y', pin: false });
+  assert.ok(r1.includes('topic is required'), `missing topic should return a clean error; got: ${r1}`);
+  const r2 = await plugin.tool.write_memory.execute({ topic: 'T', summary: 'y', pin: false });
+  assert.ok(r2.includes('content is required'), `missing content should return a clean error; got: ${r2}`);
+  const r3 = await plugin.tool.write_memory.execute({ topic: 'T', content: 'x', pin: false });
+  assert.ok(r3.includes('summary is required'), `missing summary should return a clean error; got: ${r3}`);
+});
+
+await test('remove_memory: rejects missing/invalid topic with a clean error instead of throwing', async () => {
+  const r = await plugin.tool.remove_memory.execute({});
+  assert.ok(r.includes('topic is required'), `missing topic should return a clean error, not throw; got: ${r}`);
+});
+
+await test('pin_memory: rejects missing/invalid topic with a clean error instead of throwing', async () => {
+  const r = await plugin.tool.pin_memory.execute({ pin: true });
+  assert.ok(r.includes('topic is required'), `missing topic should return a clean error, not throw; got: ${r}`);
+});
+
+// --- pin boolean coercion ---
+
+await test('pin_memory: string "false" behaves as false, not JS-truthy', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Pin Coercion Test', content: 'x', summary: 'y', pin: false });
+  await plugin.tool.pin_memory.execute({ topic: 'Pin Coercion Test', pin: 'false' });
+  const line = readIndex().split('\n').find(l => l.includes('Pin Coercion Test'));
+  assert.ok(line && !line.includes('[pin]'), `entry must remain unpinned after pin:"false"; got line: ${line}`);
+});
+
+await test('write_memory: string "false" for pin does not pin a new entry', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Write Pin Coercion', content: 'x', summary: 'y', pin: 'false' });
+  const line = readIndex().split('\n').find(l => l.includes('Write Pin Coercion'));
+  assert.ok(line && !line.includes('[pin]'), `string "false" must not pin the entry; got line: ${line}`);
+});
+
+await test('pin_memory: string "true" still pins (backward compatible with prior truthy behavior)', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Pin String True Test', content: 'x', summary: 'y', pin: false });
+  await plugin.tool.pin_memory.execute({ topic: 'Pin String True Test', pin: 'true' });
+  const line = readIndex().split('\n').find(l => l.includes('Pin String True Test'));
+  assert.ok(line && line.includes('[pin]'), `string "true" should still pin; got line: ${line}`);
+  await plugin.tool.pin_memory.execute({ topic: 'Pin String True Test', pin: false });
+});
+
+// --- Path traversal guard on filenames read back from MEMORY.md ---
+
+await test('isSafeFilename: rejects path separators and .. segments, accepts plain filenames', () => {
+  assert.equal(shared.isSafeFilename('normal-topic.md'), true);
+  assert.equal(shared.isSafeFilename('../../../etc/passwd'), false);
+  assert.equal(shared.isSafeFilename('sub/dir.md'), false);
+  assert.equal(shared.isSafeFilename('..\\windows\\path.md'), false);
+});
+
+await test('remove_memory: refuses to act on an entry with an unsafe filename instead of touching the path', async () => {
+  const memIndexPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(memIndexPath, 'utf8');
+  fs.writeFileSync(memIndexPath, before.replace(/\n+$/, '') + '\n- [Evil Entry](../../../../etc/passwd) 2026-01-01T00:00:00+00:00 -- corrupted entry\n', 'utf8');
+
+  const result = await plugin.tool.remove_memory.execute({ topic: 'Evil Entry' });
+  assert.ok(result.includes('unsafe filename'), `expected an unsafe-filename refusal; got: ${result}`);
+
+  const after = fs.readFileSync(memIndexPath, 'utf8');
+  assert.ok(after.includes('Evil Entry'), 'the corrupted entry should be left untouched by remove_memory, not silently removed');
+
+  // Clean it back up via maintainIndex's own drop-unsafe-entry path (exercised next).
+  fs.writeFileSync(memIndexPath, before, 'utf8');
+});
+
+await test('maintainIndex (via write_memory): drops an unsafe-filename index entry like an orphan', async () => {
+  const memIndexPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(memIndexPath, 'utf8');
+  fs.writeFileSync(memIndexPath, before.replace(/\n+$/, '') + '\n- [Evil Entry 2](../../../../etc/shadow) 2026-01-01T00:00:00+00:00 -- corrupted entry\n', 'utf8');
+
+  // Any write_memory call runs maintainIndex, which should drop the unsafe entry.
+  await plugin.tool.write_memory.execute({ topic: 'Maintain Trigger', content: 'x', summary: 'trigger', pin: false });
+
+  const after = readIndex();
+  assert.ok(!after.includes('Evil Entry 2'), 'unsafe-filename entry should be dropped by maintainIndex, same as an orphan');
+});
+
 
 // ═══════════════════════════════════════════════════════════
 // Results

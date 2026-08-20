@@ -10,6 +10,8 @@ The first time `shared_dir` resolves `true`, existing local memory is merged int
 
 Writes to the shared directory (and the local one) are protected by a cross-process advisory lock (`.lock` file, 10s stale-lock reclaim, 500ms acquire timeout) so this tool and another tool sharing the directory don't corrupt the index with interleaved writes. If the lock can't be acquired within the timeout, the write proceeds anyway rather than hanging — best-effort, not a hard guarantee.
 
+Filenames read back from `MEMORY.md` (on remove, pin, and the carry-over merge itself) are validated against path traversal before use in any file operation — relevant specifically because `shared_dir` puts an untrusted co-tenant tool's writes into the same trust boundary as this plugin's own index file.
+
 Path/config resolution (`getMemoryDir`, `getMemoryIndex`, `readMemoryRules`, the lock, and the carry-over itself) lives in a shared internal module (`ocl-memory-shared.mjs`) imported by both the server plugin and the TUI memory browser (`ctrl+alt+m`), so both always agree on which directory is active. The TUI re-reads `memory.jsonc` fresh every time you open the browser, so it picks up `shared_dir` immediately — no restart needed.
 
 ## First run: fresh install (shared_dir: false — the default)
