@@ -16,6 +16,10 @@ All notable changes to this project will be documented in this file.
 
 - New `docs/faq.md` known-limitations entries: carry-over/lock race window, `shared_dir`-toggle cache staleness, lock/NFS trade-offs, TUI test coverage, cross-tool coordination, subagent-memory parity gap.
 
+### Tests
+
+- 17 new tests (48 → 65). Beyond coverage for each fix above, three previously-untested paths are now covered: the 50 KB byte-cap truncation branch (distinct from the line-cap branch), `resolveDestName`'s `-oclm-2` numeric-suffix fallback on a triple collision, and lock acquisition against a lock genuinely held by a separate OS process (spawned via `child_process`, not simulated in-process).
+
 ## [0.6.1] - 2026-08-19 HOTFIX++
 
 ### Added

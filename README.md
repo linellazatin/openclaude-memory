@@ -11,6 +11,7 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 > - `stripJsonc` no longer breaks on `//` in config values (URLs etc) — now warns instead of silently resetting to defaults
 > - memory tools reject bad/missing args cleanly instead of throwing
 > - closed a path-traversal gap on filenames read back from `MEMORY.md`
+> - 17 new tests (48 → 65), incl. real multi-process lock contention, byte-cap truncation, and the `-oclm-2` collision fallback
 >
 > ## v0.6.1 HOTFIX on shared_dir
 > - **`shared_dir` carry-over now merges** instead of skipping when the shared dir already has content from another memory system of ours (e.g. openpi-memory wrote first) — collisions resolved by content comparison, differing files get a `-oclm` suffix
