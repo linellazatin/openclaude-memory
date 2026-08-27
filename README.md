@@ -6,6 +6,12 @@
 OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
 >
+> ## v0.6.3 — shared-store safety + real caps
+> - closes remaining unsafe-filename paths in `write_memory` and the TUI
+> - 50 KB is now a real bound on injected index content, not just a warning
+> - shared-dir merge indexes an identical pre-existing topic file when its index line is missing
+> - 3 new regressions (65 → 68); external manual edits now documented accurately
+>
 > ## v0.6.2 — bugfixes & hardening
 > - filename slug collisions no longer silently merge two topics into one file
 > - `stripJsonc` no longer breaks on `//` in config values (URLs etc) — now warns instead of silently resetting to defaults
@@ -15,13 +21,6 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 >
 > ## v0.6.1 HOTFIX on shared_dir
 > - **`shared_dir` carry-over now merges** instead of skipping when the shared dir already has content from another memory system of ours (e.g. openpi-memory wrote first) — collisions resolved by content comparison, differing files get a `-oclm` suffix
->
-> ## v0.6.0 - MAJOR structural change (shared_dir, consolidation, config relocation)
-> - config relocated: `~/.config/opencode/memory/RULES.jsonc` → `~/.config/opencode/memory.jsonc` (legacy installs migrate automatically, old file kept as `.bak`)
-> - `shared_dir` (opt-in): move `MEMORY.md` + topic files to `~/.agents/memory/` so our sibling tool (e.g. [openpi-memory](https://github.com/linellazatin/openpi-memory)) can share the same memory store — cross-process file lock + atomic writes included; the TUI browser (`ctrl+alt+m`) follows it too
-> - `/memory consolidate` + `consolidate_on_compact` : auto only :( - see [FAQ](docs/faq.md) ... reviews the session for undocumented facts and writes them, plus a session recap
-> - bumped defaults: `max_lines` 200 → 300, byte cap 25 KB → 50 KB
-> - 22 new tests (26 → 48)
 >
 > see [CHANGELOG](CHANGELOG.md) for more details
 
@@ -80,7 +79,7 @@ Just files, structure, and an agent that knows where to look.
 
 ## How it works
 
-1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `memory.jsonc` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection then repeats every `inject_every_n_turns` turns (default: 5) and immediately after any memory tool mutation, not to keep memory present (it persists in the system prompt for the whole session automatically) but to pick up external edits to `MEMORY.md` without re-reading disk every turn.
+1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `memory.jsonc` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection repeats every `inject_every_n_turns` turns (default: 5) and after memory tool mutations, not to keep memory present (it persists in the system prompt for the whole session automatically), but to re-emit the current cached state.
 2. **Topic files**: `MEMORY.md` is a concise index (one line per topic). Detail lives in separate topic files (`~/.config/opencode/memory/<topic>.md`), loaded on-demand by the agent when it needs more context.
 3. **Native tools**: The plugin registers `write_memory`, `remove_memory`, and `pin_memory` tools. The agent calls these instead of raw file operations — the plugin guarantees consistent format, frontmatter, and index maintenance every time. After each tool call the cache is invalidated and a dirty flag is set, so the next turn re-injects the updated index.
 4. **Auto-writes**: The agent writes to memory proactively — without being asked — when it learns something worth keeping: user preferences, feedback on how to approach work, project constraints, or pointers to external systems. Memories are typed (`user`, `feedback`, `project`, `reference`), and structured entries include a `Why:` + `How to apply:` section so the agent can reason about edge cases, not just recite facts. Reliability varies by model; see [Model compatibility](docs/architecture.md#model-compatibility).
@@ -88,7 +87,7 @@ Just files, structure, and an agent that knows where to look.
 6. **Compaction**: When context compression runs, the plugin forces a fresh disk read and injects the current memory state into the compaction context, ensuring memory survives the compaction cleanly. The injection counter is also reset so the first turn after compaction re-injects the index. If `consolidate_on_compact` is enabled, opencode's automatic post-compaction continue message is replaced with a consolidation pass — seeded with the compaction summary and told to resume pending work afterwards. Note: this only applies to **automatic** compaction — manual `/compact` does not trigger consolidation automatically.
 7. **Bootstrap**: On first run, the plugin creates `MEMORY.md` and `memory.jsonc` automatically. Nothing to set up.
 
-> **Note:** If you edit `MEMORY.md` or `memory.jsonc` manually between turns, the change will not be reflected until the next tool call, the next periodic re-injection turn, or a compaction event. This is an intentional trade-off to avoid per-turn disk reads.
+> **Note:** Manual edits to `MEMORY.md` or `memory.jsonc` do not invalidate the in-process cache. They take effect after a memory tool mutation, compaction, or session restart. TUI mutations write an `.invalidate` sentinel and are picked up on the server's next cache check when both are using the same active directory.
 
 See [How opencode Keeps Memory in Context](docs/memory-injection.md) for the full breakdown of why the injected index persists in the system prompt for the whole session, and what periodic re-injection actually refreshes.
 
