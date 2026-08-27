@@ -2,14 +2,13 @@
 description: /memory → show index | /memory <text> → store | /memory pin <topic> → pin | /memory unpin <topic> → unpin | /memory remove <topic> → remove entry | /memory consolidate → consolidate session
 ---
 
-Memory dir: ~/.config/opencode/memory/
-Memory index: ~/.config/opencode/memory/MEMORY.md
+Resolve the active memory directory before any direct file read: read `~/.config/opencode/memory.jsonc` (respecting `XDG_CONFIG_HOME` if set). If `"shared_dir": true`, use `~/.agents/memory/`; otherwise use `~/.config/opencode/memory/`. The active index is `<active memory dir>/MEMORY.md`.
 
 Arguments: $ARGUMENTS
 
 ## No arguments: show index
 
-Read ~/.config/opencode/memory/MEMORY.md. Display each entry as a table with columns: Topic (name only — no markdown links, no filenames), Date, Pinned (yes/no), Stale (yes/no). List all .md files in ~/.config/opencode/memory/. Do not write anything.
+Read `<active memory dir>/MEMORY.md`. Display each entry as a table with columns: Topic (name only — no markdown links, no filenames), Date, Pinned (yes/no), Stale (yes/no). List all `.md` files in the active directory. Do not write anything.
 
 After listing, append this legend:
 Tip: /memory <text> to store  |  /memory pin <topic> to pin  |  /memory unpin <topic> to unpin  |  /memory remove <topic> to remove  |  /memory consolidate to consolidate this session

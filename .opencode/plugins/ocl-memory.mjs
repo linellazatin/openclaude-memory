@@ -107,13 +107,25 @@ function readMemoryIndex(maxLines, memDir) {
     }
     const raw = fs.readFileSync(indexPath, 'utf8');
     const lines = raw.split('\n');
-    if (lines.length > maxLines) {
-      return lines.slice(0, maxLines).join('\n') + `\n\n<!-- memory truncated: MEMORY.md exceeds ${maxLines}-line limit; shorten the index -->`;
+    const lineLimitExceeded = lines.length > maxLines;
+    const limitedLines = lines.slice(0, maxLines);
+    const byteLimitExceeded = Buffer.byteLength(raw) > MAX_BYTES;
+    if (!lineLimitExceeded && !byteLimitExceeded) return raw;
+
+    const warning = lineLimitExceeded
+      ? `<!-- memory truncated: MEMORY.md exceeds ${maxLines}-line limit; shorten the index -->`
+      : `<!-- memory truncated: MEMORY.md exceeds ${Math.round(MAX_BYTES / 1024)} KB size limit; shorten the index -->`;
+    const budget = MAX_BYTES - Buffer.byteLength(`\n\n${warning}`);
+    const kept = [];
+    let bytes = 0;
+    for (const line of limitedLines) {
+      const prefix = kept.length ? '\n' : '';
+      const lineBytes = Buffer.byteLength(prefix + line);
+      if (bytes + lineBytes > budget) break;
+      kept.push(line);
+      bytes += lineBytes;
     }
-    if (Buffer.byteLength(raw) > MAX_BYTES) {
-      return lines.slice(0, maxLines).join('\n') + `\n\n<!-- memory truncated: MEMORY.md exceeds ${Math.round(MAX_BYTES / 1024)} KB size limit; shorten the index -->`;
-    }
-    return raw;
+    return kept.join('\n') + `\n\n${warning}`;
   } catch {
     return null;
   }
@@ -280,6 +292,9 @@ const tools = {
         for (const line of rawIndex.split('\n')) {
           const parsed = parseIndexLine(line);
           if (parsed && parsed.name.toLowerCase() === topic.toLowerCase()) {
+            if (!isSafeFilename(parsed.filename)) {
+              return `Entry has an unsafe filename (${parsed.filename}) and was not modified. This may indicate a corrupted index — inspect it manually.`;
+            }
             filename = parsed.filename;
             matchedExisting = true;
             break;
