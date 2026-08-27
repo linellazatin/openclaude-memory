@@ -16,9 +16,9 @@ The plugin re-injects memory on three conditions (not just turn 1):
 
 1. **First turn** — cold load and initial injection.
 2. **After any memory tool call** — `write_memory`, `remove_memory`, or `pin_memory` mutate `MEMORY.md`. The dirty flag is set and the next turn injects the updated index so the agent sees the change it just made.
-3. **Every `inject_every_n_turns` turns** (default: 5) — the plugin re-reads `MEMORY.md` from disk and re-injects. This is **not** to keep memory present (it already is); it is to pick up **external edits** — manual edits to `MEMORY.md`, changes made via the TUI browser, or edits from another process.
+3. **Every `inject_every_n_turns` turns** (default: 5) — the plugin re-injects its cached memory state. This is **not** to keep memory present (it already is), and it does not itself reread arbitrary manual disk edits.
 
-If you never edit memory files manually and only use memory tools, condition 3 is mostly a no-op. The index that was injected on turn 1 is already current.
+If you only use memory tools, condition 3 is mostly a no-op. Tool mutations invalidate the cache, so the next injection already has current content. TUI mutations are also detected by their `.invalidate` sentinel when the server checks the same active directory. Ordinary manual file/config edits require a tool mutation, compaction, or session restart to refresh the cache.
 
 ## Compaction
 
@@ -35,10 +35,10 @@ After compaction, opencode replaces the agent's context window. The first turn o
 |---|---|
 | Turn 1 | Injected for the first time |
 | Turn 2–4 | Still present via system prompt (no re-injection needed) |
-| Turn 5 (default N=5) | Re-injected from disk (freshness check, not presence) |
+| Turn 5 (default N=5) | Re-injected from cached state (not a disk freshness check) |
 | After `write_memory` / `remove_memory` / `pin_memory` | Re-injected with updated content |
-| After TUI browser edit | Re-injected on next periodic turn or tool call |
+| After TUI browser edit | Cache invalidated by `.invalidate`; re-injected on next server cache check in the same active dir |
 | After context compaction | Re-injected on first post-compaction turn |
 
-The `inject_every_n_turns` config value controls how quickly external edits are reflected — it has no effect on whether memory is present. Raise it to save tokens on long sessions; lower it if you frequently edit `MEMORY.md` outside the agent.
+The `inject_every_n_turns` config value controls how often cached memory is re-emitted — it has no effect on whether memory is present. Raise it to save tokens on long sessions; it does not make arbitrary manual edits visible sooner.
 </content>

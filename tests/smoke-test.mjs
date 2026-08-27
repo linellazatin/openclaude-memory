@@ -626,6 +626,9 @@ await test('byte cap (50 KB) triggers truncation independently of the line-count
     const injected = out.system.join('\n');
     assert.ok(injected.includes('KB size limit'), `expected byte-cap truncation warning; got tail: ${injected.slice(-300)}`);
     assert.ok(!injected.includes('300-line limit'), 'byte-cap warning should fire, not the line-cap warning');
+    const prefix = `Memory dir: ${MEMORY_DIR}\n\n`;
+    const indexContent = out.system[0].slice(out.system[0].indexOf(prefix) + prefix.length);
+    assert.ok(Buffer.byteLength(indexContent) <= 50 * 1024, `injected index must actually respect the 50KB cap; got ${Buffer.byteLength(indexContent)} bytes`);
   } finally {
     writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5 }');
   }
@@ -662,6 +665,7 @@ await test('shared_dir: first enable merges with pre-existing foreign content in
   // no-collision case implicitly, since none of their filenames exist yet
   // in the not-yet-created shared dir).
   await plugin.tool.write_memory.execute({ topic: 'Collision Identical', content: 'identical content', summary: 'identical', pin: false });
+  await plugin.tool.write_memory.execute({ topic: 'Identical Missing Index', content: 'identical missing-index content', summary: 'missing index', pin: false });
   await plugin.tool.write_memory.execute({ topic: 'Collision Differing', content: 'local differing content', summary: 'differing', pin: false });
   await plugin.tool.write_memory.execute({ topic: 'Already Migrated', content: 'local already-migrated content', summary: 'already migrated', pin: false });
   await plugin.tool.write_memory.execute({ topic: 'Triple Collision', content: 'local triple-collision content', summary: 'triple collision', pin: false });
@@ -681,6 +685,10 @@ await test('shared_dir: first enable merges with pre-existing foreign content in
 
   // 2. Identical-content collision: byte-identical to the local file at the same name.
   fs.copyFileSync(path.join(MEMORY_DIR, 'collision-identical.md'), path.join(SHARED_MEMORY_DIR, 'collision-identical.md'));
+
+  // 3. Identical file with no index entry: content is already present, but
+  // the merge must still make the local topic discoverable in shared MEMORY.md.
+  fs.copyFileSync(path.join(MEMORY_DIR, 'identical-missing-index.md'), path.join(SHARED_MEMORY_DIR, 'identical-missing-index.md'));
 
   // 3. Differing-content collision: same filename as a local topic, different content.
   fs.writeFileSync(path.join(SHARED_MEMORY_DIR, 'collision-differing.md'), 'foreign differing content\n', 'utf8');
@@ -738,6 +746,10 @@ await test('shared_dir: first enable merges with pre-existing foreign content in
   // 2. Identical-content collision is a no-op: no -oclm variant, no duplicate entry.
   assert.ok(!sharedFiles.includes('collision-identical-oclm.md'), 'identical content should not be renamed');
   assert.equal(countOccurrences(sharedIndex, '](collision-identical.md)'), 1, 'expected exactly one index entry for collision-identical.md');
+
+  // 3. Identical content without a shared index entry must still be indexed.
+  assert.ok(!sharedFiles.includes('identical-missing-index-oclm.md'), 'identical content should not be renamed just to add its missing index entry');
+  assert.equal(countOccurrences(sharedIndex, '](identical-missing-index.md)'), 1, 'an identical shared topic file without an index entry must gain exactly one discoverable index entry');
 
   // 3. Differing-content collision renames the local copy; foreign original untouched.
   const localDifferingContent = fs.readFileSync(path.join(MEMORY_DIR, 'collision-differing.md'), 'utf8');
@@ -1212,6 +1224,43 @@ await test('maintainIndex (via write_memory): drops an unsafe-filename index ent
 
   const after = readIndex();
   assert.ok(!after.includes('Evil Entry 2'), 'unsafe-filename entry should be dropped by maintainIndex, same as an orphan');
+});
+
+await test('write_memory: refuses an unsafe filename from a matching existing index entry before touching its path', async () => {
+  const memIndexPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const victimPath = path.join(path.dirname(MEMORY_DIR), 'write-memory-victim.md');
+  const before = fs.readFileSync(memIndexPath, 'utf8');
+  fs.writeFileSync(victimPath, 'must stay unchanged\n', 'utf8');
+  fs.writeFileSync(memIndexPath, before.replace(/\n+$/, '') + '\n- [Unsafe Existing Topic](../write-memory-victim.md) 2026-01-01T00:00:00+00:00 -- corrupted entry\n', 'utf8');
+  try {
+    const result = await plugin.tool.write_memory.execute({ topic: 'Unsafe Existing Topic', content: 'must not be written', summary: 'unsafe', mode: 'replace', pin: false });
+    assert.ok(result.includes('unsafe filename'), `expected an unsafe-filename refusal; got: ${result}`);
+    assert.equal(fs.readFileSync(victimPath, 'utf8'), 'must stay unchanged\n', 'write_memory must not read or modify the path supplied by the unsafe index entry');
+  } finally {
+    fs.writeFileSync(memIndexPath, before, 'utf8');
+    fs.unlinkSync(victimPath);
+  }
+});
+
+await test('TUI parseIndex filters unsafe filenames from a corrupted index', () => {
+  const memIndexPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(memIndexPath, 'utf8');
+  fs.writeFileSync(memIndexPath, before.replace(/\n+$/, '') + '\n- [Unsafe TUI Entry](../../tui-victim.md) 2026-01-01T00:00:00+00:00 -- corrupted entry\n', 'utf8');
+  try {
+    assert.ok(!tui.parseIndex(memIndexPath).some(entry => entry.name === 'Unsafe TUI Entry'), 'TUI must not expose an unsafe index entry as selectable');
+  } finally {
+    fs.writeFileSync(memIndexPath, before, 'utf8');
+  }
+});
+
+await test('TUI readTopic refuses an unsafe filename without reading outside the memory directory', () => {
+  const victimPath = path.join(path.dirname(MEMORY_DIR), 'tui-victim.md');
+  fs.writeFileSync(victimPath, 'private TUI victim content\n', 'utf8');
+  try {
+    assert.ok(tui.readTopic(MEMORY_DIR, '../tui-victim.md').includes('unsafe filename'), 'TUI should refuse an unsafe filename rather than previewing the outside file');
+  } finally {
+    fs.unlinkSync(victimPath);
+  }
 });
 
 

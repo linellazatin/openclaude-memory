@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.6.2
+version: 0.6.3
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -76,7 +76,7 @@ If `## Memory Rules` is not in your current context, read `~/.config/opencode/me
 
 ## Reading memory
 
-`MEMORY.md` is injected into your context by the plugin on the first turn of each session, every `inject_every_n_turns` turns (default: 5), and immediately after any memory tool call. If it is not in your current context, read it directly:
+`MEMORY.md` is injected into your context by the plugin on the first turn of each session, every `inject_every_n_turns` turns (default: 5), and immediately after any memory tool call. Periodic injection re-emits cached state; ordinary manual disk edits require a memory-tool mutation, compaction, or session restart to refresh. If it is not in your current context, read it directly:
 
 ```
 Read ~/.config/opencode/memory/MEMORY.md
@@ -206,7 +206,7 @@ The optional TUI plugin (`ocl-memory-tui.mjs`, registered in `tui.jsonc`) provid
 
 TUI mutations (pin/unpin, remove) write a `.invalidate` sentinel file to the memory directory (whichever one is active — local or shared). On the next agent interaction, the server plugin detects the sentinel, discards its cache, and re-reads the index from disk. Changes made via the TUI are therefore visible after the next agent turn — not instantly within the current one.
 
-The TUI resolves `shared_dir` the same way the server plugin does — both read `memory.jsonc` through the same shared internal module, so they always agree on which directory (local or `~/.agents/memory/`) is active. The TUI re-reads this fresh every time the browser is opened, so it picks up `shared_dir` changes immediately.
+The TUI resolves `shared_dir` through the same shared internal module as the server plugin, but re-reads `memory.jsonc` fresh every time the browser opens. After a manual `shared_dir` change, the server keeps its cached directory until a memory tool mutation, compaction, or session restart refreshes it.
 
 ## Cross-tool shared memory (`shared_dir`)
 

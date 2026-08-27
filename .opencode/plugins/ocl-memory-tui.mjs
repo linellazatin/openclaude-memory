@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import {
-  readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel,
+  readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel, isSafeFilename,
   atomicWriteFileSync, acquireLock, releaseLock, maybeCarryOverToSharedDir,
 } from './ocl-memory-shared.mjs';
 
@@ -23,6 +23,7 @@ function parseIndex(memIndex) {
   for (const line of fs.readFileSync(memIndex, 'utf8').split('\n')) {
     const m = line.match(/^- \[([^\]]+)\]\(([^)]+)\)(.*)/);
     if (!m) continue;
+    if (!isSafeFilename(m[2])) continue;
     const rest = m[3];
     const dateMatch = rest.match(/(\d{4}-\d{2}-\d{2}T[\d:+\-Z]+)/);
     const summaryMatch = rest.match(/--\s*(.+)$/);
@@ -42,6 +43,7 @@ function parseIndex(memIndex) {
 // pattern as the server plugin's tools — matters once shared_dir puts other
 // processes/tools in the same directory.
 async function setPin(memDir, memIndex, filename, pin) {
+  if (!isSafeFilename(filename)) return '(unsafe filename refused)';
   const lockPath = await acquireLock(memDir);
   try {
     const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
@@ -60,6 +62,7 @@ async function setPin(memDir, memIndex, filename, pin) {
 
 // Remove the index line matched by filename (topic file on disk is preserved).
 async function removeEntry(memDir, memIndex, filename) {
+  if (!isSafeFilename(filename)) return '(unsafe filename refused)';
   const lockPath = await acquireLock(memDir);
   try {
     const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
@@ -72,6 +75,7 @@ async function removeEntry(memDir, memIndex, filename) {
 
 // Read topic file: strip YAML frontmatter, return first 10 lines of body content.
 function readTopic(memDir, filename) {
+  if (!isSafeFilename(filename)) return '(unsafe filename refused)';
   const p = path.join(memDir, filename);
   if (!fs.existsSync(p)) return '(topic file not found on disk)';
   let body = fs.readFileSync(p, 'utf8');

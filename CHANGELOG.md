@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3] - 2026-08-28
+
+### Fixed
+
+- **Unsafe index filenames**: `write_memory` and the TUI now reject unsafe filenames from corrupted or shared `MEMORY.md` entries before file access.
+- **Real 50 KB cap**: injected index content is now byte-bounded, not merely flagged after oversize content is assembled.
+- **Shared merge discovery**: an identical pre-existing shared topic file now gains its missing index line without being copied or renamed.
+
+### Documentation
+
+- Corrected cache-refresh behavior: periodic injection re-emits cached state; manual file/config edits need a mutation, compaction, or restart to refresh.
+
+### Tests
+
+- 3 new regressions (65 → 68) for unsafe existing-topic/TUI filenames, the actual byte bound, and an identical shared file missing its index entry.
+
 ## [0.6.2] - 2026-08-20
 
 ### Fixed

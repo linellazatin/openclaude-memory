@@ -310,6 +310,9 @@ function mergeLocalIntoSharedDir(sharedDir) {
   const sharedIndexPath = path.join(sharedDir, 'MEMORY.md');
   const sharedRaw = fs.existsSync(sharedIndexPath) ? fs.readFileSync(sharedIndexPath, 'utf8') : INITIAL_MEMORY;
   const sharedFilesOnDisk = new Set(fs.readdirSync(sharedDir));
+  const sharedIndexedFilenames = new Set(
+    sharedRaw.split('\n').map(parseIndexLine).filter(Boolean).map(entry => entry.filename)
+  );
 
   const localLines = fs.readFileSync(MEMORY_INDEX, 'utf8').split('\n');
   const appended = [];
@@ -322,11 +325,16 @@ function mergeLocalIntoSharedDir(sharedDir) {
     if (!fs.existsSync(srcPath)) continue; // orphaned local entry, skip
 
     const destName = resolveDestName(srcPath, sharedDir, parsed.filename, sharedFilesOnDisk);
-    if (destName === null) continue; // identical content already present under some name — nothing to do
-
-    fs.copyFileSync(srcPath, path.join(sharedDir, destName));
-    sharedFilesOnDisk.add(destName);
-    appended.push(`${parsed.prefix}${parsed.name}](${destName})${parsed.rest}`);
+    if (!sharedFilesOnDisk.has(destName)) {
+      fs.copyFileSync(srcPath, path.join(sharedDir, destName));
+      sharedFilesOnDisk.add(destName);
+    }
+    // Identical content may already be on disk without an index entry. Keep
+    // the file untouched but add its local metadata so it remains discoverable.
+    if (!sharedIndexedFilenames.has(destName)) {
+      appended.push(`${parsed.prefix}${parsed.name}](${destName})${parsed.rest}`);
+      sharedIndexedFilenames.add(destName);
+    }
   }
 
   if (appended.length) {
@@ -338,18 +346,19 @@ function mergeLocalIntoSharedDir(sharedDir) {
 }
 
 // Decides where a local topic file should land in the shared dir. Returns the
-// destination filename to use, or null if nothing needs to be written
-// (content already present under the original name or the canonical -oclm name).
+// destination filename to use. Content already present under the original or
+// canonical -oclm name returns that existing filename so the caller can still
+// add a missing shared-index entry without copying the file again.
 function resolveDestName(srcPath, sharedDir, filename, sharedFilesOnDisk) {
   const originalDest = path.join(sharedDir, filename);
   if (!fs.existsSync(originalDest)) return filename; // no collision
 
-  if (filesEqual(srcPath, originalDest)) return null; // already there under the same name
+  if (filesEqual(srcPath, originalDest)) return filename; // already there under the same name
 
   const suffixed = filename.replace(/\.md$/, '-oclm.md');
   const suffixedDest = path.join(sharedDir, suffixed);
   if (!fs.existsSync(suffixedDest)) return suffixed;
-  if (filesEqual(srcPath, suffixedDest)) return null; // already migrated under the canonical suffixed name in a prior run
+  if (filesEqual(srcPath, suffixedDest)) return suffixed; // already migrated under the canonical suffixed name in a prior run
 
   // Exceedingly rare: even the suffixed name collides with unrelated content. Bump a counter.
   let n = 2, candidate;

@@ -101,7 +101,7 @@ Change `"max_lines"` to set a custom index size limit. The plugin clamps values 
 
 Change `"stale_after_days"` to control when entries are flagged as stale. Set to `0` to disable age flagging entirely.
 
-Change `"inject_every_n_turns"` to tune how often the memory index is re-injected into the system prompt. The default of `5` means the index is refreshed on turn 1, turn 6, turn 11, and so on — plus immediately after any memory tool call. Set to `1` to re-inject every turn. Higher values save tokens; lower values pick up external edits to `MEMORY.md` more quickly. The minimum is `1` — setting `0` is silently clamped to `1` (not treated as "disable"). To effectively disable periodic re-injection, set a very high value such as `9999`; re-injection will still fire after any memory tool mutation.
+Change `"inject_every_n_turns"` to tune how often the cached memory index is re-injected into the system prompt. The default of `5` means it is re-emitted on turn 1, turn 6, turn 11, and so on — plus immediately after any memory tool call. Set to `1` to re-inject every turn. Higher values save tokens; lower values only re-emit the cache more often; they do not cause manual file/config edits to be reread. The minimum is `1` — setting `0` is silently clamped to `1` (not treated as "disable"). To effectively disable periodic re-injection, set a very high value such as `9999`; re-injection will still fire after any memory tool mutation.
 
 Change `"shared_dir"` to `true` to move `MEMORY.md` and topic files to `~/.agents/memory/` — see [Cross-tool shared memory](shared-directory.md).
 
