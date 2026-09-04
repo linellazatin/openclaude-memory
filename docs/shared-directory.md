@@ -8,9 +8,20 @@ Set `"shared_dir": true` in `memory.jsonc` to move `MEMORY.md` and topic files t
 
 The first time `shared_dir` resolves `true`, existing local memory is merged into the shared directory — copied, never moved. If the shared directory is empty, this is just a plain copy. If another tool (or a prior run of this same carry-over) already put content there, local entries are merged in alongside it: index lines are appended, and topic files are copied over unless a file with the same name and identical content already exists (then it's skipped — already synced) or a file with the same name but *different* content already exists (then the local copy is renamed with a `-oclm` suffix so nothing is overwritten or lost). This full merge scan runs at most once *ever* for a given local install: after it succeeds, a `.shared-dir-migrated` sentinel file is written into the local memory dir, so every later opencode session (a new process) short-circuits straight to a single file-existence check instead of re-scanning and re-comparing every entry. Because files are copied rather than moved, the originals remain in `~/.config/opencode/memory/` untouched — no separate backup dir is created. Toggling `shared_dir` off and back on does not re-run it or reconcile drift that happened while it was off — treat enabling it as a one-way move. See [Opting in when the shared dir already has content](#opting-in-when-the-shared-dir-already-has-content) below for a worked example.
 
-Writes to the shared directory (and the local one) are protected by a cross-process advisory lock (`.lock` file, 10s stale-lock reclaim, 500ms acquire timeout) so this tool and another tool sharing the directory don't corrupt the index with interleaved writes. If the lock can't be acquired within the timeout, the write proceeds anyway rather than hanging — best-effort, not a hard guarantee.
+Writes to the shared directory (and the local one) are serialized by a cross-process advisory lock (`.lock` file). The lock records the holder's PID; a lock older than 10s is reclaimed only after a liveness check (`process.kill(pid, 0)`) confirms the holder is actually dead — a live but slow holder is never stolen from (a lock with an unparseable/foreign payload is only reclaimed once it is over 60s old). Contention behavior depends on the mode:
+
+- **Shared (`shared_dir: true`)** — writes **fail closed**: the tool waits up to ~2s, then sleeps and auto-retries once (another ~2s), and only if the lock is still held does it return `"memory store is busy … retry in a moment"` rather than writing. This guarantees an in-flight write by a co-tenant tool (e.g. openpi-memory, which holds the same `.lock`) is never clobbered by an unlocked write. The retry is automatic, so transient contention is invisible in practice.
+- **Local (`shared_dir: false`)** — best-effort: after a 500ms timeout the write proceeds anyway rather than hanging. There is only ever one writer locally, so lost-update risk is negligible and never-hanging is preferred.
 
 Filenames read back from `MEMORY.md` are validated against path traversal before server or TUI file operations — relevant specifically because `shared_dir` puts an untrusted co-tenant tool's writes into the same trust boundary as this plugin's own index file. An identical topic file that already exists in the shared dir is not copied again, but its local index line is still added if the shared index lacks it, so it remains discoverable.
+
+## Recovering orphaned topics (`/memory repair`)
+
+Discovery in openclaude-memory is index-driven: the agent only sees topics listed in `MEMORY.md`. A co-tenant tool can legitimately write topic `.md` files into the shared dir (or rewrite the shared `MEMORY.md` from its own smaller view) and leave openclaude's topic files present on disk but absent from the index — silently undiscoverable.
+
+`/memory repair` (tool: `repair_memory`) scans the active memory dir for topic `.md` files missing from `MEMORY.md` and appends an index line for each, marked `[stale?]` and dated from the file's own frontmatter (`last_updated` → `created`). It is **additive only** — it never deletes, reorders, or overwrites existing entries, skips `MEMORY.md`/unsafe filenames, skips any filename tombstoned by `remove_memory` (recorded in the tool-private `.ocl-removed` list, so a deliberate removal is never resurrected), and is idempotent (a second run adds nothing). When `shared_dir` is active and the on-disk topic-file count exceeds the indexed count by more than 5, the injected `## Global Memory` block gains a non-mutating maintenance note prompting you to run `/memory repair`. Repair is never run automatically — a co-tenant may be mid-write — so it is always an explicit, user-initiated action.
+
+Note on collision suffixes: openclaude renames colliding carry-over files with `-oclm`; openpi-memory uses `-opim`. This divergence is intentional so each tool's collision copies are self-attributed and the two never overwrite each other's files.
 
 Path/config resolution (`getMemoryDir`, `getMemoryIndex`, `readMemoryRules`, the lock, and the carry-over itself) lives in a shared internal module (`ocl-memory-shared.mjs`) imported by both the server plugin and the TUI memory browser (`ctrl+alt+m`). The TUI re-reads `memory.jsonc` fresh every time you open it, while the server keeps its cached resolution until a memory tool mutation, compaction, or session restart refreshes it.
 
@@ -21,16 +32,15 @@ On a brand-new install, nothing exists on disk yet. Here's exactly what happens,
 1. **`readMemoryRules()` runs.** Neither `~/.config/opencode/memory.jsonc` nor a legacy `~/.config/opencode/memory/RULES.jsonc` exists, so it writes fresh defaults to `~/.config/opencode/memory.jsonc`.
 2. **`maybeCarryOverToSharedDir()` runs.** `shared_dir` defaults to `false` in fresh defaults, so this is a no-op.
 3. **`getMemoryDir()` resolves** to the local path (`~/.config/opencode/memory/`, since `shared_dir` is `false`).
-4. **`readMemoryIndex()` runs.** No `MEMORY.md` exists at that path yet, so it creates the directory and writes an empty index (`# Memory Index`).
+4. **`readMemoryIndex()` runs.** No `MEMORY.md` exists at that path yet, so it returns the empty index (`# Memory Index`) **in-memory** — it does **not** create the file or the directory on this read path (as of v0.6.4; the file is created only by the first locked `write_memory` or by carry-over).
 5. **Injection happens.** The plugin pushes `## Global Memory` (empty index) and `## Memory Rules` (default rules) into the system prompt.
 
-Resulting state:
+Resulting state (nothing written to `memory/` yet — it materializes on the first `write_memory`):
 
 ```
 ~/.config/opencode/
 ├── memory.jsonc          # fresh defaults (shared_dir: false)
-└── memory/
-    └── MEMORY.md          # "# Memory Index" — empty, no entries yet
+└── memory/               # created on the first write_memory (with MEMORY.md + topic files)
 ```
 
 The agent's first turn sees the empty index and the default persist rules, ready to start calling `write_memory`.
@@ -44,20 +54,19 @@ On the first cache load with `shared_dir: true`:
 1. **`maybeCarryOverToSharedDir()` runs.** `_carryOverChecked` is `false` and `.shared-dir-migrated` doesn't exist — proceed to check for local content.
 2. **No local `MEMORY.md` exists** (`~/.config/opencode/memory/MEMORY.md` was never created) → **carry-over is a no-op.** Sentinel is not written (nothing was merged).
 3. **`getMemoryDir()` resolves** to `~/.agents/memory/`.
-4. **`readMemoryIndex()` finds nothing there** — creates `~/.agents/memory/` and writes an empty index.
+4. **`readMemoryIndex()` finds nothing there** — returns an empty index in-memory without creating the file (v0.6.4). `~/.agents/memory/MEMORY.md` is created by the first locked `write_memory`.
 
 Resulting state:
 
 ```
 ~/.config/opencode/
 ├── memory.jsonc              # shared_dir: true
-└── memory/                   # dir exists, no MEMORY.md — carry-over had nothing to do
+└── memory/                   # not created — no local write happened, carry-over had nothing to do
 
-~/.agents/memory/
-└── MEMORY.md                 # empty — "# Memory Index"
+~/.agents/memory/             # created on the first write_memory (with MEMORY.md + topic files)
 ```
 
-From here, every `write_memory` call writes topic files and index entries directly to `~/.agents/memory/`. The local `~/.config/opencode/memory/` dir stays empty and inert. The sentinel is not written here (nothing was actually merged), so if you somehow later toggle `shared_dir: false`, create local memories, then toggle it back to `true`, the carry-over will pick up those local memories at that point.
+From here, every `write_memory` call writes topic files and index entries directly to `~/.agents/memory/`. The local `~/.config/opencode/memory/` dir stays absent/inert. The sentinel is not written here (nothing was actually merged), so if you somehow later toggle `shared_dir: false`, create local memories, then toggle it back to `true`, the carry-over will pick up those local memories at that point.
 
 ## First run: upgrading from a pre-0.6.0 install
 

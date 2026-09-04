@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.4] - 2026-09-02 - Hardening for live `shared_dir` with openpi-memory.
+
+### Fixed
+
+- **Fail-closed shared writes**: on lock contention, wait + auto-retry once, then return "store busy" instead of writing unlocked (all tools + TUI, via `withLock`).
+- **Lock liveness reclaim**: `.lock` is PID-stamped; a >10s stale lock is reclaimed only after `kill(pid,0)` proves the holder dead (foreign/unparseable payloads: >60s).
+- **Append-mode timestamp is frontmatter-scoped**: `write_memory` append no longer runs its `last_updated`/`created` bump over the whole file — it now edits only the frontmatter block (matching `mode: "replace"`), so a body line beginning `last_updated:` is never rewritten.
+- **No unlocked read-path index write**: `readMemoryIndex` returns the initial index in-memory when `MEMORY.md` is absent instead of writing it without the lock; the file is now created only via the locked tool/carry-over paths (removes the last unlocked write under `shared_dir`).
+- **TUI missing-index guard**: `setPin`/`removeEntry` return "No memory index found." if the index was deleted mid-session instead of throwing an unhandled rejection.
+
+### Added
+
+- **`/memory repair`** (`repair_memory`): additive re-index of on-disk topic files missing from `MEMORY.md` (`[stale?]`, dated from frontmatter); idempotent. Shared-mode drift surfaces a non-mutating maintenance note.
+- **Intentional-removal tombstone**: `remove_memory` records the removed topic's filename in a `.ocl-removed` list inside the active memory dir.
+  - `repair_memory` now **skips** anything listed, separating removed from "orphan". 
+  - Re-`write_memory`-ing that topic reclaims its on-disk file and clears the tombstone.
+
+### Changed
+
+- Topic frontmatter now quotes `name`/`description` (matches openpi-memory).
+- Recap renamed to `ocl-last-session-recap.md` (dodges openpi's reserved-slug retirement).
+
+### Tests
+
+- 68 → 79: fail-closed, auto-retry, local best-effort, live/dead-PID reclaim, repair (additive/idempotent/unsafe-skip), drift note, quoted frontmatter, recap filename, frontmatter-scoped append bump, TUI missing-index guard, intentional-removal tombstone (skip + reclaim-on-rewrite).
+
 ## [0.6.3] - 2026-08-28
 
 ### Fixed
