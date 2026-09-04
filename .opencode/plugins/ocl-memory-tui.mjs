@@ -2,17 +2,19 @@ import fs from 'fs';
 import path from 'path';
 import {
   readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel, isSafeFilename,
-  atomicWriteFileSync, acquireLock, releaseLock, maybeCarryOverToSharedDir,
+  atomicWriteFileSync, withLock, LockContendedError, maybeCarryOverToSharedDir,
+  addToRemovedList,
 } from './ocl-memory-shared.mjs';
 
 // Resolves which directory (local or shared, per memory.jsonc's shared_dir)
 // is currently active. Called once per browser session (each ctrl+alt+m
 // press) — cheap, low-frequency, so no caching is needed here (unlike the
-// server plugin, which re-reads far more often).
+// server plugin, which re-reads far more often). sharedDir is returned so
+// mutations know whether to fail-closed on lock contention.
 async function resolveActiveDir() {
   const config = parseRules(readMemoryRules());
   await maybeCarryOverToSharedDir(config);
-  return { memDir: getMemoryDir(config), memIndex: getMemoryIndex(config) };
+  return { memDir: getMemoryDir(config), memIndex: getMemoryIndex(config), sharedDir: !!config.sharedDir };
 }
 
 // Parse MEMORY.md into structured entries.
@@ -40,36 +42,44 @@ function parseIndex(memIndex) {
 }
 
 // Toggle [pin] on the index line matched by filename. Locked + atomic, same
-// pattern as the server plugin's tools — matters once shared_dir puts other
-// processes/tools in the same directory.
-async function setPin(memDir, memIndex, filename, pin) {
+// pattern as the server plugin's tools — and, like them, fails closed on
+// contention whenever shared_dir is active (strict) so a co-tenant's in-flight
+// index update is never clobbered.
+async function setPin(memDir, memIndex, filename, pin, sharedDir) {
   if (!isSafeFilename(filename)) return '(unsafe filename refused)';
-  const lockPath = await acquireLock(memDir);
+  if (!fs.existsSync(memIndex)) return 'No memory index found.';
   try {
-    const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
-    const updated = lines.map(line => {
-      if (!line.includes(`](${filename})`)) return line;
-      if (pin)  return line.includes('[pin]') ? line : line.replace(/(\]\([^)]+\))/, '$1 [pin]');
-      if (!pin) return line.replace(/\s*\[pin\]/, '');
-      return line;
-    });
-    atomicWriteFileSync(memIndex, updated.join('\n'));
-    try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
-  } finally {
-    releaseLock(lockPath);
+    return await withLock(memDir, async () => {
+      const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
+      const updated = lines.map(line => {
+        if (!line.includes(`](${filename})`)) return line;
+        if (pin)  return line.includes('[pin]') ? line : line.replace(/(\]\([^)]+\))/, '$1 [pin]');
+        if (!pin) return line.replace(/\s*\[pin\]/, '');
+        return line;
+      });
+      atomicWriteFileSync(memIndex, updated.join('\n'));
+      try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
+    }, { strict: sharedDir });
+  } catch (e) {
+    if (e instanceof LockContendedError) return 'Memory store is busy (another tool/process holds the lock) — retry in a moment.';
+    throw e;
   }
 }
 
 // Remove the index line matched by filename (topic file on disk is preserved).
-async function removeEntry(memDir, memIndex, filename) {
+async function removeEntry(memDir, memIndex, filename, sharedDir) {
   if (!isSafeFilename(filename)) return '(unsafe filename refused)';
-  const lockPath = await acquireLock(memDir);
+  if (!fs.existsSync(memIndex)) return 'No memory index found.';
   try {
-    const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
-    atomicWriteFileSync(memIndex, lines.filter(l => !l.includes(`](${filename})`)).join('\n'));
-    try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
-  } finally {
-    releaseLock(lockPath);
+    return await withLock(memDir, async () => {
+      const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
+      atomicWriteFileSync(memIndex, lines.filter(l => !l.includes(`](${filename})`)).join('\n'));
+      addToRemovedList(memDir, filename); // tombstone so server repair_memory won't resurrect it
+      try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
+    }, { strict: sharedDir });
+  } catch (e) {
+    if (e instanceof LockContendedError) return 'Memory store is busy (another tool/process holds the lock) — retry in a moment.';
+    throw e;
   }
 }
 
@@ -94,7 +104,7 @@ function readTopic(memDir, filename) {
 
 const tui = async (api) => {
   async function showBrowser() {
-    const { memDir, memIndex } = await resolveActiveDir();
+    const { memDir, memIndex, sharedDir } = await resolveActiveDir();
     const entries = parseIndex(memIndex);
     api.ui.dialog.setSize('large');
     api.ui.dialog.replace(() => api.ui.DialogSelect({
@@ -105,11 +115,11 @@ const tui = async (api) => {
         description: [e.summary, e.date].filter(Boolean).join('  '),
         value:       e,
       })),
-      onSelect: opt => showActions(opt.value, memDir, memIndex),
+      onSelect: opt => showActions(opt.value, memDir, memIndex, sharedDir),
     }));
   }
 
-  function showActions(entry, memDir, memIndex) {
+  function showActions(entry, memDir, memIndex, sharedDir) {
     api.ui.dialog.replace(() => api.ui.DialogSelect({
       title:      entry.name,
       skipFilter: true,
@@ -139,21 +149,21 @@ const tui = async (api) => {
             api.ui.dialog.replace(() => api.ui.DialogAlert({
               title:     entry.name,
               message:   readTopic(memDir, entry.filename),
-              onConfirm: () => setTimeout(() => showActions(entry, memDir, memIndex), 0),
+              onConfirm: () => setTimeout(() => showActions(entry, memDir, memIndex, sharedDir), 0),
             }));
             break;
           case 'pin':
-            setPin(memDir, memIndex, entry.filename, true).then(showBrowser);
+            setPin(memDir, memIndex, entry.filename, true, sharedDir).then(showBrowser);
             break;
           case 'unpin':
-            setPin(memDir, memIndex, entry.filename, false).then(showBrowser);
+            setPin(memDir, memIndex, entry.filename, false, sharedDir).then(showBrowser);
             break;
           case 'remove':
             api.ui.dialog.replace(() => api.ui.DialogConfirm({
               title:     'Remove from index',
               message:   `Remove "${entry.name}" from the memory index?\n\nThe topic file is preserved on disk.`,
-              onConfirm: () => { removeEntry(memDir, memIndex, entry.filename).then(showBrowser); },
-              onCancel:  () => showActions(entry, memDir, memIndex),
+              onConfirm: () => { removeEntry(memDir, memIndex, entry.filename, sharedDir).then(showBrowser); },
+              onCancel:  () => showActions(entry, memDir, memIndex, sharedDir),
             }));
             break;
           case 'back':

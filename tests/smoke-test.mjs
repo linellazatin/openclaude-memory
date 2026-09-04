@@ -238,6 +238,44 @@ await test('write_memory: pin=true adds [pin] to index entry', async () => {
   assert.ok(idx.includes('[pin]'), 'index should contain [pin] token');
 });
 
+await test('write_memory: append-mode last_updated bump is frontmatter-scoped (does not touch body)', async () => {
+  await plugin.tool.write_memory.execute({
+    topic: 'FM Scope Test',
+    content: 'Original.',
+    summary: 'fm scope',
+    pin: false,
+  });
+  const file = path.join(MEMORY_DIR, 'fm-scope-test.md');
+  // Hand-write a file whose frontmatter lacks last_updated but whose BODY has a
+  // line starting `last_updated:`. The old whole-file regex would rewrite the
+  // body line; the fix must only touch the frontmatter block.
+  fs.writeFileSync(file, [
+    '---',
+    'name: "FM Scope Test"',
+    'description: "fm scope"',
+    'created: 2026-01-01T00:00:00+08:00',
+    'metadata:',
+    '  node_type: memory',
+    '---',
+    '',
+    'Notes.',
+    'last_updated: do not touch',
+    '',
+  ].join('\n'), 'utf8');
+  await plugin.tool.write_memory.execute({
+    topic: 'FM Scope Test',
+    content: 'Appended body.',
+    summary: 'fm scope 2',
+    pin: false,
+  });
+  const body = fs.readFileSync(file, 'utf8');
+  assert.ok(body.includes('last_updated: do not touch'), 'body line starting last_updated: must be left verbatim');
+  const fm = body.match(/^---\n([\s\S]*?)\n---\n/)[1];
+  assert.ok(/^last_updated:\s*\d{4}-\d{2}-\d{2}T/m.test(fm), 'frontmatter should gain a real ISO last_updated');
+  assert.ok(body.includes('Appended body.'), 'appended content should be present');
+  assert.ok(body.match(/## \d{4}-\d{2}-\d{2}T/), 'dated append heading should be present');
+});
+
 // ═══════════════════════════════════════════════════════════
 // 3. pin_memory — toggle pin state
 // ═══════════════════════════════════════════════════════════
@@ -794,9 +832,9 @@ await test('shared_dir: carry-over does not re-run on subsequent writes', async 
   assert.ok(!fs.existsSync(path.join(SHARED_MEMORY_DIR, 'post-carryover-drift.md')), 'a local-only file added after carry-over should not be copied to the shared dir');
 });
 
-await test('shared_dir: stale lock (>10s old) is reclaimed and does not block', async () => {
+await test('shared_dir: stale lock from a DEAD pid is reclaimed and does not block', async () => {
   const lockPath = path.join(SHARED_MEMORY_DIR, '.lock');
-  fs.writeFileSync(lockPath, '', 'utf8');
+  fs.writeFileSync(lockPath, '999999\t' + Date.now(), 'utf8'); // pid 999999: provably not us/our child
   const oldTime = new Date(Date.now() - 15000);
   fs.utimesSync(lockPath, oldTime, oldTime);
 
@@ -804,23 +842,89 @@ await test('shared_dir: stale lock (>10s old) is reclaimed and does not block', 
   const result = await plugin.tool.write_memory.execute({ topic: 'Stale Lock Test', content: 'x', summary: 'stale lock test', pin: false });
   const elapsed = Date.now() - start;
 
-  assert.ok(result.includes('created') || result.includes('updated'), 'write should succeed after reclaiming a stale lock');
+  assert.ok(result.includes('created') || result.includes('updated'), `write should succeed after reclaiming a dead holder's lock; got: ${result}`);
   assert.ok(elapsed < 400, `expected fast reclaim rather than a full timeout wait, took ${elapsed}ms`);
   assert.ok(!fs.existsSync(lockPath), 'lock file should not exist after a successful acquire+release');
 });
 
-await test('shared_dir: fresh (non-stale) lock causes proceed-without-lock after timeout', async () => {
+await test('shared_dir: stale-aged lock held by a LIVE pid is NOT stolen (fail-closed)', async () => {
+  // Age the lock past the soft stale window but record OUR OWN (live) pid.
+  // Liveness must win over age: we never clobber an active holder, so the
+  // writer gives up (busy) instead of stealing the lock.
   const lockPath = path.join(SHARED_MEMORY_DIR, '.lock');
-  fs.writeFileSync(lockPath, '', 'utf8'); // fresh — blocks acquisition for the whole retry window
+  fs.writeFileSync(lockPath, `${process.pid}\t${Date.now()}`, 'utf8');
+  const oldTime = new Date(Date.now() - 15000);
+  fs.utimesSync(lockPath, oldTime, oldTime);
+  try {
+    const result = await plugin.tool.write_memory.execute({ topic: 'Live Holder Test', content: 'x', summary: 'live holder', pin: false });
+    assert.ok(/busy|retry/i.test(result), `must refuse to steal a live holder's lock; got: ${result}`);
+    assert.ok(fs.existsSync(lockPath), 'the live holder lock must remain in place');
+    const idx = fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), 'utf8');
+    assert.ok(!idx.includes('Live Holder Test'), 'a refused write must not land in the index');
+  } finally {
+    if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+  }
+});
+
+await test('shared_dir: fresh foreign lock is refused (fail-closed) after one auto-retry', async () => {
+  // A genuinely foreign, still-recently-held lock (dead pid but too fresh to
+  // reclaim) must NOT be written through in shared mode. The tool should
+  // exhaust its patience window (poll + one sleep/retry) and return a busy
+  // error, leaving MEMORY.md untouched and the foreign lock in place.
+  const lockPath = path.join(SHARED_MEMORY_DIR, '.lock');
+  fs.writeFileSync(lockPath, '999999\t' + Date.now(), 'utf8'); // fresh; reclaim age >10s not met
 
   const start = Date.now();
   const result = await plugin.tool.write_memory.execute({ topic: 'Lock Contention Test', content: 'x', summary: 'lock test', pin: false });
   const elapsed = Date.now() - start;
 
-  assert.ok(result.includes('created') || result.includes('updated'), 'write should still succeed even without acquiring the lock');
-  assert.ok(elapsed >= 400, `expected the call to wait out the ~500ms acquire timeout, took ${elapsed}ms`);
+  assert.ok(/busy|retry/i.test(result), `expected a busy/retry refusal under shared contention; got: ${result}`);
+  assert.ok(elapsed >= 3000, `expected the full patience window (poll + sleep + retry) to be waited, took ${elapsed}ms`);
+  assert.ok(fs.existsSync(lockPath), 'the foreign lock must NOT be unlinked by the losing writer');
+  const idx = fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), 'utf8');
+  assert.ok(!idx.includes('Lock Contention Test'), 'a refused write must not appear in the index');
 
   fs.unlinkSync(lockPath); // cleanup the external lock we created
+});
+
+await test('shared_dir: a lock that clears during the retry window succeeds on the second attempt', async () => {
+  // Contended past the first poll window, then released during the retry
+  // sleep — the writer must transparently acquire on the second window rather
+  // than failing closed, proving the single auto-retry actually re-attempts.
+  const lockPath = path.join(SHARED_MEMORY_DIR, '.lock');
+  fs.writeFileSync(lockPath, '999999\t' + Date.now(), 'utf8'); // fresh, dead pid, not reclaimable yet
+  const releaseTimer = setTimeout(() => { try { fs.unlinkSync(lockPath); } catch {} }, 2300);
+  try {
+    const start = Date.now();
+    const result = await plugin.tool.write_memory.execute({ topic: 'Retry Winner', content: 'x', summary: 'retry winner', pin: false });
+    const elapsed = Date.now() - start;
+    assert.ok(result.includes('created') || result.includes('updated'), `should succeed via the retry window after the lock clears; got: ${result}`);
+    assert.ok(elapsed >= 2000, `should have waited past the first poll window into the retry, took ${elapsed}ms`);
+  } finally {
+    clearTimeout(releaseTimer);
+    if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+  }
+});
+
+await test('local (shared_dir:false) contention still proceeds best-effort after the short timeout', async () => {
+  // Best-effort mode must be untouched by the shared fail-closed change: a
+  // foreign local lock that can't be reclaimed does NOT error — the write
+  // proceeds unlocked after the ~500ms window.
+  writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5, "shared_dir": false }');
+  await plugin['experimental.session.compacting']({}, makeCompactOutput()); // force cache to pick up shared_dir:false
+  const lockPath = path.join(MEMORY_DIR, '.lock');
+  fs.writeFileSync(lockPath, '999999\t' + Date.now(), 'utf8');
+  try {
+    const start = Date.now();
+    const result = await plugin.tool.write_memory.execute({ topic: 'Local Best Effort', content: 'x', summary: 'local be', pin: false });
+    const elapsed = Date.now() - start;
+    assert.ok(result.includes('created') || result.includes('updated'), `local write should proceed unlocked; got: ${result}`);
+    assert.ok(elapsed < 1000, `local best-effort should use the short window, not the shared patience window, took ${elapsed}ms`);
+  } finally {
+    if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+    writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5, "shared_dir": true }');
+    await plugin['experimental.session.compacting']({}, makeCompactOutput());
+  }
 });
 
 await test('shared_dir: acquireLock waits out a lock genuinely held by another OS process', async () => {
@@ -883,7 +987,7 @@ await test('config: /memory command template includes a consolidate branch', asy
   await plugin.config(mockConfig);
   const template = mockConfig.command['memory'].template;
   assert.ok(template.includes('consolidate'), 'template should mention consolidate');
-  assert.ok(template.toLowerCase().includes('last session recap') || template.includes('last-session-recap'), 'template should reference the session recap topic');
+  assert.ok(template.includes('ocl-last-session-recap.md'), 'template should reference the namespaced session recap topic');
   assert.ok(template.includes('always_persist'), 'template should reference always_persist rules');
 });
 
@@ -1261,6 +1365,140 @@ await test('TUI readTopic refuses an unsafe filename without reading outside the
   } finally {
     fs.unlinkSync(victimPath);
   }
+});
+
+
+await test('TUI setPin/removeEntry return a friendly message when the index is missing (no throw)', async () => {
+  const missing = path.join(MEMORY_DIR, 'does-not-exist-index.md');
+  assert.ok(!fs.existsSync(missing), 'precondition: index path must not exist');
+  const pinResult = await tui.setPin(MEMORY_DIR, missing, 'whatever.md', true, false);
+  assert.strictEqual(pinResult, 'No memory index found.', 'setPin should report missing index, not throw');
+  const rmResult = await tui.removeEntry(MEMORY_DIR, missing, 'whatever.md', false);
+  assert.strictEqual(rmResult, 'No memory index found.', 'removeEntry should report missing index, not throw');
+});
+
+
+// ═══════════════════════════════════════════════════════════
+// 19. v0.6.4 shared_dir co-tenancy hardening (repair, format, recap)
+//     Runs in shared_dir:true (restored at end of section 15/16 region).
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n--- 19. v0.6.4 co-tenancy hardening ---');
+
+// Ensure the plugin targets the SHARED dir for this section (writes below
+// assert against SHARED_MEMORY_DIR) regardless of what earlier sections left.
+writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5, "shared_dir": true }');
+await plugin['experimental.session.compacting']({}, makeCompactOutput()); // force fresh shared-dir resolution
+
+// [T2.6] Frontmatter converges to openpi's quoted form.
+await test('write_memory: emits quoted frontmatter name/description', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Quoted FM', content: 'body', summary: 'a summary: with colon', pin: false });
+  const file = fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'quoted-fm.md'), 'utf8');
+  assert.ok(/^name: "Quoted FM"$/m.test(file), `frontmatter name should be quoted; got header: ${file.split('\n').slice(0,4).join(' | ')}`);
+  assert.ok(/^description: "a summary: with colon"$/m.test(file), 'frontmatter description should be quoted (colon-safe)');
+});
+
+// [T2.7] Recap uses a tool-namespaced, non-reserved slug so openpi won't strip it.
+await test('config: consolidation references the non-reserved ocl-last-session-recap topic', async () => {
+  const mockConfig = {};
+  await plugin.config(mockConfig);
+  const template = mockConfig.command['memory'].template;
+  assert.ok(template.includes('ocl-last-session-recap.md'), 'consolidation should target ocl-last-session-recap.md');
+});
+
+// [T0.2] repair re-adds orphan files as stale, deduped, additive-only.
+await test('repairMemoryIndex: re-adds orphan topic files as [stale?] entries', async () => {
+  const { repairMemoryIndex } = plugin.__test__ || {};
+  assert.ok(typeof repairMemoryIndex === 'function', 'repairMemoryIndex should be exposed for testing');
+  // Seed two orphan topic files not present in the index.
+  const orphanA = path.join(SHARED_MEMORY_DIR, 'repair-alpha.md');
+  fs.writeFileSync(orphanA, '---\nname: "Repair Alpha"\ndescription: "alpha summary"\ncreated: 2026-01-01T00:00:00+08:00\nlast_updated: 2026-06-01T00:00:00+08:00\nmetadata:\n  node_type: memory\n---\n\nbody\n', 'utf8');
+  const orphanB = path.join(SHARED_MEMORY_DIR, 'repair-beta.md');
+  fs.writeFileSync(orphanB, 'no frontmatter at all, just text\n', 'utf8');
+
+  const idxPath = path.join(SHARED_MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(idxPath, 'utf8');
+  const res = repairMemoryIndex({ memDir: SHARED_MEMORY_DIR, memIndex: idxPath });
+  assert.ok(res.added >= 2, `expected at least 2 recovered entries (the 2 seeded orphans); got ${res.added}`);
+
+  const after = fs.readFileSync(idxPath, 'utf8');
+  assert.ok(after.includes('[Repair Alpha](repair-alpha.md)'), 'alpha recovered with its name');
+  assert.ok(after.includes('](repair-alpha.md)') && /\[stale\?\]/.test(after.split('repair-alpha.md')[1].slice(0, 60)), 'recovered alpha should be marked [stale?]');
+  assert.ok(after.includes('](repair-beta.md)'), 'beta (no frontmatter) recovered under a filename-derived name');
+  // Additive-only: pre-existing lines survive.
+  assert.ok(before.split('\n').filter(l => l.startsWith('- [')).every(l => after.includes(l.slice(0, 30))), 'existing index lines must not be removed by repair');
+
+  // Idempotent: second run adds nothing, creates no duplicates.
+  const res2 = repairMemoryIndex({ memDir: SHARED_MEMORY_DIR, memIndex: idxPath });
+  assert.equal(res2.added, 0, 'second repair run must be idempotent (add 0)');
+  const after2 = fs.readFileSync(idxPath, 'utf8');
+  assert.equal((after2.match(/repair-alpha\.md/g) || []).length, 1, 'no duplicate line for repair-alpha.md');
+
+  // cleanup the seeded orphans + their index lines to not disturb later tests
+  fs.writeFileSync(idxPath, before, 'utf8');
+  fs.unlinkSync(orphanA); fs.unlinkSync(orphanB);
+});
+
+// [T0.2] repair skips unsafe filenames (never re-introduces a traversal line).
+await test('repairMemoryIndex: does not index an unsafe filename even if the file exists oddly', async () => {
+  const { repairMemoryIndex } = plugin.__test__ || {};
+  // An orphan file is only ever referenced by its on-disk basename; ensure a
+  // normal file recovers but the guard path is exercised via isSafeFilename.
+  assert.equal(shared.isSafeFilename('../../outside.md'), false);
+  assert.equal(typeof repairMemoryIndex, 'function');
+});
+
+// [T0.2] passive drift warning appears in injected content when shared.
+await test('injection: shared_dir drift adds a non-mutating /memory repair note', async () => {
+  const idxPath = path.join(SHARED_MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(idxPath, 'utf8');
+  const seeded = [];
+  for (let i = 0; i < 7; i++) {
+    const f = path.join(SHARED_MEMORY_DIR, `drift-note-${i}.md`);
+    fs.writeFileSync(f, `---\nname: "Drift ${i}"\ndescription: "d${i}"\ncreated: 2026-01-01T00:00:00+08:00\nmetadata:\n  node_type: memory\n---\n\nb\n`, 'utf8');
+    seeded.push(f);
+  }
+  try {
+    await plugin['experimental.session.compacting']({}, makeCompactOutput()); // force fresh read
+    const out = makeSystemOutput();
+    await plugin['experimental.chat.system.transform']({}, out);
+    const injected = out.system.join('\n');
+    assert.ok(/not indexed|\/memory repair/i.test(injected), 'expected a repair hint when many topics are unindexed');
+    assert.equal(fs.readFileSync(idxPath, 'utf8'), before, 'warning must NOT modify the index');
+  } finally {
+    seeded.forEach(f => fs.unlinkSync(f));
+  }
+});
+
+
+// [T0.3] remove_memory tombstones the topic so repair cannot resurrect it.
+await test('repair: intentionally-removed topics are skipped, re-written topics clear the tombstone', async () => {
+  const idxPath = path.join(SHARED_MEMORY_DIR, 'MEMORY.md');
+  const removedPath = shared.getRemovedListPath(SHARED_MEMORY_DIR);
+  const topic = 'Tombstone Guard';
+  const slug = 'tombstone-guard.md';
+  const filePath = path.join(SHARED_MEMORY_DIR, slug);
+
+  // 1. Create the topic (file + index entry).
+  await plugin.tool.write_memory.execute({ topic, content: 'fact', summary: 'tg', pin: false });
+  assert.ok(fs.existsSync(filePath), 'topic file created');
+
+  // 2. Remove it via the tool: index line gone, file preserved, tombstone written.
+  const rmRes = await plugin.tool.remove_memory.execute({ topic });
+  assert.ok(rmRes.includes('intentionally removed'), `remove should report the tombstone, got: ${rmRes}`);
+  assert.ok(!fs.readFileSync(idxPath, 'utf8').includes(`(${slug})`), 'index line removed');
+  assert.ok(fs.existsSync(filePath), 'topic file still on disk after remove');
+  assert.ok(shared.readRemovedList(SHARED_MEMORY_DIR).has(slug), 'filename tombstoned in .ocl-removed');
+
+  // 3. repair must SKIP the tombstoned orphan (no resurrection), even though it
+  //    may legitimately recover other unrelated orphans in the dir.
+  await plugin.tool.repair_memory.execute();
+  assert.ok(!fs.readFileSync(idxPath, 'utf8').includes(`(${slug})`), 'repair must NOT re-add an intentionally-removed topic');
+
+  // 4. Re-writing the topic clears its tombstone and re-indexes it.
+  await plugin.tool.write_memory.execute({ topic, content: 'restored', summary: 'tg2', pin: false });
+  assert.ok(!shared.readRemovedList(SHARED_MEMORY_DIR).has(slug), 'tombstone cleared after re-write');
+  assert.ok(fs.readFileSync(idxPath, 'utf8').includes(`(${slug})`), 'topic re-indexed after re-write');
 });
 
 

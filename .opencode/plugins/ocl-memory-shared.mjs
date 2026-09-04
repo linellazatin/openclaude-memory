@@ -54,8 +54,16 @@ const DEFAULT_STALE_DAYS = 180;
 const DEFAULT_INJECT_INTERVAL = 5;
 
 const LOCK_STALE_MS = 10000;
-const LOCK_ACQUIRE_TIMEOUT_MS = 500;
+const LOCK_ACQUIRE_TIMEOUT_MS = 500;      // local, best-effort single poll window
+const LOCK_ACQUIRE_TIMEOUT_MS_SHARED = 2000; // shared, per poll window (see withLock retry)
+const LOCK_RETRY_DELAY_MS = 1000;         // strict mode: sleep, then one more full window
+const LOCK_STALE_HARD_MS = 60000;         // unparseable-pid locks may only be stolen past this
 const LOCK_POLL_INTERVAL_MS = 25;
+
+// Thrown by withLock() in strict (shared_dir) mode when the lock could not be
+// acquired within its full patience window (poll + one sleep + poll again).
+// Callers translate this into a "store busy" tool result instead of writing.
+export class LockContendedError extends Error {}
 
 const INITIAL_RULES_JSONC = `{
   // What to always persist
@@ -119,6 +127,47 @@ export function getDirtySentinel(memDir) {
   return path.join(memDir, '.invalidate');
 }
 
+// Tombstone list of INTENTIONALLY removed topics (via remove_memory). One
+// topic filename per line, stored inside the ACTIVE memory dir. repair_memory
+// skips anything listed here so a deliberate removal is never resurrected as
+// an "orphan" by a later co-tenancy repair. Tool-private (like our collision
+// suffix): other tools neither write nor read it. A topic re-written by
+// write_memory has its entry cleared.
+export function getRemovedListPath(memDir) {
+  return path.join(memDir, '.ocl-removed');
+}
+
+export function readRemovedList(memDir) {
+  try {
+    return new Set(
+      fs.readFileSync(getRemovedListPath(memDir), 'utf8')
+        .split('\n')
+        .map(s => s.trim())
+        .filter(s => s && isSafeFilename(s))
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+export function addToRemovedList(memDir, filename) {
+  const set = readRemovedList(memDir);
+  if (set.has(filename)) return; // deduped
+  set.add(filename);
+  ensureMemoryDir(memDir);
+  atomicWriteFileSync(getRemovedListPath(memDir), [...set].join('\n') + '\n');
+}
+
+export function removeFromRemovedList(memDir, filename) {
+  const set = readRemovedList(memDir);
+  if (!set.has(filename)) return; // no-op, avoid a needless write
+  set.delete(filename);
+  atomicWriteFileSync(
+    getRemovedListPath(memDir),
+    set.size ? [...set].join('\n') + '\n' : ''
+  );
+}
+
 export function ensureMemoryDir(dir = MEMORY_DIR) {
   fs.mkdirSync(dir, { recursive: true });
 }
@@ -138,26 +187,32 @@ export function sleep(ms) {
 // Cross-process advisory lock. Guards MEMORY.md read-modify-write sections so
 // concurrent writers (this plugin's tools, the TUI, or another process/tool
 // sharing the same dir) don't interleave writes into corrupted or duplicated
-// index lines. wx create fails if the lock already exists; a lock older than
-// LOCK_STALE_MS is assumed abandoned (crashed holder) and reclaimed.
-// If contention persists past LOCK_ACQUIRE_TIMEOUT_MS, proceeds without the
-// lock rather than hanging indefinitely — best-effort, not a hard guarantee.
-export async function acquireLock(memDir) {
+// index lines. wx create fails if the lock already exists. A lock older than
+// LOCK_STALE_MS is a reclaim CANDIDATE, but is only actually stolen when its
+// recorded pid is provably dead (process.kill(pid, 0) throws) — never from a
+// live holder. A lock with an unparseable pid (older tools / openpi-memory
+// wrote a bare pid or empty file) is only stolen past LOCK_STALE_HARD_MS, so
+// it is at worst briefly unfair, never silently clobbering an active writer.
+// Returns the lockPath on success, or null after `timeoutMs` of contention.
+// Callers that must not proceed unlocked should use withLock() instead.
+export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS) {
   ensureMemoryDir(memDir);
   const lockPath = path.join(memDir, '.lock');
-  const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
       const fd = fs.openSync(lockPath, 'wx');
+      fs.writeSync(fd, `${process.pid}\t${Date.now()}`);
       fs.closeSync(fd);
       return lockPath;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
       try {
         const stat = fs.statSync(lockPath);
-        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+        const age = Date.now() - stat.mtimeMs;
+        if (age > LOCK_STALE_MS && !lockHolderAlive(lockPath, age)) {
           try { fs.unlinkSync(lockPath); } catch {}
-          continue; // retry acquire immediately after reclaiming
+          continue; // retry acquire immediately after reclaiming a dead holder
         }
       } catch {}
       if (Date.now() > deadline) return null;
@@ -166,9 +221,53 @@ export async function acquireLock(memDir) {
   }
 }
 
+// True if the lock's recorded pid refers to a still-running process. An
+// unparseable/absent pid is treated as "assume alive" unless the lock is far
+// past the soft stale window (LOCK_STALE_HARD_MS), to avoid stealing a lock
+// from a co-tenant that writes an empty or pid-only file.
+function lockHolderAlive(lockPath, age) {
+  let pid;
+  try {
+    const raw = fs.readFileSync(lockPath, 'utf8').trim();
+    pid = parseInt(raw.split('\t')[0], 10);
+  } catch {
+    pid = NaN;
+  }
+  if (Number.isInteger(pid)) {
+    try { process.kill(pid, 0); return true; } catch { return false; } // ESRCH → dead
+  }
+  return age <= LOCK_STALE_HARD_MS; // unknown pid: alive unless very old
+}
+
 export function releaseLock(lockPath) {
   if (!lockPath) return;
   try { fs.unlinkSync(lockPath); } catch {}
+}
+
+// Run `fn` while holding the directory lock. This is the single entry point
+// every mutation should use (server tools, TUI, carry-over) so the
+// contention/retry policy lives in one place.
+//   - Default (strict: false): best-effort. If the lock can't be acquired
+//     within timeoutMs, `fn` still runs WITHOUT the lock. Correct for a local,
+//     single-writer directory; preserves prior non-blocking behavior.
+//   - strict: true (used whenever shared_dir is active): never run `fn`
+//     unlocked. On contention, poll one window; if that fails, sleep
+//     LOCK_RETRY_DELAY_MS and poll again; if STILL contended, throw
+//     LockContendedError so the caller reports "store busy" instead of
+//     clobbering a co-tenant's in-flight index update.
+export async function withLock(memDir, fn, { strict = false, timeoutMs } = {}) {
+  const tmo = timeoutMs != null ? timeoutMs : (strict ? LOCK_ACQUIRE_TIMEOUT_MS_SHARED : LOCK_ACQUIRE_TIMEOUT_MS);
+  const lockPath = await acquireLock(memDir, tmo);
+  if (lockPath) {
+    try { return await fn(); } finally { releaseLock(lockPath); }
+  }
+  if (!strict) return await fn(); // best-effort proceed without the lock
+  await sleep(LOCK_RETRY_DELAY_MS);
+  const retryPath = await acquireLock(memDir, tmo);
+  if (retryPath) {
+    try { return await fn(); } finally { releaseLock(retryPath); }
+  }
+  throw new LockContendedError('memory store busy — could not acquire lock after retry');
 }
 
 export const stripJsonc = raw => {
@@ -285,17 +384,12 @@ export async function maybeCarryOverToSharedDir(config) {
   try {
     const sharedDir = SHARED_MEMORY_DIR;
     ensureMemoryDir(sharedDir);
-    const lockPath = await acquireLock(sharedDir);
-    try {
-      mergeLocalIntoSharedDir(sharedDir);
-    } finally {
-      releaseLock(lockPath);
-    }
+    await withLock(sharedDir, () => mergeLocalIntoSharedDir(sharedDir), { strict: true });
     fs.writeFileSync(CARRY_OVER_SENTINEL, '');
   } catch {
     // best-effort — carry-over failure should never break normal operation;
-    // sentinel intentionally not written on failure so a retry can happen
-    // on the next process start
+    // sentinel intentionally not written on failure (including a busy lock,
+    // retried via withLock) so a retry can happen on the next process start
   }
 }
 
