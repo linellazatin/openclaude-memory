@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.5] - 2026-09-15 - Markdown / flatfile index-integrity hardening.
+
+`MEMORY.md` is a line-oriented flatfile (one topic = one index line), but topic names and summaries are free-form markdown. This release closes the gap between the two, plus a JSONC-parser and a filename-validation hardening.
+
+### Fixed
+
+- **Phantom index-line injection**: a `topic` or `summary` containing a newline used to be written verbatim into an index line, splitting one record into two physical lines. Under `shared_dir` (where foreign index lines are trusted on read) a crafted summary could therefore inject an arbitrary `- [Name](file)` entry. `sanitizeIndexField` now collapses newlines to spaces and strips link-breaking `[`, `]`, `(`, `)` from the name and summary before they reach the index. Topic-file *content* is unchanged (newlines there are normal).
+- **Link-metacharacter topic names**: a `]` in a topic name silently broke `parseIndexLine` on read-back, making the entry invisible to every tool and the TUI while its file remained on disk (drift). Names are now sanitized at the source so the whole write path (slug, name-match, frontmatter, index) uses one consistent clean value.
+- **Block comments in `memory.jsonc`**: `stripJsonc` handled only `//` line comments, so a valid `/* … */` JSONC comment made the entire config fail to parse — silently reverting every setting to defaults (only a `console.error`) and injecting raw JSONC into the prompt. `stripJsonc` is now string-literal-aware for both comment styles.
+
+### Changed
+
+- **`isSafeFilename` hardened**: filenames are now also rejected if they start with a `.` (tool-internal / hidden files: `.ocl-removed`, `.lock`, dotfiles) or contain `[]()` (which break the `- [name](filename)` index shape). Applied automatically at every existing read-time boundary — the TUI hides such entries, `remove_memory`/`pin_memory`/`write_memory` refuse them, and `repair_memory` skips such orphan files.
+- A topic whose name has no slug-formable characters (e.g. `"!!!"`) is rejected with a clear error instead of producing a `.md` file that the read-back guard would then silently orphan.
+
+### Tests
+
+- 79 → 86: newline-in-summary injection, newline/bracket topic collapse, paren-in-filename entry hidden + refused, leading-dot file skipped by repair, `/* */` block-comment parsing, `*/`-inside-a-string safety, and the extended `isSafeFilename` rejections.
+
 ## [0.6.4] - 2026-09-02 - Hardening for live `shared_dir` with openpi-memory.
 
 ### Fixed

@@ -85,4 +85,10 @@ No. Automatic compaction fires at the end of a complete LLM step (opencode's `st
 
 **Q: Why did the size caps increase in v0.6.0 (`max_lines` 200→300, byte cap 25KB→50KB)? Does this affect my existing `MEMORY.md`?**
 No. The caps only control how much of `MEMORY.md` gets **injected** into the system prompt (and when the truncation warning appears) — they don't touch the file on disk. An existing index that was previously near the old 200-line/25KB limit is now simply further from the new limit; nothing was rewritten or migrated because of this change.
+
+**Q: `MEMORY.md` is a flatfile where one topic = one line. What stops a topic name or summary from breaking that?**
+Since v0.6.5 the plugin sanitizes the two free-text fields that land on an index line. Newlines in a `topic` or `summary` are collapsed to spaces and link-breaking characters (`[`, `]`, `(`, `)`) are stripped before the line is written, so a value can never split one record into two lines or inject a phantom `- [Name](file)` entry (a real hazard under `shared_dir`, where a co-tenant trusts foreign lines). Filenames are held to the same shape: `isSafeFilename` now also rejects a leading dot (`.lock`, `.ocl-removed`, hidden files) and any `[]()` — so a corrupted or foreign index entry whose filename can't round-trip is hidden by the TUI and refused by the tools rather than silently mishandled. Topic-file *content* is unaffected (newlines there are normal markdown).
+
+**Q: Can I use `/* … */` block comments in `memory.jsonc`?**
+Yes as of v0.6.5. Previously only `//` line comments were stripped, so a `/* */` comment made the whole file fail to parse and silently reverted your config to defaults while injecting raw JSONC into the prompt. `stripJsonc` is now string-literal-aware for both comment styles (a `//` or `*/` inside a quoted value stays part of the value).
 </content>

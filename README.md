@@ -6,6 +6,12 @@
 OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
 >
+> ## v0.6.5 — markdown/flatfile index integrity
+> - a topic name or summary can no longer break the "one topic = one line" index contract: newlines are collapsed and `[]()` stripped before an index line is written (blocks phantom-entry injection under `shared_dir`)
+> - `isSafeFilename` now also rejects leading-dot files (`.lock`, `.ocl-removed`, hidden `.md`) and any `[]()` in a filename — hidden from the TUI, refused by the tools, skipped by repair
+> - `memory.jsonc` now accepts `/* … */` block comments (string-literal-aware, like the existing `//` handling) instead of silently reverting to defaults
+> - 7 new tests (79 → 86)
+>
 > ## v0.6.4 — memory dir hardening
 > - writes now fail closed (wait + auto-retry once, then "busy") under `shared_dir` instead of ever writing unlocked — a co-tenant's in-flight write is never clobbered
 > - `.lock` is PID-stamped with a real liveness check before stale reclaim — a live slow holder is never stolen from

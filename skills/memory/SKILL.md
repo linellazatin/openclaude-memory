@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.6.4
+version: 0.6.5
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -134,7 +134,7 @@ Call `write_memory` with the same `topic` name and one of two modes:
 ### Index discipline
 
 - `MEMORY.md` must stay under the configured `max_lines` limit (default 300; set via `"max_lines"` in `memory.jsonc`). One line per topic.
-- Never expand an index entry beyond one line. Put detail in the topic file.
+- Never expand an index entry beyond one line. Put detail in the topic file. (The plugin enforces this: newlines and link-breaking `[]()` characters in a topic name or summary are stripped before the index line is written, so one record can never split into two lines or inject a phantom entry.)
 - After any write, verify `MEMORY.md` line count and trim if needed.
 - Entries with `[pin]` are exempt from all cleanup and staleness logic — never suggest removing them.
 
