@@ -231,12 +231,28 @@ function toSlug(topic) {
     .replace(/-+/g, '-');
 }
 
+// A MEMORY.md record is ONE physical line: `- [name](file.md) date -- summary`.
+// The topic name and summary are user/agent text that could otherwise contain
+// newlines (which would split one record into two, letting a crafted summary
+// inject a phantom index line — a real hazard under shared_dir where a
+// co-tenant trusts foreign lines) or `[]()` (which break parseIndexLine).
+// Collapse newlines to spaces and strip link metacharacters before a value
+// lands on an index line. Frontmatter is already safe (JSON.stringify escapes
+// newlines); this covers the flatfile index only.
+function sanitizeIndexField(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[[\]()]/g, '');
+}
+
 // --- Index upsert ---
 // Finds and updates an existing index line for the given filename, or appends a new one.
 // Returns updated lines array.
 
 function upsertIndexLine(lines, filename, name, summary, pin) {
   const dateStr = nowIso();
+  name = sanitizeIndexField(name);
+  summary = sanitizeIndexField(summary);
 
   for (let i = 0; i < lines.length; i++) {
     const parsed = parseIndexLine(lines[i]);
@@ -273,7 +289,10 @@ function readFrontmatter(filePath) {
     return {
       name: grab('name') || fallbackName,
       description: grab('description'),
-      ts: grab('last_updated') || grab('created') || nowIso(),
+      // strip newlines so a malformed co-tenant timestamp can never split an
+      // index record across two physical lines (brackets are dropped by
+      // sanitizeIndexField at the repair emit site)
+      ts: (grab('last_updated') || grab('created') || nowIso()).replace(/[\r\n]+/g, ' ').trim(),
     };
   } catch {
     return { name: fallbackName, description: '', ts: nowIso() };
@@ -317,7 +336,7 @@ function repairMemoryIndex({ memDir, memIndex }) {
     if (indexed.has(file)) continue;           // already present — additive only
     if (removed.has(file)) continue;           // deliberately removed via remove_memory — skip
     const fm = readFrontmatter(path.join(memDir, file));
-    added.push(`- [${fm.name}](${file}) ${fm.ts} [stale?] -- ${fm.description || fm.name}`);
+    added.push(`- [${sanitizeIndexField(fm.name)}](${file}) ${fm.ts} [stale?] -- ${sanitizeIndexField(fm.description || fm.name)}`);
     indexed.add(file);
   }
   if (added.length) {
@@ -356,6 +375,12 @@ const tools = {
       if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
       if (typeof content !== 'string') return 'Error: content is required and must be a string.';
       if (typeof summary !== 'string') return 'Error: summary is required and must be a string.';
+      // Sanitize the topic up front so filename matching, frontmatter name, and
+      // the index line all use the SAME clean value (a raw `]` in the name
+      // would otherwise break parseIndexLine on read-back). A topic of only
+      // metacharacters sanitizes to empty -> treat as missing.
+      const cleanTopic = sanitizeIndexField(topic).trim();
+      if (!cleanTopic) return 'Error: topic is required and must be a non-empty string.';
       const pinBool = pin === true || pin === 'true';
 
       const { config } = await getCache();
@@ -371,11 +396,17 @@ const tools = {
             : INITIAL_MEMORY;
 
           // Check if an existing index entry matches this topic name — use its filename if so
-          let filename = toSlug(topic) + '.md';
+          let filename = toSlug(cleanTopic) + '.md';
+          // A topic with no slug-formable characters (e.g. "!!!") would produce
+          // ".md" — reject cleanly rather than write a file the read-back guard
+          // (isSafeFilename rejects leading-dot names) would silently orphan.
+          if (!isSafeFilename(filename)) {
+            return 'Error: topic must contain at least one letter or digit to form a valid filename.';
+          }
           let matchedExisting = false;
           for (const line of rawIndex.split('\n')) {
             const parsed = parseIndexLine(line);
-            if (parsed && parsed.name.toLowerCase() === topic.toLowerCase()) {
+            if (parsed && parsed.name.toLowerCase() === cleanTopic.toLowerCase()) {
               if (!isSafeFilename(parsed.filename)) {
                 return `Entry has an unsafe filename (${parsed.filename}) and was not modified. This may indicate a corrupted index — inspect it manually.`;
               }
@@ -408,7 +439,7 @@ const tools = {
           if (!fs.existsSync(topicPath)) {
             isNew = true;
             const now = nowIso();
-            const frontmatter = `---\nname: ${JSON.stringify(topic)}\ndescription: ${JSON.stringify(summary)}\ncreated: ${now}\nlast_updated: ${now}\nmetadata:\n  node_type: memory\n---\n\n`;
+            const frontmatter = `---\nname: ${JSON.stringify(cleanTopic)}\ndescription: ${JSON.stringify(summary)}\ncreated: ${now}\nlast_updated: ${now}\nmetadata:\n  node_type: memory\n---\n\n`;
             atomicWriteFileSync(topicPath, frontmatter + content + '\n');
           } else if (mode === 'replace') {
             const now = nowIso();
@@ -441,14 +472,14 @@ const tools = {
           // Update index
           let lines = rawIndex.split('\n');
 
-          lines = upsertIndexLine(lines, filename, topic, summary, pinBool);
+          lines = upsertIndexLine(lines, filename, cleanTopic, summary, pinBool);
           lines = maintainIndex(lines, config, memDir);
 
           atomicWriteFileSync(memIndex, lines.join('\n'));
           removeFromRemovedList(memDir, filename); // re-storing clears any prior intentional-removal tombstone
           invalidateCache(); // nuke cache so the next caller re-reads the fresh index
 
-          return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${memIndex}\nEntry: [${topic}](${filename}) ${nowIso()} -- ${summary}`;
+          return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${memIndex}\nEntry: [${cleanTopic}](${filename}) ${nowIso()} -- ${sanitizeIndexField(summary)}`;
         }, { strict: config.sharedDir });
       } catch (e) {
         if (e instanceof LockContendedError) return BUSY_MESSAGE;

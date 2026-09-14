@@ -298,22 +298,39 @@ export const stripJsonc = raw => {
       i--; // land back on '\n' (or raw.length) so the for-loop's i++ is correct
       continue;
     }
+    // Block comment: /* ... */ — only outside a string literal. A `*/` inside
+    // a config value (e.g. a path glob) must NOT terminate it early.
+    if (ch === '/' && raw[i + 1] === '*') {
+      i += 2;
+      while (i < raw.length && !(raw[i] === '*' && raw[i + 1] === '/')) i++;
+      i++; // land on the '/' of the closing '*/' so the for-loop's i++ skips it
+      continue;
+    }
     out += ch;
   }
   return out.replace(/,\s*([}\]])/g, '$1');
 };
 
-// Rejects filenames that could escape memDir (path separators, `..` segments).
-// toSlug() already prevents these on the write path for brand-new topics, but
-// a filename read back from an existing MEMORY.md index line is otherwise
+// Rejects filenames that could escape memDir (path separators, `..` segments)
+// or corrupt the line-oriented MEMORY.md index. Brackets/parens are rejected
+// because they break parseIndexLine's `- [name](filename)` shape, and a
+// leading dot marks tool-internal / hidden files (.ocl-removed, .lock, dotfiles)
+// that are never topics. toSlug() already prevents all of these on the write
+// path for brand-new topics, but a filename read back from an existing
+// MEMORY.md index line (or a co-tenant's directory listing) is otherwise
 // trusted verbatim — apply this before using such a filename in any path.join
 // or file operation.
 export function isSafeFilename(filename) {
   return typeof filename === 'string'
     && filename.length > 0
+    && !filename.startsWith('.')
     && !filename.includes('/')
     && !filename.includes('\\')
-    && !filename.includes('..');
+    && !filename.includes('..')
+    && !filename.includes('[')
+    && !filename.includes(']')
+    && !filename.includes('(')
+    && !filename.includes(')');
 }
 
 export function parseRules(raw) {
