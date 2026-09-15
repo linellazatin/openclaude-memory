@@ -1,8 +1,13 @@
 # openclaude-memory
 
+<div align="center">
+
+[![gh stars](https://img.shields.io/github/stars/linellazatin/openclaude-memory?logo=github&color=ffffe0)](https://github.com/linellazatin/openclaude-memory)
 [![npm version](https://img.shields.io/npm/v/@openlines/openclaude-memory)](https://www.npmjs.com/package/@openlines/openclaude-memory)
+[![npm downloads](https://img.shields.io/npm/dm/@openlines/openclaude-memory?logo=npm&color=cb3837)](https://www.npmjs.com/package/@openlines/openclaude-memory)
 [![license](https://img.shields.io/npm/l/@openlines/openclaude-memory)](./LICENSE)
 
+</div>
 OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
 >
@@ -26,13 +31,6 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 > - 50 KB is now a real bound on injected index content, not just a warning
 > - shared-dir merge indexes an identical pre-existing topic file when its index line is missing
 > - 3 new regressions (65 → 68); external manual edits now documented accurately
->
-> ## v0.6.2 — bugfixes & hardening
-> - filename slug collisions no longer silently merge two topics into one file
-> - `stripJsonc` no longer breaks on `//` in config values (URLs etc) — now warns instead of silently resetting to defaults
-> - memory tools reject bad/missing args cleanly instead of throwing
-> - closed a path-traversal gap on filenames read back from `MEMORY.md`
-> - 17 new tests (48 → 65), incl. real multi-process lock contention, byte-cap truncation, and the `-oclm-2` collision fallback
 >
 > see [CHANGELOG](CHANGELOG.md) for more details
 
