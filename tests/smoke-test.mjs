@@ -1503,6 +1503,100 @@ await test('repair: intentionally-removed topics are skipped, re-written topics 
 
 
 // ═══════════════════════════════════════════════════════════
+// 20. v0.6.5 markdown/flatfile integrity (index-line injection, block
+//     comments, leading-dot/bracket filenames)
+//     Runs against the LOCAL dir.
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n--- 20. markdown/flatfile index integrity ---');
+
+writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5, "shared_dir": false }');
+await plugin['experimental.session.compacting']({}, makeCompactOutput()); // force local-dir resolution
+
+// [G1] a newline in the summary must not split one record into two lines and
+// inject a phantom entry. Brackets/parens in the injected text are also stripped.
+await test('write_memory: newline in summary does not inject a phantom index entry', async () => {
+  await plugin.tool.write_memory.execute({
+    topic: 'Newline Summary',
+    content: 'x',
+    summary: 'first\n- [INJECTED](evil.md) phantom',
+    pin: false,
+  });
+  const idx = readIndex();
+  assert.ok(idx.includes('[Newline Summary]'), 'the real entry should exist');
+  assert.ok(!idx.includes('[INJECTED]'), `link-metachar summary text must be stripped; got: ${idx.split('\n').filter(l => l.includes('INJECTED')).join(' | ')}`);
+  assert.ok(!idx.split('\n').some(l => shared.parseIndexLine(l) && shared.parseIndexLine(l).filename === 'evil.md'), 'no phantom evil.md entry may be indexed');
+});
+
+// [G1/G2] newlines and brackets in the topic name collapse into one clean record.
+await test('write_memory: newline/brackets in topic name collapse to a single clean entry', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Two\nLines', content: 'x', summary: 's', pin: false });
+  await plugin.tool.write_memory.execute({ topic: 'Bad]Name', content: 'x', summary: 's2', pin: false });
+  const idx = readIndex();
+  assert.ok(idx.includes('[Two Lines]'), 'newline in topic should collapse to a space');
+  assert.ok(idx.includes('[BadName]'), 'bracket in topic name should be stripped');
+  assert.ok(!idx.includes('[Bad]'), 'raw "[Bad]" must not appear as a link label');
+  assert.ok(fs.existsSync(path.join(MEMORY_DIR, 'two-lines.md')), 'topic slug should be clean');
+});
+
+// [G2] an index line whose filename carries a bracket/paren is treated as unsafe:
+// the TUI hides it and the server tools refuse to act on it.
+await test('corrupted index entry with a paren-in-filename is hidden by TUI and refused by tools', async () => {
+  const memIndexPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(memIndexPath, 'utf8');
+  fs.writeFileSync(memIndexPath, before.replace(/\n+$/, '') + '\n- [Paren Entry](we(ird).md) 2026-01-01T00:00:00+00:00 -- x\n', 'utf8');
+  try {
+    assert.ok(!tui.parseIndex(memIndexPath).some(e => e.name === 'Paren Entry'), 'TUI must hide a paren-filename entry as unsafe');
+    const result = await plugin.tool.remove_memory.execute({ topic: 'Paren' });
+    assert.ok(/No matching entry|unsafe/i.test(result), `remove_memory must not act on it; got: ${result}`);
+  } finally {
+    fs.writeFileSync(memIndexPath, before, 'utf8');
+  }
+});
+
+// [G4] a leading-dot file is never re-indexed as a topic by repair.
+await test('repairMemoryIndex: skips a leading-dot file even with a .md suffix', async () => {
+  const { repairMemoryIndex } = plugin.__test__ || {};
+  const dotFile = path.join(MEMORY_DIR, '.hidden-topic.md');
+  fs.writeFileSync(dotFile, '---\nname: "Hidden"\ndescription: "d"\ncreated: 2026-01-01T00:00:00+08:00\n---\n\nbody\n', 'utf8');
+  const idxPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(idxPath, 'utf8');
+  try {
+    repairMemoryIndex({ memDir: MEMORY_DIR, memIndex: idxPath });
+    const after = fs.readFileSync(idxPath, 'utf8');
+    assert.ok(!after.includes('.hidden-topic.md'), 'dotfile must NOT be recovered as a topic entry');
+  } finally {
+    fs.writeFileSync(idxPath, before, 'utf8');
+    fs.unlinkSync(dotFile);
+  }
+});
+
+// [H1] memory.jsonc block comments parse instead of silently reverting to defaults.
+await test('stripJsonc: strips /* */ block comments and parseRules keeps custom scalars', () => {
+  const stripped = shared.stripJsonc('{ /* block */ "max_lines": 250 }');
+  assert.ok(!stripped.includes('block'), 'block comment should be stripped');
+  const config = shared.parseRules('{ /* note */\n "max_lines": 250\n}');
+  assert.equal(config.maxLines, 250, 'custom max_lines should survive a block comment (old code reverted to the 300 default)');
+});
+
+await test('stripJsonc: does not strip a */ sequence inside a string value', () => {
+  // "*/" inside a string must not be read as a block-comment terminator, which
+  // would consume the rest of the file and corrupt parsing (silently reverting
+  // to defaults). max_lines surviving proves the string was not truncated.
+  const config = shared.parseRules('{ "always_ask": ["glob */ inside"], /* c */ "max_lines": 200 }');
+  assert.equal(config.maxLines, 200, 'a */ inside a string must not corrupt config parsing');
+});
+
+// [G4/G2] isSafeFilename now also rejects leading-dot and bracket/paren names.
+await test('isSafeFilename: rejects leading-dot and link-breaking filenames', () => {
+  assert.equal(shared.isSafeFilename('normal-topic.md'), true);
+  assert.equal(shared.isSafeFilename('.ocl-removed.md'), false, 'leading-dot hidden file rejected');
+  assert.equal(shared.isSafeFilename('.lock'), false, 'leading-dot file rejected');
+  assert.equal(shared.isSafeFilename('we(ird).md'), false, 'paren in filename rejected (breaks parseIndexLine)');
+  assert.equal(shared.isSafeFilename('a[b].md'), false, 'bracket in filename rejected');
+});
+
+// ═══════════════════════════════════════════════════════════
 // Results
 // ═══════════════════════════════════════════════════════════
 

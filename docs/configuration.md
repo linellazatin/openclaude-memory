@@ -56,7 +56,7 @@ The cap exists to keep per-turn token overhead bounded. At the default 300 lines
 
 ## memory.jsonc
 
-`~/.config/opencode/memory.jsonc` is auto-created on first run with sensible defaults. Edit it directly to add, remove, or modify rules, and to configure the index limits:
+`~/.config/opencode/memory.jsonc` is auto-created on first run with sensible defaults. Edit it directly to add, remove, or modify rules, and to configure the index limits. It is JSONC, so both `//` line comments and `/* … */` block comments are supported (a `//` or `*/` inside a string value — e.g. a URL or glob — is treated as text, not a comment).
 
 ```jsonc
 {
