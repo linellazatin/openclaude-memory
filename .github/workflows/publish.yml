@@ -21,7 +21,26 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
-      
+
+      - name: Syntax-check plugin and test sources
+        run: |
+          for f in .opencode/plugins/*.mjs tests/*.mjs; do node --check "$f"; done
+
+      - name: Run smoke tests
+        run: npm test
+
+      # Version consistency has no single source of truth in this repo (package.json,
+      # SKILL.md frontmatter, and the tag must all agree; the release body is scraped
+      # from the matching CHANGELOG heading) — gate the publish on it.
+      - name: Validate version consistency (tag / package.json / SKILL.md / CHANGELOG)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          SKILL=$(grep -m1 '^version:' skills/memory/SKILL.md | sed 's/^version: *//')
+          [ "$PKG" = "$VERSION" ] || { echo "tag v$VERSION does not match package.json ($PKG)"; exit 1; }
+          [ "$SKILL" = "$VERSION" ] || { echo "tag v$VERSION does not match SKILL.md ($SKILL)"; exit 1; }
+          grep -q "^## \[$VERSION\]" CHANGELOG.md || { echo "CHANGELOG.md has no ## [$VERSION] entry — release body would be empty"; exit 1; }
+
       - name: Extract changelog for this version
         id: changelog
         run: |
