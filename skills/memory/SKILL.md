@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.6.5
+version: 0.6.6
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -24,12 +24,12 @@ Global memory persists across all opencode sessions. It lives at:
 
 ## Available tools
 
-The plugin registers three native tools. Use these instead of raw Write/Edit tools for all memory operations — they handle file format, frontmatter, and index maintenance automatically.
+The plugin registers four native tools. Use these instead of raw Write/Edit tools for all memory operations — they handle file format, frontmatter, and index maintenance automatically.
 
 | Tool | Args | What it does |
 |---|---|---|
 | `write_memory` | `topic`, `content`, `summary`, `pin?`, `mode?` | Creates or appends to a topic file; upserts MEMORY.md index entry |
-| `remove_memory` | `topic` | Removes the index entry (refuses if pinned); topic file preserved on disk and tombstoned in `.ocl-removed` so `repair_memory` won't resurrect it |
+| `remove_memory` | `topic` | Removes the index entry (refuses if pinned; partial match must be unique — exact name wins, ambiguous matches are refused); topic file preserved on disk and tombstoned in `.ocl-removed` so `repair_memory` won't resurrect it |
 | `pin_memory` | `topic`, `pin` (bool) | Pins or unpins an index entry |
 | `repair_memory` | — | Additively re-indexes topic files on disk missing from MEMORY.md (marked `[stale?]`); idempotent; skips tombstoned (intentionally removed) files. Mostly for `shared_dir` co-tenancy drift. |
 
@@ -219,7 +219,7 @@ Writes to the shared directory are protected by a cross-process advisory lock (`
 
 ## Consolidation
 
-`/memory consolidate` reviews the current conversation for facts that match `always_persist` in `memory.jsonc` but haven't been written yet, calls `write_memory` for each, and writes or updates a `Session Recap (openclaude)` topic (`ocl-last-session-recap.md`, `mode: "replace"`, unpinned — it's meant to be overwritten every session, not accumulated). The `ocl-` prefix keeps it distinct from openpi-memory's reserved `last-session-recap` slug, which that tool strips from a shared index every session.
+`/memory consolidate` reviews the current conversation for facts that match `always_persist` in `memory.jsonc` but haven't been written yet, calls `write_memory` for each, and writes or updates a `OCL Last Session Recap` topic (`ocl-last-session-recap.md`, `mode: "replace"`, unpinned — it's meant to be overwritten every session, not accumulated). The `ocl-` prefix keeps it distinct from openpi-memory's reserved `last-session-recap` slug, which that tool strips from a shared index every session.
 
 Setting `"consolidate_on_compact": true` in `memory.jsonc` runs the same consolidation automatically after opencode's automatic (threshold-triggered) compaction, replacing opencode's default synthetic "continue" message. To avoid re-scanning the whole conversation, the consolidation turn is seeded with the compaction summary opencode just generated, and it tells the agent to resume any pending work from the summary's "Next Move" section afterwards — so consolidation persists the session's facts without abandoning an in-progress task. Default is `false` — opencode already sends that default continue message on its own; this setting only matters if you want a consolidation pass to run instead. **This only fires on automatic (overflow-triggered) compaction.** Manual `/compact` does not trigger consolidation — run `/memory consolidate` explicitly if you compact manually and want the same effect.
 
