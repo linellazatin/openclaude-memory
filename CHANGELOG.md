@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.6] - 2026-09-21 - Co-tenancy audit fixes.
+
+### Fixed
+
+- **Ambiguous partial matches refused**: `remove_memory`/`pin_memory` no longer mutate the first substring hit — an exact name wins, multiple partial candidates are reported and nothing is touched (openpi-memory parity).
+- **Lock double-reclaim race**: `.lock` now holds a `pid\tts\trand` token; stale reclaim re-verifies inode+mtime before unlinking (two simultaneous reclaimers can't clobber each other's fresh lock) and release is compare-and-delete.
+- **Stuck drift note**: the `/memory repair` maintenance note no longer counts intentionally-removed (tombstoned) files, so it can't persist forever after repeated removals.
+- **Repair timestamp forgery**: `repair_memory` sanitizes recovered frontmatter timestamps — a corrupted co-tenant `last_updated:` can no longer forge a `[pin]` onto an index line.
+- **Split-brain consolidation recap**: the recap now uses one canonical topic, `OCL Last Session Recap`, whose slug is exactly `ocl-last-session-recap.md` (the old prompt promised a filename it never produced).
+- **TUI over-match**: `setPin`/`removeEntry` act only on the parsed entry line, never on a foreign line whose summary merely mentions `](file.md)`.
+- **Carry-over retry**: a failed or lock-contended first merge is retried on the next cache refresh within the same process, not only on the next session.
+
+### Changed
+
+- `write_memory` collapses `summary` whitespace and caps it at 500 chars (openpi parity) before frontmatter, index, and result message.
+- `.ocl-removed` is now documented as shared: openpi-memory reads/writes the same file in the shared dir, so either tool's removals are honored by both.
+
+### Tests
+
+- 86 → 92: ambiguous-match refusal, lock token + stolen-lock release, tombstone-aware drift count, repair timestamp sanitizing, summary cap, TUI parse-based matching.
+
 ## [0.6.5] - 2026-09-15 - Markdown / flatfile index-integrity hardening.
 
 `MEMORY.md` is a line-oriented flatfile (one topic = one index line), but topic names and summaries are free-form markdown. This release closes the gap between the two, plus a JSONC-parser and a filename-validation hardening.
