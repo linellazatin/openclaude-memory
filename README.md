@@ -10,6 +10,21 @@
 </div>
 OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai) sessions. Inspired by Claude Code's auto-memory — your agent remembers what it learns, across every session, globally.
 
+> <div align="center">
+>
+> ### An [upgraded, small, and deterministic SQLite core (FTS5/BM25) for coding-agent memory](https://github.com/linellazatin/nanomneme) is currently in development - which also has an **opencode** adapter. Feel free to check it out, specially if you're already tired of flat-files as memory store (I won't stop you, though).
+> #### Once nanomneme has been fully adapted, and tested end-to-end, there's a big possibility that we'll be migrating to nanomneme infrastructure for memory system.
+>
+> </div>
+
+>
+> ## v0.6.6 — co-tenancy audit fixes (match safety, lock tokens, drift hygiene)
+> - `remove_memory`/`pin_memory` now refuse ambiguous partial matches instead of silently mutating the first matching entry; exact names win outright (openpi-memory parity)
+> - `.lock` carries a `pid\tts\trand` token: stale reclaim re-verifies the file before unlinking (no two-reclaimer lock clobber), and release is compare-and-delete
+> - drift maintenance note no longer counts intentionally-removed (tombstoned) files — it can't get stuck after repeated removals
+> - `repair_memory` sanitizes recovered frontmatter timestamps so a corrupted co-tenant file can't forge a `[pin]` onto an index line; summaries are collapsed + capped at 500 chars; consolidation recap is now one canonical topic (`OCL Last Session Recap`)
+> - TUI pin/remove match only the parsed entry line, never a line that merely mentions another topic's link; failed carry-over merges now retry within the session
+> - 6 new tests (86 → 92)
 >
 > ## v0.6.5 — markdown/flatfile index integrity
 > - a topic name or summary can no longer break the "one topic = one line" index contract: newlines are collapsed and `[]()` stripped before an index line is written (blocks phantom-entry injection under `shared_dir`)
@@ -25,12 +40,6 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 > - topic frontmatter quoted + recap renamed (`ocl-last-session-recap.md`) to align with openpi-memory
 > - append-mode `last_updated` bump is now frontmatter-scoped, the last unlocked read-path index write is gone, and TUI mutations guard a missing index
 > - 11 new tests (68 → 79)
->
-> ## v0.6.3 — shared-store safety + real caps
-> - closes remaining unsafe-filename paths in `write_memory` and the TUI
-> - 50 KB is now a real bound on injected index content, not just a warning
-> - shared-dir merge indexes an identical pre-existing topic file when its index line is missing
-> - 3 new regressions (65 → 68); external manual edits now documented accurately
 >
 > see [CHANGELOG](CHANGELOG.md) for more details
 
@@ -103,20 +112,20 @@ See [How opencode Keeps Memory in Context](docs/memory-injection.md) for the ful
 
 ## Native tools
 
-The plugin registers three tools that the agent calls directly. These replace raw Write/Edit file operations for all memory writes.
+The plugin registers four tools that the agent calls directly. These replace raw Write/Edit file operations for all memory writes.
 
 | Tool | Args | What it does |
 |---|---|---|
-| `write_memory` | `topic`, `content`, `summary`, `pin?`, `mode?` | Creates a new topic file with YAML frontmatter, or updates an existing one. `mode: "append"` (default) adds content under a new dated heading; `mode: "replace"` overwrites the body while preserving frontmatter. Upserts the `MEMORY.md` index entry automatically. |
-| `remove_memory` | `topic` | Removes the index entry (case-insensitive match). Refuses if the entry is pinned. Topic file is preserved on disk and its filename is tombstoned in `.ocl-removed` so `/memory repair` will not resurrect it. |
-| `pin_memory` | `topic`, `pin` (bool) | Pins (`true`) or unpins (`false`) an index entry. Pinned entries are never flagged as stale and cannot be removed. |
+| `write_memory` | `topic`, `content`, `summary`, `pin?`, `mode?` | Creates a new topic file with YAML frontmatter, or updates an existing one. `mode: "append"` (default) adds content under a new dated heading; `mode: "replace"` overwrites the body while preserving frontmatter. The index `summary` is collapsed to one line and capped at 500 chars. Upserts the `MEMORY.md` index entry automatically. |
+| `remove_memory` | `topic` | Removes the index entry. A partial `topic` must match exactly one entry — an exact name wins, multiple substring matches are refused with a candidate list. Refuses if the entry is pinned. Topic file is preserved on disk and its filename is tombstoned in `.ocl-removed` so `/memory repair` will not resurrect it. |
+| `pin_memory` | `topic`, `pin` (bool) | Pins (`true`) or unpins (`false`) an index entry. Same exact-wins / ambiguous-refuses matching as `remove_memory`. Pinned entries are never flagged as stale and cannot be removed. |
 | `repair_memory` | — | Additively re-indexes topic `.md` files present on disk but missing from `MEMORY.md` (marked `[stale?]`, dated from frontmatter). Idempotent; never deletes or reorders. **Skips any file tombstoned by `remove_memory`**, so intentional removals stay gone. |
 
 After every tool call that touches `MEMORY.md`, the plugin runs an index maintenance pass: removes orphaned entries (file no longer on disk), removes duplicates (keeps the more recent), and stamps or removes `[stale?]` flags. See [Configuration & Index Reference](docs/configuration.md) for the full index format and staleness rules.
 
 ## Consolidation
 
-`/memory consolidate` asks the agent to review the current conversation for facts matching `always_persist` in `memory.jsonc` that haven't been written yet, call `write_memory` for each, and write or update a `Session Recap (openclaude)` topic (`ocl-last-session-recap.md`, `mode: "replace"`, unpinned — it's overwritten every session, not accumulated).
+`/memory consolidate` asks the agent to review the current conversation for facts matching `always_persist` in `memory.jsonc` that haven't been written yet, call `write_memory` for each, and write or update a `OCL Last Session Recap` topic (`ocl-last-session-recap.md`, `mode: "replace"`, unpinned — it's overwritten every session, not accumulated).
 
 Set `"consolidate_on_compact": true` in `memory.jsonc` to run the same consolidation automatically after opencode's automatic (threshold-triggered) compaction. When enabled, this replaces opencode's default synthetic "continue" message with a consolidation turn instead. Rather than re-scanning the whole conversation, the consolidation turn is seeded with the compaction summary opencode just generated — one fewer full-conversation scan — and it tells the agent to resume any pending work from the summary's "Next Move" section afterwards, so consolidation does not abandon an in-progress task. If the summary can't be fetched, it falls back to a full-conversation scan. Default is `false` — opencode already sends that continue message on its own; this setting only matters if you want consolidation to run in its place.
 

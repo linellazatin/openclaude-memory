@@ -1,0 +1,25 @@
+name: Test
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Zero runtime deps + no lockfile, so no `npm install` step is needed.
+      # `node --check` is this repo's only static verification (no TS, no lint).
+      - name: Syntax-check plugin and test sources
+        run: |
+          for f in .opencode/plugins/*.mjs tests/*.mjs; do node --check "$f"; done
+
+      - name: Run smoke tests
+        run: npm test

@@ -20,7 +20,8 @@ export const MEMORY_CONFIG = path.join(CONFIG_ROOT, 'memory.jsonc');
 // shared dir at least once. Lives in the local dir (not the shared one) —
 // it's a property of the local install, independent of which dir is
 // currently active. Never written on a failed/partial merge, so a failed
-// attempt retries on the next process start.
+// attempt retries — within the same process on the next cache refresh, and
+// across process starts via the missing sentinel.
 export const CARRY_OVER_SENTINEL = path.join(MEMORY_DIR, '.shared-dir-migrated');
 export const MEMORY_CONFIG_LEGACY = path.join(MEMORY_DIR, 'RULES.jsonc'); // pre-0.6.0 location, fallback only
 
@@ -64,6 +65,11 @@ const LOCK_POLL_INTERVAL_MS = 25;
 // acquired within its full patience window (poll + one sleep + poll again).
 // Callers translate this into a "store busy" tool result instead of writing.
 export class LockContendedError extends Error {}
+
+// lockPath -> token THIS process wrote into it. Lets releaseLock() do a
+// compare-and-delete: never unlink a file a stale-reclaimer stole from us
+// mid-critical-section. Only ever holds locks we currently believe we own.
+const _lockTokens = new Map();
 
 const INITIAL_RULES_JSONC = `{
   // What to always persist
@@ -130,9 +136,11 @@ export function getDirtySentinel(memDir) {
 // Tombstone list of INTENTIONALLY removed topics (via remove_memory). One
 // topic filename per line, stored inside the ACTIVE memory dir. repair_memory
 // skips anything listed here so a deliberate removal is never resurrected as
-// an "orphan" by a later co-tenancy repair. Tool-private (like our collision
-// suffix): other tools neither write nor read it. A topic re-written by
-// write_memory has its entry cleared.
+// an "orphan" by a later co-tenancy repair. NOT private under shared_dir:
+// openpi-memory deliberately reads and writes the same `.ocl-removed` path
+// in the shared dir, so a removal made by either tool is honored by both.
+// In local mode the file exists only in our local dir and no one else sees
+// it. A topic re-written by write_memory has its entry cleared.
 export function getRemovedListPath(memDir) {
   return path.join(memDir, '.ocl-removed');
 }
@@ -187,12 +195,20 @@ export function sleep(ms) {
 // Cross-process advisory lock. Guards MEMORY.md read-modify-write sections so
 // concurrent writers (this plugin's tools, the TUI, or another process/tool
 // sharing the same dir) don't interleave writes into corrupted or duplicated
-// index lines. wx create fails if the lock already exists. A lock older than
-// LOCK_STALE_MS is a reclaim CANDIDATE, but is only actually stolen when its
-// recorded pid is provably dead (process.kill(pid, 0) throws) — never from a
-// live holder. A lock with an unparseable pid (older tools / openpi-memory
-// wrote a bare pid or empty file) is only stolen past LOCK_STALE_HARD_MS, so
-// it is at worst briefly unfair, never silently clobbering an active writer.
+// index lines. wx create fails if the lock already exists. The payload is a
+// token `pid\tts\trand` (field 0 pid matches openpi-memory's format, so each
+// tool parses the other's lock); releaseLock only unlinks while the content
+// still equals OUR token. A lock older than LOCK_STALE_MS is a reclaim
+// CANDIDATE, but is only actually stolen when its recorded pid is provably
+// dead (process.kill(pid, 0) throws) — and immediately before unlinking we
+// RE-STAT and compare inode+mtime against the lock we observed: a competing
+// reclaimer may already have replaced it (its wx-create succeeded after our
+// age check), and unlinking THAT would put us both inside the critical
+// section. Residual window between the recheck and the unlink is microseconds,
+// and the compare-and-delete release means neither loser clobbers the other's
+// lock on exit. A lock with an unparseable pid (foreign writer, empty file)
+// is only stolen past LOCK_STALE_HARD_MS, so it is at worst briefly unfair,
+// never silently clobbering an active writer.
 // Returns the lockPath on success, or null after `timeoutMs` of contention.
 // Callers that must not proceed unlocked should use withLock() instead.
 export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS) {
@@ -201,9 +217,11 @@ export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
+      const token = `${process.pid}\t${Date.now()}\t${Math.random().toString(36).slice(2)}`;
       const fd = fs.openSync(lockPath, 'wx');
-      fs.writeSync(fd, `${process.pid}\t${Date.now()}`);
+      fs.writeSync(fd, token);
       fs.closeSync(fd);
+      _lockTokens.set(lockPath, token);
       return lockPath;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
@@ -211,8 +229,12 @@ export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS) {
         const stat = fs.statSync(lockPath);
         const age = Date.now() - stat.mtimeMs;
         if (age > LOCK_STALE_MS && !lockHolderAlive(lockPath, age)) {
-          try { fs.unlinkSync(lockPath); } catch {}
-          continue; // retry acquire immediately after reclaiming a dead holder
+          let fresh;
+          try { fresh = fs.statSync(lockPath); } catch { continue; } // vanished — retry acquire
+          if (fresh.ino === stat.ino && fresh.mtimeMs === stat.mtimeMs) {
+            try { fs.unlinkSync(lockPath); } catch {}
+          }
+          continue; // retry acquire (immediately, or against the new holder)
         }
       } catch {}
       if (Date.now() > deadline) return null;
@@ -241,6 +263,17 @@ function lockHolderAlive(lockPath, age) {
 
 export function releaseLock(lockPath) {
   if (!lockPath) return;
+  const token = _lockTokens.get(lockPath);
+  _lockTokens.delete(lockPath);
+  if (token !== undefined) {
+    // Compare-and-delete: if a stale-reclaimer stole the lock while our
+    // critical section ran long, the content is THEIRS now — leave it alone.
+    // (No recorded token means this lock was never acquired by us; unlink
+    // unconditionally, preserving the old direct-call behavior.)
+    let raw;
+    try { raw = fs.readFileSync(lockPath, 'utf8'); } catch { return; } // gone — nothing to release
+    if (raw !== token) return;
+  }
   try { fs.unlinkSync(lockPath); } catch {}
 }
 

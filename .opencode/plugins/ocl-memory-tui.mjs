@@ -3,7 +3,7 @@ import path from 'path';
 import {
   readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel, isSafeFilename,
   atomicWriteFileSync, withLock, LockContendedError, maybeCarryOverToSharedDir,
-  addToRemovedList,
+  addToRemovedList, parseIndexLine,
 } from './ocl-memory-shared.mjs';
 
 // Resolves which directory (local or shared, per memory.jsonc's shared_dir)
@@ -41,10 +41,12 @@ function parseIndex(memIndex) {
   return entries;
 }
 
-// Toggle [pin] on the index line matched by filename. Locked + atomic, same
-// pattern as the server plugin's tools — and, like them, fails closed on
-// contention whenever shared_dir is active (strict) so a co-tenant's in-flight
-// index update is never clobbered.
+// Toggle [pin] on the index line whose PARSED filename equals `filename`.
+// Parse-based (not `line.includes('](file)')`) so a foreign line that merely
+// MENTIONS `](file.md)` in its summary text is never pinned by accident.
+// Locked + atomic, same pattern as the server tools — and, like them, fails
+// closed on contention whenever shared_dir is active (strict) so a co-tenant's
+// in-flight index update is never clobbered.
 async function setPin(memDir, memIndex, filename, pin, sharedDir) {
   if (!isSafeFilename(filename)) return '(unsafe filename refused)';
   if (!fs.existsSync(memIndex)) return 'No memory index found.';
@@ -52,10 +54,10 @@ async function setPin(memDir, memIndex, filename, pin, sharedDir) {
     return await withLock(memDir, async () => {
       const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
       const updated = lines.map(line => {
-        if (!line.includes(`](${filename})`)) return line;
-        if (pin)  return line.includes('[pin]') ? line : line.replace(/(\]\([^)]+\))/, '$1 [pin]');
-        if (!pin) return line.replace(/\s*\[pin\]/, '');
-        return line;
+        const parsed = parseIndexLine(line);
+        if (!parsed || parsed.filename !== filename) return line;
+        if (pin)  return parsed.rest.includes('[pin]') ? line : line.replace(/(\]\([^)]+\))/, '$1 [pin]');
+        return line.replace(/\s*\[pin\]/, '');
       });
       atomicWriteFileSync(memIndex, updated.join('\n'));
       try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
@@ -66,14 +68,19 @@ async function setPin(memDir, memIndex, filename, pin, sharedDir) {
   }
 }
 
-// Remove the index line matched by filename (topic file on disk is preserved).
+// Remove the index line whose PARSED filename equals `filename` (topic file
+// on disk is preserved). Parse-based so a line merely MENTIONING the link in
+// its summary text is never dropped.
 async function removeEntry(memDir, memIndex, filename, sharedDir) {
   if (!isSafeFilename(filename)) return '(unsafe filename refused)';
   if (!fs.existsSync(memIndex)) return 'No memory index found.';
   try {
     return await withLock(memDir, async () => {
       const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
-      atomicWriteFileSync(memIndex, lines.filter(l => !l.includes(`](${filename})`)).join('\n'));
+      atomicWriteFileSync(memIndex, lines.filter(l => {
+        const parsed = parseIndexLine(l);
+        return !(parsed && parsed.filename === filename);
+      }).join('\n'));
       addToRemovedList(memDir, filename); // tombstone so server repair_memory won't resurrect it
       try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
     }, { strict: sharedDir });

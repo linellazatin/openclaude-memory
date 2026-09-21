@@ -1597,6 +1597,136 @@ await test('isSafeFilename: rejects leading-dot and link-breaking filenames', ()
 });
 
 // ═══════════════════════════════════════════════════════════
+// 21. v0.6.6 audit fixes (ambiguous-match refusal, lock token,
+//     tombstone-aware drift count, repair ts sanitizing, summary cap,
+//     parse-based TUI matching)
+//     Runs against the LOCAL dir (shared_dir:false from section 20).
+// ═══════════════════════════════════════════════════════════
+
+console.log('\n--- 21. v0.6.6 audit fixes ---');
+
+// [B1] partial matches must never silently mutate the first entry found.
+await test('remove/pin refuse an ambiguous partial match; exact names still win outright', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Node Upgrade', content: 'a', summary: 's1', pin: false });
+  await plugin.tool.write_memory.execute({ topic: 'Kubernetes Node Upgrade', content: 'b', summary: 's2', pin: false });
+  // a bare substring matching BOTH entries (no exact match) must refuse
+  const rm = await plugin.tool.remove_memory.execute({ topic: 'upgrade' });
+  assert.ok(/Multiple entries match/.test(rm), `expected an ambiguous refusal; got: ${rm}`);
+  assert.ok(/Nothing was modified/.test(rm), 'refusal must state nothing changed');
+  const idx = readIndex();
+  assert.ok(idx.includes('[Node Upgrade]') && idx.includes('[Kubernetes Node Upgrade]'), 'both entries survive a refused removal untouched');
+  // exact (case-insensitive) name match wins even though it is also a substring of the other
+  const pin = await plugin.tool.pin_memory.execute({ topic: 'Node Upgrade', pin: true });
+  assert.ok(/Pinned/.test(pin), `exact name must win outright; got: ${pin}`);
+  // a SINGLE substring match still resolves normally
+  const rm2 = await plugin.tool.remove_memory.execute({ topic: 'kubernetes' });
+  assert.ok(/Index entry removed/.test(rm2), `single substring match must work; got: ${rm2}`);
+  // cleanup
+  await plugin.tool.pin_memory.execute({ topic: 'Node Upgrade', pin: false });
+  await plugin.tool.remove_memory.execute({ topic: 'Node Upgrade' });
+});
+
+// [B2] lock payload is a token and release is compare-and-delete.
+await test('lock: payload is a pid/ts/rand token; releaseLock never unlinks a lock stolen from us', async () => {
+  const lp = path.join(MEMORY_DIR, '.lock');
+  const acquired = await shared.acquireLock(MEMORY_DIR);
+  assert.equal(acquired, lp, 'acquireLock returns the lock path');
+  const payload = fs.readFileSync(lp, 'utf8');
+  assert.match(payload, new RegExp(`^${process.pid}\\t\\d+\\t\\S+$`), 'lock must hold a 3-field pid/ts/rand token (openpi-parsable field 0)');
+  try {
+    // simulate a stale-reclaimer that stole the lock mid-critical-section
+    fs.writeFileSync(lp, '999999\t' + Date.now() + '\tthief', 'utf8');
+    shared.releaseLock(lp);
+    assert.ok(fs.existsSync(lp), 'releaseLock must NOT unlink a lock whose content is no longer ours');
+    assert.equal(fs.readFileSync(lp, 'utf8').split('\t')[2], 'thief', 'the thief lock must be left byte-intact');
+  } finally {
+    fs.unlinkSync(lp);
+  }
+  // normal acquire/release round-trip still cleans up
+  await shared.acquireLock(MEMORY_DIR);
+  shared.releaseLock(lp);
+  assert.ok(!fs.existsSync(lp), 'releasing OUR own lock unlinks it');
+});
+
+// [B3] tombstoned files are not drift.
+await test('countMemoryFiles: a tombstoned orphan does not count toward the drift signal', async () => {
+  const { countMemoryFiles } = plugin.__test__;
+  const idxPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const f = path.join(MEMORY_DIR, 'drift-tombstone-x.md');
+  const base = countMemoryFiles(MEMORY_DIR, idxPath).fileCount;
+  fs.writeFileSync(f, '---\nname: "Drift Tombstone X"\n---\n\nb\n', 'utf8');
+  try {
+    const withOrphan = countMemoryFiles(MEMORY_DIR, idxPath).fileCount;
+    assert.equal(withOrphan, base + 1, 'sanity: an unindexed orphan file counts as drift');
+    shared.addToRemovedList(MEMORY_DIR, 'drift-tombstone-x.md');
+    const afterTombstone = countMemoryFiles(MEMORY_DIR, idxPath).fileCount;
+    assert.equal(afterTombstone, base, 'a deliberately-removed (tombstoned) file must NOT count as drift');
+  } finally {
+    shared.removeFromRemovedList(MEMORY_DIR, 'drift-tombstone-x.md');
+    fs.unlinkSync(f);
+  }
+});
+
+// [B5] a foreign frontmatter timestamp cannot forge a pin flag via repair.
+await test('repairMemoryIndex: sanitizes a malicious frontmatter timestamp out of the emitted line', async () => {
+  const { repairMemoryIndex } = plugin.__test__;
+  const f = path.join(MEMORY_DIR, 'evil-ts.md');
+  fs.writeFileSync(f, '---\nname: "Evil Ts"\ndescription: "d"\nlast_updated: 2026-01-01 [pin]\n---\n\nbody\n', 'utf8');
+  const idxPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(idxPath, 'utf8');
+  try {
+    repairMemoryIndex({ memDir: MEMORY_DIR, memIndex: idxPath });
+    const line = fs.readFileSync(idxPath, 'utf8').split('\n').find(l => l.includes('evil-ts.md'));
+    assert.ok(line, 'the orphan should be recovered');
+    assert.ok(!/\[pin\]/.test(line), `the recovered timestamp must not carry a pin token; got: ${line}`);
+    assert.ok(line.includes('[stale?]'), 'the recovered entry keeps its stale flag');
+  } finally {
+    fs.writeFileSync(idxPath, before, 'utf8');
+    fs.unlinkSync(f);
+  }
+});
+
+// [parity] summaries are whitespace-collapsed and capped at 500 chars.
+await test('write_memory: summary is collapsed to one line and capped at 500 chars everywhere', async () => {
+  await plugin.tool.write_memory.execute({
+    topic: 'Long Summary Cap', content: 'c',
+    summary: 'a  b\n' + 'x'.repeat(600), pin: false,
+  });
+  const line = readIndex().split('\n').find(l => l.includes('(long-summary-cap.md)'));
+  assert.ok(line, 'entry exists');
+  const summaryPart = line.split(' -- ')[1];
+  assert.ok(summaryPart.length <= 500, `index summary must be capped at 500, got ${summaryPart.length}`);
+  assert.ok(summaryPart.startsWith('a b '), 'whitespace collapsed to single spaces');
+  const topicFile = fs.readFileSync(path.join(MEMORY_DIR, 'long-summary-cap.md'), 'utf8');
+  assert.ok(topicFile.includes(JSON.stringify(summaryPart)), 'frontmatter description carries the identical capped summary');
+  await plugin.tool.remove_memory.execute({ topic: 'Long Summary Cap' });
+});
+
+// [TUI] parse-based matching: a line merely MENTIONING another entry's link is untouched.
+await test('TUI setPin/removeEntry only act on the parsed entry line, not on summary mentions', async () => {
+  const idxPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = fs.readFileSync(idxPath, 'utf8');
+  fs.writeFileSync(idxPath, before.replace(/\n+$/, '') +
+    '\n- [Real Topic](real-topic.md) 2026-01-01T00:00:00+00:00 -- plain summary' +
+    '\n- [Mentioner](mentioner.md) 2026-01-01T00:00:00+00:00 -- see [link](real-topic.md) elsewhere\n', 'utf8');
+  try {
+    await tui.setPin(MEMORY_DIR, idxPath, 'real-topic.md', true, false);
+    const afterPin = fs.readFileSync(idxPath, 'utf8').split('\n');
+    const mentioner = afterPin.find(l => l.includes('(mentioner.md)'));
+    assert.ok(!/\[pin\]/.test(mentioner), 'a line that only MENTIONS the link in its summary must not be pinned');
+    assert.ok(/\[pin\]/.test(afterPin.find(l => l.startsWith('- [Real Topic]'))), 'the real entry got its pin');
+    await tui.removeEntry(MEMORY_DIR, idxPath, 'real-topic.md', false);
+    const afterRm = fs.readFileSync(idxPath, 'utf8');
+    assert.ok(afterRm.includes('(mentioner.md)'), 'the mentioning line must survive removal of the real entry');
+    assert.ok(!/^- \[Real Topic\]/m.test(afterRm), 'the real entry line was removed');
+  } finally {
+    fs.writeFileSync(idxPath, before, 'utf8');
+    shared.removeFromRemovedList(MEMORY_DIR, 'real-topic.md'); // removeEntry tombstoned it
+    try { fs.unlinkSync(shared.getDirtySentinel(MEMORY_DIR)); } catch {}
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
 // Results
 // ═══════════════════════════════════════════════════════════
 

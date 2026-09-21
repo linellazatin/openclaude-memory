@@ -34,7 +34,7 @@ The text after "unpin " is the topic to find. Call the pin_memory tool:
 
 Review the current conversation for facts, decisions, or discoveries that match the "always_persist" rules in ~/.config/opencode/memory.jsonc but have not yet been written to memory. For each one found, call write_memory with an appropriate topic, content, summary, and pin value.
 
-Then write or update a topic named "Session Recap (openclaude)" (filename ocl-last-session-recap.md) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
+Then write or update a topic named "OCL Last Session Recap" (toSlug of that name is exactly ocl-last-session-recap.md — use this topic string verbatim so repeated consolidations update ONE recap) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
 
 If nothing new was found to persist, say so plainly and do not call any tools.
 

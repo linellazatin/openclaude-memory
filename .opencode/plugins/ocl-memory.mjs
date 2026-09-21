@@ -9,10 +9,14 @@ import {
 } from './ocl-memory-shared.mjs';
 
 const MAX_BYTES = 50 * 1024;
+// Parity with openpi-memory's MAX_SUMMARY_LENGTH: index summaries are
+// whitespace-collapsed and capped so one rambling summary cannot eat the
+// whole 50 KB injection budget.
+const MAX_SUMMARY_LENGTH = 500;
 
 const CONSOLIDATION_PROMPT = `Review the current conversation for facts, decisions, or discoveries that match the "always_persist" rules in ${MEMORY_CONFIG} but have not yet been written to memory. For each one found, call write_memory with an appropriate topic, content, summary, and pin value.
 
-Then write or update a topic named "Session Recap (openclaude)" (filename ocl-last-session-recap.md) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
+Then write or update a topic named "OCL Last Session Recap" (toSlug of that name is exactly ocl-last-session-recap.md — use this topic string verbatim so repeated consolidations update ONE recap instead of creating duplicates) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
 
 If nothing new was found to persist, say so plainly and do not call any tools.`;
 
@@ -29,7 +33,7 @@ ${summary}
 
 Based on the summary above, identify any facts, decisions, or discoveries that match the "always_persist" rules in ${MEMORY_CONFIG} but have not yet been written to memory. For each one, call write_memory with an appropriate topic, content, summary, and pin value.
 
-Then write or update a topic named "Session Recap (openclaude)" (filename ocl-last-session-recap.md) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
+Then write or update a topic named "OCL Last Session Recap" (toSlug of that name is exactly ocl-last-session-recap.md — use this topic string verbatim so repeated consolidations update ONE recap instead of creating duplicates) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
 
 After consolidating, continue with any pending work described in the summary's "Next Move" section. If there is no pending work, stop.`;
 
@@ -208,14 +212,26 @@ function maintainIndex(lines, config, memDir = MEMORY_DIR) {
 }
 
 // --- Shared index search helper ---
+// Locate an index entry by (case-insensitive) search string, matching openpi-memory's
+// semantics: an exact match on name or filename wins outright; otherwise a SINGLE
+// substring match is returned; MULTIPLE substring matches return an ambiguity signal
+// so callers refuse to mutate the wrong entry instead of silently taking the first.
+// Returns { idx, parsed } | { ambiguous: true, names: string[] } | null.
 
 function findIndexEntry(lines, search) {
   const s = search.toLowerCase();
+  const substringMatches = [];
   for (let i = 0; i < lines.length; i++) {
     const parsed = parseIndexLine(lines[i]);
     if (!parsed) continue;
-    if (parsed.name.toLowerCase().includes(s) || parsed.filename.toLowerCase().includes(s))
-      return { idx: i, parsed };
+    const name = parsed.name.toLowerCase();
+    const file = parsed.filename.toLowerCase();
+    if (name === s || file === s) return { idx: i, parsed };
+    if (name.includes(s) || file.includes(s)) substringMatches.push({ idx: i, parsed });
+  }
+  if (substringMatches.length === 1) return substringMatches[0];
+  if (substringMatches.length > 1) {
+    return { ambiguous: true, names: substringMatches.map(m => m.parsed.name) };
   }
   return null;
 }
@@ -301,12 +317,16 @@ function readFrontmatter(filePath) {
 
 // Counts non-MEMORY topic .md files on disk vs indexed filenames, for the
 // drift signal. Skips unsafe names (which would be dropped by maintainIndex
-// anyway) so the count reflects legitimately recoverable files.
+// anyway) so the count reflects legitimately recoverable files, and skips
+// tombstoned files (remove_memory deliberately keeps the topic file on disk
+// while dropping its index line — repair skips them too, so counting them as
+// "drift" would make the maintenance note a permanent false positive).
 function countMemoryFiles(memDir, memIndex) {
   let fileCount = 0;
   try {
+    const removed = readRemovedList(memDir);
     fileCount = fs.readdirSync(memDir)
-      .filter(f => f.endsWith('.md') && f !== 'MEMORY.md' && isSafeFilename(f)).length;
+      .filter(f => f.endsWith('.md') && f !== 'MEMORY.md' && isSafeFilename(f) && !removed.has(f)).length;
   } catch {}
   let indexedCount = 0;
   try {
@@ -336,7 +356,10 @@ function repairMemoryIndex({ memDir, memIndex }) {
     if (indexed.has(file)) continue;           // already present — additive only
     if (removed.has(file)) continue;           // deliberately removed via remove_memory — skip
     const fm = readFrontmatter(path.join(memDir, file));
-    added.push(`- [${sanitizeIndexField(fm.name)}](${file}) ${fm.ts} [stale?] -- ${sanitizeIndexField(fm.description || fm.name)}`);
+    // sanitizeIndexField on every recovered field — including ts: a corrupted
+    // co-tenant frontmatter timestamp like "2026-01-01 [pin]" must not smuggle
+    // a pin token (or a phantom `--` summary separator) onto the index line.
+    added.push(`- [${sanitizeIndexField(fm.name)}](${file}) ${sanitizeIndexField(fm.ts).trim()} [stale?] -- ${sanitizeIndexField(fm.description || fm.name)}`);
     indexed.add(file);
   }
   if (added.length) {
@@ -381,6 +404,10 @@ const tools = {
       // metacharacters sanitizes to empty -> treat as missing.
       const cleanTopic = sanitizeIndexField(topic).trim();
       if (!cleanTopic) return 'Error: topic is required and must be a non-empty string.';
+      // Collapse to one clean line and cap length (openpi-memory parity) BEFORE
+      // any use, so the frontmatter description, the index line, and the
+      // returned Entry line all carry the SAME summary value.
+      const cleanSummary = summary.replace(/\s+/g, ' ').trim().slice(0, MAX_SUMMARY_LENGTH);
       const pinBool = pin === true || pin === 'true';
 
       const { config } = await getCache();
@@ -439,7 +466,7 @@ const tools = {
           if (!fs.existsSync(topicPath)) {
             isNew = true;
             const now = nowIso();
-            const frontmatter = `---\nname: ${JSON.stringify(cleanTopic)}\ndescription: ${JSON.stringify(summary)}\ncreated: ${now}\nlast_updated: ${now}\nmetadata:\n  node_type: memory\n---\n\n`;
+            const frontmatter = `---\nname: ${JSON.stringify(cleanTopic)}\ndescription: ${JSON.stringify(cleanSummary)}\ncreated: ${now}\nlast_updated: ${now}\nmetadata:\n  node_type: memory\n---\n\n`;
             atomicWriteFileSync(topicPath, frontmatter + content + '\n');
           } else if (mode === 'replace') {
             const now = nowIso();
@@ -472,14 +499,14 @@ const tools = {
           // Update index
           let lines = rawIndex.split('\n');
 
-          lines = upsertIndexLine(lines, filename, cleanTopic, summary, pinBool);
+          lines = upsertIndexLine(lines, filename, cleanTopic, cleanSummary, pinBool);
           lines = maintainIndex(lines, config, memDir);
 
           atomicWriteFileSync(memIndex, lines.join('\n'));
           removeFromRemovedList(memDir, filename); // re-storing clears any prior intentional-removal tombstone
           invalidateCache(); // nuke cache so the next caller re-reads the fresh index
 
-          return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${memIndex}\nEntry: [${cleanTopic}](${filename}) ${nowIso()} -- ${sanitizeIndexField(summary)}`;
+          return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${memIndex}\nEntry: [${cleanTopic}](${filename}) ${nowIso()} -- ${cleanSummary}`;
         }, { strict: config.sharedDir });
       } catch (e) {
         if (e instanceof LockContendedError) return BUSY_MESSAGE;
@@ -514,6 +541,9 @@ const tools = {
           const found = findIndexEntry(lines, search);
           if (!found) {
             return `No matching entry found for "${topic}".`;
+          }
+          if (found.ambiguous) {
+            return `Multiple entries match "${topic}" — be more specific (exact names win over partial matches). Candidates: ${found.names.join(', ')}. Nothing was modified.`;
           }
           const { idx: foundIdx, parsed } = found;
 
@@ -576,6 +606,9 @@ const tools = {
           const found = findIndexEntry(lines, search);
           if (!found) {
             return `No matching entry found for "${topic}".`;
+          }
+          if (found.ambiguous) {
+            return `Multiple entries match "${topic}" — be more specific (exact names win over partial matches). Candidates: ${found.names.join(', ')}. Nothing was modified.`;
           }
           const { idx: foundIdx, parsed } = found;
 
