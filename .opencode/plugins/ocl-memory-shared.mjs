@@ -55,7 +55,7 @@ const DEFAULT_STALE_DAYS = 180;
 const DEFAULT_INJECT_INTERVAL = 5;
 
 const LOCK_STALE_MS = 10000;
-const LOCK_ACQUIRE_TIMEOUT_MS = 500;      // local, best-effort single poll window
+const LOCK_ACQUIRE_TIMEOUT_MS = 500;      // local, bounded fail-closed poll window
 const LOCK_ACQUIRE_TIMEOUT_MS_SHARED = 2000; // shared, per poll window (see withLock retry)
 const LOCK_RETRY_DELAY_MS = 1000;         // strict mode: sleep, then one more full window
 const LOCK_STALE_HARD_MS = 60000;         // unparseable-pid locks may only be stolen past this
@@ -116,6 +116,7 @@ const INITIAL_RULES_JSONC = `{
 // function's own fs.existsSync short-circuit makes a double-run across two
 // separate processes harmless).
 let _carryOverChecked = false;
+let _carryOverPending = null;
 
 export function getMemoryDir(config) {
   return config && config.sharedDir ? SHARED_MEMORY_DIR : MEMORY_DIR;
@@ -252,14 +253,16 @@ export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS) {
     try {
       const token = `${process.pid}\t${Date.now()}\t${Math.random().toString(36).slice(2)}`;
       const fd = fs.openSync(lockPath, 'wx');
-      fs.writeSync(fd, token);
-      fs.closeSync(fd);
+      try { fs.writeFileSync(fd, token); }
+      catch (err) { fs.unlinkSync(lockPath); throw err; }
+      finally { fs.closeSync(fd); }
       _lockTokens.set(lockPath, token);
       return lockPath;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
       try {
-        const stat = fs.statSync(lockPath);
+        const stat = fs.lstatSync(lockPath);
+        if (!stat.isFile()) throw new Error('Unsafe lock file');
         const age = Date.now() - stat.mtimeMs;
         if (age > LOCK_STALE_MS && !lockHolderAlive(lockPath, age)) {
           let fresh;
@@ -283,13 +286,13 @@ export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS) {
 function lockHolderAlive(lockPath, age) {
   let pid;
   try {
-    const raw = fs.readFileSync(lockPath, 'utf8').trim();
+    const raw = readStoreFileSync(lockPath, 1024).trim();
     pid = parseInt(raw.split('\t')[0], 10);
   } catch {
     pid = NaN;
   }
-  if (Number.isInteger(pid)) {
-    try { process.kill(pid, 0); return true; } catch { return false; } // ESRCH → dead
+  if (Number.isInteger(pid) && pid > 0) {
+    try { process.kill(pid, 0); return true; } catch (err) { return err.code !== 'ESRCH'; }
   }
   return age <= LOCK_STALE_HARD_MS; // unknown pid: alive unless very old
 }
@@ -298,13 +301,12 @@ export function releaseLock(lockPath) {
   if (!lockPath) return;
   const token = _lockTokens.get(lockPath);
   _lockTokens.delete(lockPath);
-  if (token !== undefined) {
+  if (token === undefined) return;
+  {
     // Compare-and-delete: if a stale-reclaimer stole the lock while our
     // critical section ran long, the content is THEIRS now — leave it alone.
-    // (No recorded token means this lock was never acquired by us; unlink
-    // unconditionally, preserving the old direct-call behavior.)
     let raw;
-    try { raw = fs.readFileSync(lockPath, 'utf8'); } catch { return; } // gone — nothing to release
+    try { raw = readStoreFileSync(lockPath, 1024); } catch { return; } // gone — nothing to release
     if (raw !== token) return;
   }
   try { fs.unlinkSync(lockPath); } catch {}
@@ -313,9 +315,7 @@ export function releaseLock(lockPath) {
 // Run `fn` while holding the directory lock. This is the single entry point
 // every mutation should use (server tools, TUI, carry-over) so the
 // contention/retry policy lives in one place.
-//   - Default (strict: false): best-effort. If the lock can't be acquired
-//     within timeoutMs, `fn` still runs WITHOUT the lock. Correct for a local,
-//     single-writer directory; preserves prior non-blocking behavior.
+//   - Default (strict: false): one bounded local wait, then refuse the mutation.
 //   - strict: true (used whenever shared_dir is active): never run `fn`
 //     unlocked. On contention, poll one window; if that fails, sleep
 //     LOCK_RETRY_DELAY_MS and poll again; if STILL contended, throw
@@ -327,7 +327,7 @@ export async function withLock(memDir, fn, { strict = false, timeoutMs } = {}) {
   if (lockPath) {
     try { return await fn(); } finally { releaseLock(lockPath); }
   }
-  if (!strict) return await fn(); // best-effort proceed without the lock
+  if (!strict) throw new LockContendedError('memory store busy — could not acquire local lock');
   await sleep(LOCK_RETRY_DELAY_MS);
   const retryPath = await acquireLock(memDir, tmo);
   if (retryPath) {
@@ -464,19 +464,21 @@ export function readMemoryRules() {
 // (see AGENTS.md quirk).
 export async function maybeCarryOverToSharedDir(config) {
   if (!config.sharedDir || _carryOverChecked) return;
-  _carryOverChecked = true;
-  if (fs.existsSync(CARRY_OVER_SENTINEL)) return; // already migrated in a prior process
+  if (_carryOverPending) return await _carryOverPending;
+  if (fs.existsSync(CARRY_OVER_SENTINEL)) { _carryOverChecked = true; return; }
   if (!fs.existsSync(MEMORY_INDEX)) return; // nothing local to carry over
-  try {
-    const sharedDir = SHARED_MEMORY_DIR;
-    ensureMemoryDir(sharedDir);
-    await withLock(sharedDir, () => mergeLocalIntoSharedDir(sharedDir), { strict: true });
-    fs.writeFileSync(CARRY_OVER_SENTINEL, '');
-  } catch {
-    // best-effort — carry-over failure should never break normal operation;
-    // sentinel intentionally not written on failure (including a busy lock,
-    // retried via withLock) so a retry can happen on the next process start
-  }
+  _carryOverPending = (async () => {
+    try {
+      await withLock(MEMORY_DIR, () => withLock(SHARED_MEMORY_DIR, () => {
+        mergeLocalIntoSharedDir(SHARED_MEMORY_DIR);
+        atomicWriteFileSync(CARRY_OVER_SENTINEL, '');
+        _carryOverChecked = true;
+      }, { strict: true }));
+    } catch (err) {
+      console.error('[openclaude-memory] carry-over deferred:', err.message);
+    }
+  })();
+  try { await _carryOverPending; } finally { _carryOverPending = null; }
 }
 
 // Merges the local MEMORY.md's entries and topic files into the shared dir.
@@ -488,25 +490,28 @@ export async function maybeCarryOverToSharedDir(config) {
 // the shared dir via getMemoryDir(config), never back to the local copy).
 function mergeLocalIntoSharedDir(sharedDir) {
   const sharedIndexPath = path.join(sharedDir, 'MEMORY.md');
-  const sharedRaw = fs.existsSync(sharedIndexPath) ? fs.readFileSync(sharedIndexPath, 'utf8') : INITIAL_MEMORY;
+  const sharedRaw = fs.existsSync(sharedIndexPath) ? readStoreFileSync(sharedIndexPath) : INITIAL_MEMORY;
   const sharedFilesOnDisk = new Set(fs.readdirSync(sharedDir));
   const sharedIndexedFilenames = new Set(
     sharedRaw.split('\n').map(parseIndexLine).filter(Boolean).map(entry => entry.filename)
   );
 
-  const localLines = fs.readFileSync(MEMORY_INDEX, 'utf8').split('\n');
+  const localLines = readStoreFileSync(MEMORY_INDEX).split('\n');
+  const removed = new Set([...readRemovedList(MEMORY_DIR), ...readRemovedList(sharedDir)]);
   const appended = [];
 
   for (const line of localLines) {
     const parsed = parseIndexLine(line);
     if (!parsed) continue; // headers/blanks — destination keeps its own
     if (!isSafeFilename(parsed.filename)) continue; // corrupted/unsafe entry — drop like an orphan
+    if (removed.has(parsed.filename)) continue;
     const srcPath = path.join(MEMORY_DIR, parsed.filename);
-    if (!fs.existsSync(srcPath)) continue; // orphaned local entry, skip
+    if (!isRegularFile(srcPath)) continue; // orphaned/unsafe local entry, skip
 
     const destName = resolveDestName(srcPath, sharedDir, parsed.filename, sharedFilesOnDisk);
+    if (removed.has(destName)) continue;
     if (!sharedFilesOnDisk.has(destName)) {
-      fs.copyFileSync(srcPath, path.join(sharedDir, destName));
+      atomicWriteFileSync(path.join(sharedDir, destName), readStoreFileSync(srcPath));
       sharedFilesOnDisk.add(destName);
     }
     // Identical content may already be on disk without an index entry. Keep
@@ -531,13 +536,13 @@ function mergeLocalIntoSharedDir(sharedDir) {
 // add a missing shared-index entry without copying the file again.
 function resolveDestName(srcPath, sharedDir, filename, sharedFilesOnDisk) {
   const originalDest = path.join(sharedDir, filename);
-  if (!fs.existsSync(originalDest)) return filename; // no collision
+  if (!sharedFilesOnDisk.has(filename)) return filename; // no collision, including broken symlinks
 
   if (filesEqual(srcPath, originalDest)) return filename; // already there under the same name
 
   const suffixed = filename.replace(/\.md$/, '-oclm.md');
   const suffixedDest = path.join(sharedDir, suffixed);
-  if (!fs.existsSync(suffixedDest)) return suffixed;
+  if (!sharedFilesOnDisk.has(suffixed)) return suffixed;
   if (filesEqual(srcPath, suffixedDest)) return suffixed; // already migrated under the canonical suffixed name in a prior run
 
   // Exceedingly rare: even the suffixed name collides with unrelated content. Bump a counter.
@@ -550,5 +555,5 @@ function resolveDestName(srcPath, sharedDir, filename, sharedFilesOnDisk) {
 }
 
 function filesEqual(pathA, pathB) {
-  return fs.readFileSync(pathA, 'utf8') === fs.readFileSync(pathB, 'utf8');
+  return isRegularFile(pathA) && isRegularFile(pathB) && readStoreFileSync(pathA) === readStoreFileSync(pathB);
 }

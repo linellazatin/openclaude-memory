@@ -38,33 +38,37 @@ Then write or update a topic named "OCL Last Session Recap" (toSlug of that name
 After consolidating, continue with any pending work described in the summary's "Next Move" section. If there is no pending work, stop.`;
 
 // --- In-process cache ---
-// Loaded once per session (or after any tool mutation / compaction).
-// Avoids re-reading memory.jsonc and MEMORY.md on every turn.
-// Caveat: manual edits to memory.jsonc or MEMORY.md between turns are not
-// reflected until the next tool call or compaction event.
-// process-global state; safe for single-user plugin.
-// Upgrade path: per-session Map keyed by session ID if multi-session needed.
+// Memory is global, so sessions can share a cache. Check filesystem identity
+// before reuse; never consume a notification that another process still needs.
 let _cache = null;
+let _requestCount = 0;
+
+function fileStamp(filePath) {
+  try {
+    const s = fs.lstatSync(filePath, { bigint: true });
+    return `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+  } catch (err) { if (err.code === 'ENOENT') return ''; throw err; }
+}
+
+function cacheSignature(memDir, configStamp = fileStamp(MEMORY_CONFIG)) {
+  return [configStamp, ...[memDir, path.join(memDir, 'MEMORY.md'), path.join(memDir, '.ocl-removed'), getDirtySentinel(memDir)].map(fileStamp)].join('|');
+}
 
 async function getCache(forceRefresh = false) {
-  // If TUI mutated MEMORY.md directly, it writes a sentinel file to signal us.
-  // The sentinel lives alongside whichever dir was active last time we
-  // resolved (_cache.memDir) — matches wherever the TUI actually wrote it.
-  if (_cache && !forceRefresh && fs.existsSync(getDirtySentinel(_cache.memDir))) {
-    try { fs.unlinkSync(getDirtySentinel(_cache.memDir)); } catch {}
-    _cache = null;
-  }
+  if (_cache && _cache.signature !== cacheSignature(_cache.memDir)) _cache = null;
   if (!_cache || forceRefresh) {
+    const configStamp = fileStamp(MEMORY_CONFIG);
     const rules = readMemoryRules();
     const config = parseRules(rules);
     await maybeCarryOverToSharedDir(config);
     const renderedRules = renderRulesForInjection(rules);
     const memDir = getMemoryDir(config);
+    const signature = cacheSignature(memDir, configStamp);
     const content = readMemoryIndex(config.maxLines, memDir);
     // Only meaningful under shared_dir (a co-tenant is the realistic cause of
     // index/file drift); cheap readdir+read, computed once per cache refresh.
     const drift = config.sharedDir ? countMemoryFiles(memDir, getMemoryIndex(config)) : null;
-    _cache = { renderedRules, config, content, memDir, drift };
+    _cache = { renderedRules, config, content, memDir, drift, signature };
   }
   return _cache;
 }
@@ -782,7 +786,9 @@ Any text including single words is treated literally as content to store. Do not
     // OpenCode constructs a fresh system prompt for EVERY model request.
     // Cache disk reads, never the presence of memory in the outgoing request.
     'experimental.chat.system.transform': async (_input, output) => {
-      const { renderedRules, content, config, memDir, drift } = await getCache();
+      let cache = await getCache();
+      if (++_requestCount % cache.config.injectEveryNTurns === 0) cache = await getCache(true);
+      const { renderedRules, content, config, memDir, drift } = cache;
       if (content) {
         output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
         if (config.sharedDir && drift && drift.fileCount > drift.indexedCount + DRIFT_NOTE_THRESHOLD) {

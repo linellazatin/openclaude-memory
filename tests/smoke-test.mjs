@@ -910,7 +910,7 @@ await test('shared_dir: a lock that clears during the retry window succeeds on t
   }
 });
 
-await test('local (shared_dir:false) contention still proceeds best-effort after the short timeout', async () => {
+await test('local contention refuses to mutate after its bounded wait', async () => {
   // Best-effort mode must be untouched by the shared fail-closed change: a
   // foreign local lock that can't be reclaimed does NOT error — the write
   // proceeds unlocked after the ~500ms window.
@@ -922,7 +922,8 @@ await test('local (shared_dir:false) contention still proceeds best-effort after
     const start = Date.now();
     const result = await plugin.tool.write_memory.execute({ topic: 'Local Best Effort', content: 'x', summary: 'local be', pin: false });
     const elapsed = Date.now() - start;
-    assert.ok(result.includes('created') || result.includes('updated'), `local write should proceed unlocked; got: ${result}`);
+    assert.match(result, /busy/i);
+    assert.ok(!fs.existsSync(path.join(MEMORY_DIR, 'local-best-effort.md')));
     assert.ok(elapsed < 1000, `local best-effort should use the short window, not the shared patience window, took ${elapsed}ms`);
   } finally {
     if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
@@ -1833,6 +1834,82 @@ await test('failed tombstone write leaves the index entry discoverable', async (
   try { await assert.rejects(plugin.tool.remove_memory.execute({ topic: 'Removal Failure Audit' }), /tombstone failure/); }
   finally { fs.renameSync = rename; }
   assert.equal(readIndex(), before);
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('EPERM is treated as a live lock holder', async () => {
+  const lp = path.join(MEMORY_DIR, '.lock');
+  const payload = `${process.pid}\t${Date.now()}\tprotected`;
+  fs.writeFileSync(lp, payload);
+  const old = new Date(Date.now() - 20000);
+  fs.utimesSync(lp, old, old);
+  const kill = process.kill;
+  process.kill = () => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }); };
+  try {
+    assert.equal(await shared.acquireLock(MEMORY_DIR, 20), null);
+    assert.equal(fs.readFileSync(lp, 'utf8'), payload);
+  } finally { process.kill = kill; shared.releaseLock(lp); if (fs.existsSync(lp)) fs.unlinkSync(lp); }
+});
+
+await test('releaseLock does not remove a lock it never acquired', () => {
+  const lp = path.join(MEMORY_DIR, '.lock');
+  fs.writeFileSync(lp, 'foreign');
+  try { shared.releaseLock(lp); assert.equal(fs.readFileSync(lp, 'utf8'), 'foreign'); }
+  finally { if (fs.existsSync(lp)) fs.unlinkSync(lp); }
+});
+
+await test('external index and config edits refresh every process cache without consuming a sentinel', async () => {
+  writeRules('{ "shared_dir": false, "inject_every_n_turns": 999 }');
+  await plugin['experimental.session.compacting']({}, makeCompactOutput());
+  const idx = path.join(MEMORY_DIR, 'MEMORY.md');
+  const original = readIndex();
+  const sentinel = shared.getDirtySentinel(MEMORY_DIR);
+  try {
+    shared.atomicWriteFileSync(idx, original + '\n- [External Cache Marker](external-cache.md) 2026-10-03 -- external\n');
+    fs.writeFileSync(sentinel, 'generation-1');
+    const out = makeSystemOutput();
+    await plugin['experimental.chat.system.transform']({}, out);
+    assert.ok(out.system.join('\n').includes('External Cache Marker'));
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'generation-1');
+    writeRules('{ "shared_dir": true, "always_persist": ["CONFIG_HOT_RELOAD"] }');
+    const switched = makeSystemOutput();
+    await plugin['experimental.chat.system.transform']({}, switched);
+    assert.ok(switched.system.join('\n').includes('CONFIG_HOT_RELOAD'));
+    assert.ok(switched.system[0].includes(`Memory dir: ${SHARED_MEMORY_DIR}`));
+  } finally {
+    fs.writeFileSync(idx, original);
+    fs.unlinkSync(sentinel);
+    writeRules('{ "shared_dir": false }');
+    await plugin['experimental.session.compacting']({}, makeCompactOutput());
+  }
+});
+
+await test('failed carry-over retries in the same process and respects shared tombstones', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Retry Migration Audit', content: 'retry', summary: 'retry' });
+  await plugin.tool.write_memory.execute({ topic: 'Removed Migration Audit', content: 'removed elsewhere', summary: 'removed' });
+  shared.addToRemovedList(SHARED_MEMORY_DIR, 'removed-migration-audit.md');
+  const sentinel = path.join(MEMORY_DIR, '.shared-dir-migrated');
+  const prior = fs.existsSync(sentinel) ? fs.readFileSync(sentinel) : null;
+  if (prior !== null) fs.unlinkSync(sentinel);
+  const fresh = await import('../.opencode/plugins/ocl-memory-shared.mjs?retry-audit');
+  const rename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to === path.join(SHARED_MEMORY_DIR, 'MEMORY.md')) throw new Error('injected carry-over failure');
+    return rename(from, to);
+  };
+  try { await fresh.maybeCarryOverToSharedDir({ sharedDir: true }); }
+  finally { fs.renameSync = rename; }
+  try {
+    assert.ok(!fs.existsSync(sentinel));
+    await fresh.maybeCarryOverToSharedDir({ sharedDir: true });
+    assert.ok(fs.existsSync(sentinel), 'failed attempts must not seal the process guard');
+    const idx = fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), 'utf8');
+    assert.ok(idx.includes('(retry-migration-audit.md)'));
+    assert.ok(!idx.includes('(removed-migration-audit.md)'));
+  } finally {
+    if (prior !== null) fs.writeFileSync(sentinel, prior);
+    else if (fs.existsSync(sentinel)) fs.unlinkSync(sentinel);
+  }
 });
 
 // ═══════════════════════════════════════════════════════════
