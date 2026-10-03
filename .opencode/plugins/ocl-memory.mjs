@@ -46,7 +46,14 @@ let _requestCount = 0;
 function fileStamp(filePath) {
   try {
     const s = fs.lstatSync(filePath, { bigint: true });
-    return `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+    let stamp = `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+    if (s.isSymbolicLink()) {
+      try {
+        const target = fs.statSync(filePath, { bigint: true });
+        stamp += `>${target.dev}:${target.ino}:${target.size}:${target.mtimeNs}:${target.ctimeNs}`;
+      } catch (err) { stamp += `>${err.code}`; }
+    }
+    return stamp;
   } catch (err) { if (err.code === 'ENOENT') return ''; throw err; }
 }
 
@@ -367,7 +374,9 @@ function repairMemoryIndex({ memDir, memIndex }) {
     // sanitizeIndexField on every recovered field — including ts: a corrupted
     // co-tenant frontmatter timestamp like "2026-01-01 [pin]" must not smuggle
     // a pin token (or a phantom `--` summary separator) onto the index line.
-    added.push(`- [${sanitizeIndexField(fm.name)}](${file}) ${sanitizeIndexField(fm.ts).trim()} [stale?] -- ${sanitizeIndexField(fm.description || fm.name)}`);
+    const name = sanitizeIndexField(fm.name).trim() || file.slice(0, -3).trim() || file;
+    const ts = sanitizeIndexField(fm.ts).trim().split(' -- ')[0];
+    added.push(`- [${name}](${file}) ${ts} [stale?] -- ${sanitizeIndexField(fm.description || name)}`);
     indexed.add(file);
   }
   if (added.length) {

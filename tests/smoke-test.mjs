@@ -1940,6 +1940,20 @@ await test('repair reports its pre-existing count without double-counting new en
   fs.rmSync(dir, { recursive: true });
 });
 
+await test('repair keeps malformed frontmatter discoverable and flagged', () => {
+  const dir = fs.mkdtempSync(path.join(TMP, 'repair-empty-name-'));
+  const index = path.join(dir, 'MEMORY.md');
+  try {
+    fs.writeFileSync(path.join(dir, 'repair-empty-name.md'), '---\nname: "[()]"\nlast_updated: "2026-01-01T00:00:00+00:00 -- forged summary"\n---\nbody');
+    assert.equal(plugin.__test__.repairMemoryIndex({ memDir: dir, memIndex: index }).added, 1);
+    const line = fs.readFileSync(index, 'utf8').split('\n').find(l => l.includes('(repair-empty-name.md)'));
+    const entry = shared.parseIndexLine(line);
+    assert.equal(entry?.name, 'repair-empty-name');
+    assert.equal(shared.hasIndexFlag(entry.rest, '[stale?]'), true);
+    assert.equal(plugin.__test__.repairMemoryIndex({ memDir: dir, memIndex: index }).added, 0);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 await test('same-day duplicate timestamps choose the newest entry without losing a pin', async () => {
   await plugin.tool.write_memory.execute({ topic: 'Dedup Timestamp Audit', content: 'keep', summary: 'keep' });
   const index = path.join(MEMORY_DIR, 'MEMORY.md');
@@ -2113,6 +2127,34 @@ await test('an undeletable stale lock obeys the acquisition deadline', async () 
 // ═══════════════════════════════════════════════════════════
 // Results
 // ═══════════════════════════════════════════════════════════
+
+await test('store and config FIFO reads are refused without blocking', async () => {
+  if (process.platform === 'win32') return;
+  const { spawnSync } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(TMP, 'fifo-read-'));
+  const script = `import assert from 'node:assert/strict'; import fs from 'node:fs'; import { execFileSync } from 'node:child_process'; const s = await import(${JSON.stringify(new URL('../.opencode/plugins/ocl-memory-shared.mjs', import.meta.url).href)}); fs.mkdirSync(s.CONFIG_ROOT, { recursive: true }); const pipe = ${JSON.stringify(path.join(dir, 'pipe.md'))}; execFileSync('mkfifo', [pipe, s.MEMORY_CONFIG]); assert.throws(() => s.readStoreFileSync(pipe), /regular/); assert.equal(s.readMemoryRules(), null);`;
+  try {
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, XDG_CONFIG_HOME: dir }, timeout: 2000 });
+    assert.equal(child.status, 0, child.error?.message || child.stderr.toString());
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+await test('config target edits through a symlink refresh the active store', async () => {
+  const before = fs.readFileSync(MEMORY_CONFIG, 'utf8');
+  const target = path.join(TMP, 'symlink-config.jsonc');
+  try {
+    fs.writeFileSync(target, '{ "shared_dir": false, "inject_every_n_turns": 9999 }');
+    fs.unlinkSync(MEMORY_CONFIG);
+    fs.symlinkSync(target, MEMORY_CONFIG);
+    const first = { system: [] };
+    await plugin['experimental.chat.system.transform']({}, first);
+    assert.ok(first.system.join('\n').includes(`Memory dir: ${MEMORY_DIR}`));
+    fs.writeFileSync(target, '{ "shared_dir": true, "inject_every_n_turns": 9999 }');
+    const next = { system: [] };
+    await plugin['experimental.chat.system.transform']({}, next);
+    assert.ok(next.system.join('\n').includes(`Memory dir: ${SHARED_MEMORY_DIR}`));
+  } finally { fs.unlinkSync(MEMORY_CONFIG); fs.writeFileSync(MEMORY_CONFIG, before); fs.rmSync(target, { force: true }); }
+});
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

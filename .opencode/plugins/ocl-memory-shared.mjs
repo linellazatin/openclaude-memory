@@ -189,13 +189,13 @@ export function ensureMemoryDir(dir = MEMORY_DIR) {
 // Writes via temp file + rename so a crash or concurrent read never observes
 // a partially-written file. Same directory as the target to keep rename atomic.
 export function atomicWriteFileSync(filePath, data, { exclusive = false } = {}) {
-  assertWritableFile(filePath);
+  if (!exclusive) assertWritableFile(filePath);
   const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
     const fd = fs.openSync(tmp, 'wx', 0o600);
     try { fs.writeFileSync(fd, data, 'utf8'); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
-    assertWritableFile(filePath);
+    if (!exclusive) assertWritableFile(filePath);
     if (exclusive) fs.linkSync(tmp, filePath); // publish complete contents without replacing a racing creator
     else fs.renameSync(tmp, filePath);
   } finally {
@@ -215,8 +215,9 @@ export function isRegularFile(filePath) {
 }
 
 // Open without following symlinks, then verify the opened object, not a stale path check.
-export function readStoreFileSync(filePath, maxBytes = Infinity) {
-  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+export function readStoreFileSync(filePath, maxBytes = Infinity, { followSymlinks = false } = {}) {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0) | (followSymlinks ? 0 : (fs.constants.O_NOFOLLOW || 0));
+  const fd = fs.openSync(filePath, flags);
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) throw new Error(`Unsafe non-regular file: ${filePath}`);
@@ -453,15 +454,15 @@ export function parseRules(raw) {
 export function readMemoryRules() {
   try {
     if (fs.existsSync(MEMORY_CONFIG)) {
-      return fs.readFileSync(MEMORY_CONFIG, 'utf8');
+      return readStoreFileSync(MEMORY_CONFIG, Infinity, { followSymlinks: true });
     }
     // Legacy fallback: pre-0.6.0 installs kept config at memory/RULES.jsonc.
     // Back it up in place (never delete) and copy forward to the new location.
     if (fs.existsSync(MEMORY_CONFIG_LEGACY)) {
-      const legacy = fs.readFileSync(MEMORY_CONFIG_LEGACY, 'utf8');
+      const legacy = readStoreFileSync(MEMORY_CONFIG_LEGACY, Infinity, { followSymlinks: true });
       ensureMemoryDir(CONFIG_ROOT);
       try { atomicWriteFileSync(MEMORY_CONFIG, legacy, { exclusive: true }); }
-      catch (err) { if (err.code === 'EEXIST') return fs.readFileSync(MEMORY_CONFIG, 'utf8'); throw err; }
+      catch (err) { if (err.code === 'EEXIST') return readStoreFileSync(MEMORY_CONFIG, Infinity, { followSymlinks: true }); throw err; }
       if (!fs.existsSync(`${MEMORY_CONFIG_LEGACY}.bak`)) {
         try { fs.renameSync(MEMORY_CONFIG_LEGACY, `${MEMORY_CONFIG_LEGACY}.bak`); } catch {}
       }
@@ -469,7 +470,7 @@ export function readMemoryRules() {
     }
     ensureMemoryDir(CONFIG_ROOT);
     try { atomicWriteFileSync(MEMORY_CONFIG, INITIAL_RULES_JSONC, { exclusive: true }); }
-    catch (err) { if (err.code === 'EEXIST') return fs.readFileSync(MEMORY_CONFIG, 'utf8'); throw err; }
+    catch (err) { if (err.code === 'EEXIST') return readStoreFileSync(MEMORY_CONFIG, Infinity, { followSymlinks: true }); throw err; }
     return INITIAL_RULES_JSONC;
   } catch (err) {
     console.error('[openclaude-memory] failed to read/write memory config:', err.message);
