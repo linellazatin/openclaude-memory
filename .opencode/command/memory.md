@@ -36,7 +36,7 @@ Review the current conversation for facts, decisions, or discoveries that match 
 
 Then write or update a topic named "OCL Last Session Recap" (toSlug of that name is exactly ocl-last-session-recap.md — use this topic string verbatim so repeated consolidations update ONE recap) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
 
-If nothing new was found to persist, say so plainly and do not call any tools.
+If no new durable facts were found, say so plainly and only refresh the unpinned recap.
 
 ## Arguments are exactly "repair": re-index orphaned topic files
 
@@ -48,7 +48,7 @@ This scans the active memory directory for topic `.md` files that are missing fr
 ## Arguments provided (not starting with "pin ", "unpin ", or "remove ", and not exactly "consolidate" or "repair"): store a memory
 
 Treat the arguments as a fact or note to persist. Decide the topic, a slug filename, a one-line summary, and whether the topic is permanent (hardware, user identity, core workflows = pin it). Then call the write_memory tool:
-  write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false> })
+  write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false>, mode: "append" })
 
 The tool creates a new topic file or appends to an existing one, and updates the MEMORY.md index automatically.
 
