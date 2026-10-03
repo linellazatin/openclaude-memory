@@ -18,7 +18,7 @@ Each entry in `MEMORY.md` can carry optional metadata fields:
 
 ## Staleness
 
-The plugin stamps `[stale?]` on index entries older than `stale_after_days` (default: 180 days) during any tool call that touches `MEMORY.md`. The file is never modified on session load — only on explicit tool use.
+Age maintenance runs on committed writes, removals, and pin changes, flagging entries older than `stale_after_days` (default: 180 days). Reads do not run maintenance. Repair is separately additive and marks recovered entries `[stale?]` for review regardless of their age. Metadata flags are recognized before ` -- `, not from summary text; pinning or disabling age flagging heals stale metadata during maintenance.
 
 **Rules:**
 - `[pin]` entries are never flagged, regardless of age.
@@ -45,7 +45,7 @@ The file on disk is untouched. The agent sees the warning and is responsible for
 1. Read `MEMORY.md` in full to assess all entries.
 2. Identify entries that are candidates for removal:
    - **Skip**: any entry with `[pin]` — never a removal candidate.
-   - **Remove without judgment**: orphaned entries (topic file missing) or duplicates. Use `remove_memory`.
+   - **Maintenance**: committed updates drop missing/unsafe files and deduplicate by filename, choosing the newest full timestamp while preserving pins. Do not use `remove_memory` to discard one duplicate record: it removes all references to that topic file.
    - **`[stale?]` entries**: prioritised candidates — review these first.
    - **Remove only if clearly obsolete**: topic was session-specific and no longer applies; topic is fully superseded by a newer broader entry. When in doubt, keep the entry. Use `remove_memory`.
 3. If all entries are still valid but the count is high, consolidate: merge two closely related topic files into one using `write_memory`, then `remove_memory` on the now-redundant entry.
@@ -56,7 +56,7 @@ The cap exists to keep per-turn token overhead bounded. At the default 300 lines
 
 ## memory.jsonc
 
-`~/.config/opencode/memory.jsonc` is auto-created on first run with sensible defaults. Edit it directly to add, remove, or modify rules, and to configure the index limits. It is JSONC, so both `//` line comments and `/* … */` block comments are supported (a `//` or `*/` inside a string value — e.g. a URL or glob — is treated as text, not a comment).
+`~/.config/opencode/memory.jsonc` is auto-created on first use without overwriting a racing creator's file. Edit it directly to configure persist rules and limits; changes, including edits to a symlink target, are detected at the next cache check. Config must resolve to a regular file; FIFO reads are refused without blocking. JSONC supports line comments, block comments, and trailing commas while preserving quoted URLs, globs, `,]`, and `,}` literally. Invalid scalar config is logged and falls back to defaults without rewriting the file; the rules renderer retains a raw-text fallback for malformed JSONC.
 
 ```jsonc
 {
@@ -86,7 +86,7 @@ The cap exists to keep per-turn token overhead bounded. At the default 300 lines
   "max_lines": 300,
   // stale_after_days: 0 = disable age flagging
   "stale_after_days": 180,
-  // inject_every_n_turns: re-inject memory every N user prompts; 1 = every prompt
+  // inject_every_n_turns: full disk refresh every N model requests; memory is always injected
   "inject_every_n_turns": 5,
   // shared_dir: true = store MEMORY.md and topic files at ~/.agents/memory/
   // so other tools can read/write the same files. This file always stays local.
@@ -101,15 +101,14 @@ Change `"max_lines"` to set a custom index size limit. The plugin clamps values 
 
 Change `"stale_after_days"` to control when entries are flagged as stale. Set to `0` to disable age flagging entirely.
 
-Change `"inject_every_n_turns"` to tune how often the cached memory index is re-injected into the system prompt. The default of `5` means it is re-emitted on turn 1, turn 6, turn 11, and so on — plus immediately after any memory tool call. Set to `1` to re-inject every turn. Higher values save tokens; lower values only re-emit the cache more often; they do not cause manual file/config edits to be reread. The minimum is `1` — setting `0` is silently clamped to `1` (not treated as "disable"). To effectively disable periodic re-injection, set a very high value such as `9999`; re-injection will still fire after any memory tool mutation.
+Change `inject_every_n_turns` to tune the forced disk-refresh interval in model requests, default `5`, minimum `1`. This process-wide counter includes model steps beyond user prompts. File-stamp changes, memory tools, and compaction refresh independently of this interval. The index and rules are attached to every request; increasing the interval does not save prompt tokens or disable injection.
 
 Change `"shared_dir"` to `true` to move `MEMORY.md` and topic files to `~/.agents/memory/` — see [Cross-tool shared memory](shared-directory.md).
 
 Change `"consolidate_on_compact"` to `true` to run consolidation automatically after automatic compaction — see [Consolidation](../README.md#consolidation) in the README.
 
-The plugin injects this file into every session's system prompt under a `## Memory Rules` header. `memory.jsonc` is the single source of truth for persist rules — no other configuration needed.
+The plugin renders non-empty behavioral rule arrays under `## Memory Rules` on every model request. Malformed JSONC or config with no non-empty behavioral arrays falls back to raw text, including scalar settings. `memory.jsonc` is the single source of truth for persist rules.
 
-**Note:** The "Always ask before persisting" section is a strong convention. The agent will always prompt before storing credentials or personal data.
+**Note:** Persist rules guide the model; they are not enforced permission checks or guarantees about what a model chooses to store.
 
-**Migrating from pre-0.6.0 installs**: config used to live at `~/.config/opencode/memory/RULES.jsonc`. On first read after upgrading, the plugin automatically renames that file to `RULES.jsonc.bak` (content preserved, never deleted) and copies it forward to the new `memory.jsonc` location. No action needed — see the [FAQ](faq.md) for more on this migration.
-</content>
+**Migrating from pre-0.6.0 installs**: legacy `memory/RULES.jsonc` is copied into a missing `memory.jsonc` using exclusive publication. Only after success is the original renamed to `RULES.jsonc.bak`, and only if that backup does not exist. An existing config or backup is preserved; failed publication leaves the legacy original intact.

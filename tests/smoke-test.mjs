@@ -521,7 +521,7 @@ await test('maintainIndex: [stale?] is removed after topic is updated (self-heal
 
 console.log('\n--- 10. inject_every_n_turns trigger ---');
 
-await test('inject_every_n_turns=2: injects at turn 1 and turn 2; skips turn 3', async () => {
+await test('memory stays in every fresh request across sessions and compaction', async () => {
   writeRules('{ "inject_every_n_turns": 2 }');
   // Compaction force-refreshes config and resets _injectedOnce=false, _dirty=false, _turnCount=0
   await plugin['experimental.session.compacting']({}, makeCompactOutput());
@@ -536,7 +536,10 @@ await test('inject_every_n_turns=2: injects at turn 1 and turn 2; skips turn 3',
 
   const out3 = makeSystemOutput();
   await plugin['experimental.chat.system.transform']({}, out3);
-  assert.equal(out3.system.length, 0, 'turn 3 should NOT inject (3 % 2 !== 0, not dirty)');
+  assert.ok(out3.system.join('\n').includes('Global Memory'), 'third request must retain memory');
+  const other = makeSystemOutput();
+  await plugin['experimental.chat.system.transform']({ sessionID: 'another-session' }, other);
+  assert.ok(other.system.join('\n').includes('Memory Rules'), 'another session must receive rules');
 
   writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5 }');
 });
@@ -628,7 +631,8 @@ console.log('\n--- 14. cap bump ---');
 
 await test('max_lines clamps to 1000 maximum (live truncation)', async () => {
   writeRules('{ "max_lines": 5000 }');
-  const entries = Array.from({ length: 1005 }, (_, i) => `- [MX Mock ${i}](mock-mx-${i}.md) 2026-01-01T00:00:00+00:00 -- mock ${i}`);
+  const entries = Array.from({ length: 1005 }, (_, i) => `- [MX ${i}](mx-${i}.md)`);
+  assert.ok(Buffer.byteLength(entries.join('\n')) < 50 * 1024, 'isolate the line cap from the byte cap');
   fs.writeFileSync(path.join(MEMORY_DIR, 'MEMORY.md'), ['# Memory Index', ...entries].join('\n') + '\n', 'utf8');
   try {
     await plugin['tool.execute.after']({ tool: 'write_memory' }, {});
@@ -906,7 +910,7 @@ await test('shared_dir: a lock that clears during the retry window succeeds on t
   }
 });
 
-await test('local (shared_dir:false) contention still proceeds best-effort after the short timeout', async () => {
+await test('local contention refuses to mutate after its bounded wait', async () => {
   // Best-effort mode must be untouched by the shared fail-closed change: a
   // foreign local lock that can't be reclaimed does NOT error — the write
   // proceeds unlocked after the ~500ms window.
@@ -918,7 +922,8 @@ await test('local (shared_dir:false) contention still proceeds best-effort after
     const start = Date.now();
     const result = await plugin.tool.write_memory.execute({ topic: 'Local Best Effort', content: 'x', summary: 'local be', pin: false });
     const elapsed = Date.now() - start;
-    assert.ok(result.includes('created') || result.includes('updated'), `local write should proceed unlocked; got: ${result}`);
+    assert.match(result, /busy/i);
+    assert.ok(!fs.existsSync(path.join(MEMORY_DIR, 'local-best-effort.md')));
     assert.ok(elapsed < 1000, `local best-effort should use the short window, not the shared patience window, took ${elapsed}ms`);
   } finally {
     if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
@@ -939,12 +944,13 @@ await test('shared_dir: acquireLock waits out a lock genuinely held by another O
   fs.writeFileSync(helperPath, [
     "import fs from 'fs';",
     'const [lockPath, holdMs] = [process.argv[2], Number(process.argv[3])];',
-    "fs.writeFileSync(lockPath, '', 'utf8');",
+    "fs.writeFileSync(lockPath, `${process.pid}\t${Date.now()}\tchild`, { flag: 'wx' });",
+    "process.send('ready');",
     'await new Promise(r => setTimeout(r, holdMs));',
     'fs.unlinkSync(lockPath);',
   ].join('\n'), 'utf8');
 
-  const child = spawn(process.execPath, [helperPath, lockPath, String(holdMs)], { stdio: 'ignore' });
+  const child = spawn(process.execPath, [helperPath, lockPath, String(holdMs)], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
   const childDone = new Promise((resolve, reject) => {
     child.on('exit', code => (code === 0 ? resolve() : reject(new Error(`lock-holder exited with code ${code}`))));
     child.on('error', reject);
@@ -952,7 +958,11 @@ await test('shared_dir: acquireLock waits out a lock genuinely held by another O
 
   // Give the child a head start so its lock file genuinely exists before
   // the main process attempts to acquire it.
-  await new Promise(r => setTimeout(r, 50));
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill(); reject(new Error('lock-holder readiness timed out')); }, 5000);
+    child.once('message', () => { clearTimeout(timer); resolve(); });
+    child.once('error', err => { clearTimeout(timer); reject(err); });
+  });
   assert.ok(fs.existsSync(lockPath), 'expected the child process to have created the real lock file by now');
 
   const start = Date.now();
@@ -964,7 +974,7 @@ await test('shared_dir: acquireLock waits out a lock genuinely held by another O
   // Comfortably above a no-contention write, comfortably below the ~500ms
   // acquire timeout — proves the main process waited for and then acquired
   // the real lock, rather than winning immediately or timing out unguarded.
-  assert.ok(elapsed >= 150 && elapsed < 480, `expected the write to wait for the child's real lock release (~${holdMs}ms) without hitting the full acquire timeout, took ${elapsed}ms`);
+  assert.ok(elapsed >= 150 && elapsed < 2000, `expected contention to resolve within the shared acquire window, took ${elapsed}ms`);
   assert.ok(!fs.existsSync(lockPath), 'lock file should not exist after both processes have finished');
 
   const sharedIndexAfter = fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), 'utf8');
@@ -1017,12 +1027,16 @@ await test('autocontinue: consolidate_on_compact=true with a client suppresses c
   await plugin2.tool.write_memory.execute({ topic: 'Autocontinue Flush C', content: 'x', summary: 'flush', pin: false });
 
   const output = { enabled: true };
-  await plugin2['experimental.compaction.autocontinue']({ sessionID: 'test-session-c' }, output);
+  await plugin2['experimental.compaction.autocontinue']({ sessionID: 'test-session-c', agent: 'build', model: { providerID: 'test', id: 'model' }, message: { model: { variant: 'reasoning' } } }, output);
 
   assert.equal(output.enabled, false, 'native continue should be suppressed');
   assert.equal(calls.length, 1, 'client.session.prompt should be called exactly once');
   assert.equal(calls[0].path.id, 'test-session-c', 'sessionID should be passed through');
   assert.ok(calls[0].body.parts[0].text.includes('always_persist'), 'prompt text should reference always_persist rules');
+  assert.equal(calls[0].body.noReply, true, 'enqueue without re-entering the running session');
+  assert.equal(calls[0].body.agent, 'build');
+  assert.deepEqual(calls[0].body.model, { providerID: 'test', modelID: 'model' });
+  assert.equal(calls[0].body.variant, 'reasoning');
 });
 
 await test('autocontinue: seeds the consolidation prompt with the compaction summary when available', async () => {
@@ -1093,6 +1107,17 @@ await test('autocontinue: falls back to native continue if client.session.prompt
   writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5, "consolidate_on_compact": false }');
 });
 
+await test('autocontinue: SDK error responses retain native continue', async () => {
+  writeRules('{ "consolidate_on_compact": true }');
+  await plugin['experimental.session.compacting']({}, makeCompactOutput());
+  const instance = await makePlugin({ client: { session: { async prompt() { return { error: { message: 'failed' } }; } } } });
+  const output = { enabled: true };
+  await instance['experimental.compaction.autocontinue']({ sessionID: 'failed-enqueue' }, output);
+  assert.equal(output.enabled, true);
+  writeRules('{ "consolidate_on_compact": false }');
+  await plugin['experimental.session.compacting']({}, makeCompactOutput());
+});
+
 // ═══════════════════════════════════════════════════════════
 // 17. TUI plugin: shared_dir awareness
 //    ocl-memory-shared.mjs is a single cached module instance across both
@@ -1141,6 +1166,7 @@ await test('TUI removeEntry: removes from the shared MEMORY.md, topic file prese
   const before = tui.parseIndex(memIndex);
   const target = before[0];
 
+  await tui.setPin(memDir, memIndex, target.filename, false);
   await tui.removeEntry(memDir, memIndex, target.filename);
 
   const after = tui.parseIndex(memIndex);
@@ -1715,6 +1741,7 @@ await test('TUI setPin/removeEntry only act on the parsed entry line, not on sum
     const mentioner = afterPin.find(l => l.includes('(mentioner.md)'));
     assert.ok(!/\[pin\]/.test(mentioner), 'a line that only MENTIONS the link in its summary must not be pinned');
     assert.ok(/\[pin\]/.test(afterPin.find(l => l.startsWith('- [Real Topic]'))), 'the real entry got its pin');
+    await tui.setPin(MEMORY_DIR, idxPath, 'real-topic.md', false, false);
     await tui.removeEntry(MEMORY_DIR, idxPath, 'real-topic.md', false);
     const afterRm = fs.readFileSync(idxPath, 'utf8');
     assert.ok(afterRm.includes('(mentioner.md)'), 'the mentioning line must survive removal of the real entry');
@@ -1727,8 +1754,407 @@ await test('TUI setPin/removeEntry only act on the parsed entry line, not on sum
 });
 
 // ═══════════════════════════════════════════════════════════
+// 0.6.7 storage regressions
+// ═══════════════════════════════════════════════════════════
+
+await test('tombstoned slug collisions preserve the original topic', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'XY+Audit', content: 'original', summary: 'original' });
+  await plugin.tool.remove_memory.execute({ topic: 'XY+Audit' });
+  const original = fs.readFileSync(path.join(MEMORY_DIR, 'xyaudit.md'), 'utf8');
+  await plugin.tool.write_memory.execute({ topic: 'XYAudit', content: 'unrelated', summary: 'unrelated' });
+  assert.equal(fs.readFileSync(path.join(MEMORY_DIR, 'xyaudit.md'), 'utf8'), original);
+  assert.ok(fs.readFileSync(path.join(MEMORY_DIR, 'xyaudit-2.md'), 'utf8').includes('unrelated'));
+  assert.ok(shared.readRemovedList(MEMORY_DIR).has('xyaudit.md'));
+});
+
+await test('TUI removal refuses freshly pinned entries', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Pinned Audit', content: 'keep', summary: 'keep', pin: true });
+  const before = readIndex();
+  const result = await tui.removeEntry(MEMORY_DIR, path.join(MEMORY_DIR, 'MEMORY.md'), 'pinned-audit.md', false);
+  assert.match(result, /pinned/i);
+  assert.equal(readIndex(), before);
+  assert.ok(!shared.readRemovedList(MEMORY_DIR).has('pinned-audit.md'));
+});
+
+await test('topic filenames exclude the index, non-markdown and control characters', () => {
+  for (const filename of ['MEMORY.md', 'memory.md', 'config.json', 'bad\nfile.md', 'bad\0file.md']) {
+    assert.equal(shared.isSafeFilename(filename), false, filename);
+  }
+});
+
+await test('write refuses reserved topics without changing the index', async () => {
+  const before = readIndex();
+  const result = await plugin.tool.write_memory.execute({ topic: 'Memory', content: 'bad', summary: 'bad' });
+  assert.match(result, /Error|reserved|unsafe/i);
+  assert.equal(readIndex(), before);
+});
+
+await test('symlink topics are not read, repaired or overwritten', async () => {
+  const outside = path.join(TMP, 'outside.md');
+  const link = path.join(MEMORY_DIR, 'symlink-audit.md');
+  const idxPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = readIndex();
+  fs.writeFileSync(outside, 'PRIVATE_OUTSIDE_MARKER');
+  fs.symlinkSync(outside, link);
+  try {
+    assert.ok(!tui.readTopic(MEMORY_DIR, 'symlink-audit.md').includes('PRIVATE_OUTSIDE_MARKER'));
+    plugin.__test__.repairMemoryIndex({ memDir: MEMORY_DIR, memIndex: idxPath });
+    assert.ok(!readIndex().includes('(symlink-audit.md)'));
+    fs.writeFileSync(idxPath, before + '\n- [Symlink Audit](symlink-audit.md) 2026-10-01 -- unsafe\n');
+    await assert.rejects(plugin.tool.write_memory.execute({ topic: 'Symlink Audit', content: 'bad', summary: 'bad' }), /unsafe|regular|symlink|ELOOP/i);
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'PRIVATE_OUTSIDE_MARKER');
+    assert.ok(fs.lstatSync(link).isSymbolicLink());
+  } finally {
+    fs.unlinkSync(link);
+    fs.unlinkSync(outside);
+    fs.writeFileSync(idxPath, before);
+  }
+});
+
+await test('atomic write failure preserves the target and removes its temporary file', () => {
+  const target = path.join(MEMORY_DIR, 'atomic-failure.md');
+  fs.writeFileSync(target, 'original');
+  const rename = fs.renameSync;
+  fs.renameSync = () => { throw new Error('injected rename failure'); };
+  try { assert.throws(() => shared.atomicWriteFileSync(target, 'replacement'), /rename failure/); }
+  finally { fs.renameSync = rename; }
+  assert.equal(fs.readFileSync(target, 'utf8'), 'original');
+  assert.ok(!fs.readdirSync(MEMORY_DIR).some(f => f.startsWith('atomic-failure.md.tmp-')));
+  fs.unlinkSync(target);
+});
+
+await test('failed tombstone write leaves the index entry discoverable', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Removal Failure Audit', content: 'keep', summary: 'keep' });
+  const before = readIndex();
+  const rename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to.endsWith('.ocl-removed')) throw new Error('injected tombstone failure');
+    return rename(from, to);
+  };
+  try { await assert.rejects(plugin.tool.remove_memory.execute({ topic: 'Removal Failure Audit' }), /tombstone failure/); }
+  finally { fs.renameSync = rename; }
+  assert.equal(readIndex(), before);
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('EPERM is treated as a live lock holder', async () => {
+  const lp = path.join(MEMORY_DIR, '.lock');
+  const payload = `${process.pid}\t${Date.now()}\tprotected`;
+  fs.writeFileSync(lp, payload);
+  const old = new Date(Date.now() - 20000);
+  fs.utimesSync(lp, old, old);
+  const kill = process.kill;
+  process.kill = () => { throw Object.assign(new Error('permission denied'), { code: 'EPERM' }); };
+  try {
+    assert.equal(await shared.acquireLock(MEMORY_DIR, 20), null);
+    assert.equal(fs.readFileSync(lp, 'utf8'), payload);
+  } finally { process.kill = kill; shared.releaseLock(lp); if (fs.existsSync(lp)) fs.unlinkSync(lp); }
+});
+
+await test('releaseLock does not remove a lock it never acquired', () => {
+  const lp = path.join(MEMORY_DIR, '.lock');
+  fs.writeFileSync(lp, 'foreign');
+  try { shared.releaseLock(lp); assert.equal(fs.readFileSync(lp, 'utf8'), 'foreign'); }
+  finally { if (fs.existsSync(lp)) fs.unlinkSync(lp); }
+});
+
+await test('external index and config edits refresh every process cache without consuming a sentinel', async () => {
+  writeRules('{ "shared_dir": false, "inject_every_n_turns": 999 }');
+  await plugin['experimental.session.compacting']({}, makeCompactOutput());
+  const idx = path.join(MEMORY_DIR, 'MEMORY.md');
+  const original = readIndex();
+  const sentinel = shared.getDirtySentinel(MEMORY_DIR);
+  try {
+    shared.atomicWriteFileSync(idx, original + '\n- [External Cache Marker](external-cache.md) 2026-10-03 -- external\n');
+    fs.writeFileSync(sentinel, 'generation-1');
+    const out = makeSystemOutput();
+    await plugin['experimental.chat.system.transform']({}, out);
+    assert.ok(out.system.join('\n').includes('External Cache Marker'));
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'generation-1');
+    writeRules('{ "shared_dir": true, "always_persist": ["CONFIG_HOT_RELOAD"] }');
+    const switched = makeSystemOutput();
+    await plugin['experimental.chat.system.transform']({}, switched);
+    assert.ok(switched.system.join('\n').includes('CONFIG_HOT_RELOAD'));
+    assert.ok(switched.system[0].includes(`Memory dir: ${SHARED_MEMORY_DIR}`));
+  } finally {
+    fs.writeFileSync(idx, original);
+    fs.unlinkSync(sentinel);
+    writeRules('{ "shared_dir": false }');
+    await plugin['experimental.session.compacting']({}, makeCompactOutput());
+  }
+});
+
+await test('failed carry-over retries in the same process and respects shared tombstones', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Retry Migration Audit', content: 'retry', summary: 'retry' });
+  await plugin.tool.write_memory.execute({ topic: 'Removed Migration Audit', content: 'removed elsewhere', summary: 'removed' });
+  shared.addToRemovedList(SHARED_MEMORY_DIR, 'removed-migration-audit.md');
+  const sentinel = path.join(MEMORY_DIR, '.shared-dir-migrated');
+  const prior = fs.existsSync(sentinel) ? fs.readFileSync(sentinel) : null;
+  if (prior !== null) fs.unlinkSync(sentinel);
+  const fresh = await import('../.opencode/plugins/ocl-memory-shared.mjs?retry-audit');
+  const rename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to === path.join(SHARED_MEMORY_DIR, 'MEMORY.md')) throw new Error('injected carry-over failure');
+    return rename(from, to);
+  };
+  try { await fresh.maybeCarryOverToSharedDir({ sharedDir: true }); }
+  finally { fs.renameSync = rename; }
+  try {
+    assert.ok(!fs.existsSync(sentinel));
+    await fresh.maybeCarryOverToSharedDir({ sharedDir: true });
+    assert.ok(fs.existsSync(sentinel), 'failed attempts must not seal the process guard');
+    const idx = fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), 'utf8');
+    assert.ok(idx.includes('(retry-migration-audit.md)'));
+    assert.ok(!idx.includes('(removed-migration-audit.md)'));
+  } finally {
+    if (prior !== null) fs.writeFileSync(sentinel, prior);
+    else if (fs.existsSync(sentinel)) fs.unlinkSync(sentinel);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('JSONC trailing commas never alter literal strings', () => {
+  const raw = '{ "always_ask": ["literal ,] and ,}",], "max_lines": 200, /* comment */ }';
+  assert.deepEqual(JSON.parse(shared.stripJsonc(raw)), { always_ask: ['literal ,] and ,}'], max_lines: 200 });
+  assert.throws(() => JSON.parse(shared.stripJsonc('{ "max_lines": 1/* gap */2 }')));
+});
+
+await test('updated frontmatter and index carry identical current metadata', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Metadata Audit', content: 'old', summary: 'old' });
+  await plugin.tool.write_memory.execute({ topic: 'Metadata Audit', content: 'new', summary: 'new [bracket] (paren)', mode: 'replace' });
+  const file = path.join(MEMORY_DIR, 'metadata-audit.md');
+  const fm = plugin.__test__.readFrontmatter(file);
+  const line = readIndex().split('\n').find(l => l.includes('(metadata-audit.md)'));
+  assert.equal(fm.description, 'new bracket paren');
+  assert.ok(line.endsWith(' -- ' + fm.description));
+  assert.ok(!fs.readFileSync(file, 'utf8').includes('\nold\n'));
+});
+
+await test('repair reports its pre-existing count without double-counting new entries', () => {
+  const dir = fs.mkdtempSync(path.join(TMP, 'repair-count-'));
+  const index = path.join(dir, 'MEMORY.md');
+  fs.writeFileSync(index, '# Memory Index\n- [Existing](existing.md) -- existing\n');
+  fs.writeFileSync(path.join(dir, 'existing.md'), 'existing');
+  fs.writeFileSync(path.join(dir, 'missing.md'), '---\nname: "Missing"\n---\nbody');
+  assert.deepEqual(plugin.__test__.repairMemoryIndex({ memDir: dir, memIndex: index }), { added: 1, alreadyIndexed: 1 });
+  fs.rmSync(dir, { recursive: true });
+});
+
+await test('repair keeps malformed frontmatter discoverable and flagged', () => {
+  const dir = fs.mkdtempSync(path.join(TMP, 'repair-empty-name-'));
+  const index = path.join(dir, 'MEMORY.md');
+  try {
+    fs.writeFileSync(path.join(dir, 'repair-empty-name.md'), '---\nname: "[()]"\nlast_updated: "2026-01-01T00:00:00+00:00 -- forged summary"\n---\nbody');
+    assert.equal(plugin.__test__.repairMemoryIndex({ memDir: dir, memIndex: index }).added, 1);
+    const line = fs.readFileSync(index, 'utf8').split('\n').find(l => l.includes('(repair-empty-name.md)'));
+    const entry = shared.parseIndexLine(line);
+    assert.equal(entry?.name, 'repair-empty-name');
+    assert.equal(shared.hasIndexFlag(entry.rest, '[stale?]'), true);
+    assert.equal(plugin.__test__.repairMemoryIndex({ memDir: dir, memIndex: index }).added, 0);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+await test('same-day duplicate timestamps choose the newest entry without losing a pin', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Dedup Timestamp Audit', content: 'keep', summary: 'keep' });
+  const index = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = readIndex();
+  const without = before.split('\n').filter(l => !l.includes('(dedup-timestamp-audit.md)')).join('\n');
+  fs.writeFileSync(index, without + '\n- [Dedup Timestamp Audit](dedup-timestamp-audit.md) [pin] 2026-10-03T01:00:00+00:00 -- older\n- [Dedup Timestamp Audit](dedup-timestamp-audit.md) 2026-10-03T02:00:00+00:00 -- newest\n');
+  await plugin.tool.write_memory.execute({ topic: 'Dedup Timestamp Trigger', content: 'trigger', summary: 'trigger' });
+  const line = readIndex().split('\n').find(l => l.includes('(dedup-timestamp-audit.md)'));
+  assert.ok(line.endsWith(' -- newest'));
+  assert.ok(line.includes('[pin]'));
+  assert.ok(!line.includes('[stale?]'));
+});
+
+await test('pin-like text in a summary never acts as a metadata flag', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Summary Pin Audit', content: 'keep', summary: 'keep' });
+  const index = path.join(MEMORY_DIR, 'MEMORY.md');
+  fs.writeFileSync(index, readIndex().replace(/(^- \[Summary Pin Audit\].* -- ).*$/m, '$1literal [pin] in a summary'));
+  const entry = tui.parseIndex(index).find(e => e.filename === 'summary-pin-audit.md');
+  assert.equal(entry.pinned, false);
+  const result = await plugin.tool.remove_memory.execute({ topic: 'Summary Pin Audit' });
+  assert.match(result, /Index entry removed/);
+});
+
+await test('failed index commit restores the original topic body', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Write Rollback Audit', content: 'original', summary: 'original' });
+  const topic = path.join(MEMORY_DIR, 'write-rollback-audit.md');
+  const before = fs.readFileSync(topic, 'utf8');
+  const indexBefore = readIndex();
+  const rename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to === path.join(MEMORY_DIR, 'MEMORY.md')) throw new Error('injected index failure');
+    return rename(from, to);
+  };
+  try { await assert.rejects(plugin.tool.write_memory.execute({ topic: 'Write Rollback Audit', content: 'replacement', summary: 'replacement', mode: 'replace' }), /index failure/); }
+  finally { fs.renameSync = rename; }
+  assert.equal(fs.readFileSync(topic, 'utf8'), before);
+  assert.equal(readIndex(), indexBefore);
+});
+
+await test('TUI shows a pinned refusal instead of silently returning to the browser', async () => {
+  const module = await import('../.opencode/plugins/ocl-memory-tui.mjs');
+  let current;
+  let commands;
+  const api = {
+    ui: { dialog: { setSize() {}, replace(fn) { current = fn(); } }, DialogSelect: opts => opts, DialogConfirm: opts => opts, DialogAlert: opts => opts },
+    keymap: { registerLayer(opts) { commands = opts.commands; return () => {}; } },
+    lifecycle: { onDispose() {} },
+  };
+  await module.default.tui(api);
+  await commands[0].run();
+  const target = current.options.find(o => !o.value.pinned);
+  assert.ok(target);
+  current.onSelect(target);
+  const remove = current.options.find(o => o.value === 'remove');
+  assert.ok(remove);
+  current.onSelect(remove);
+  const confirm = current.onConfirm;
+  await tui.setPin(MEMORY_DIR, path.join(MEMORY_DIR, 'MEMORY.md'), target.value.filename, true, false);
+  await confirm();
+  assert.match(current.message || '', /pinned/i);
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('failed config migration preserves the original legacy file and backup', () => {
+  const config = fs.readFileSync(MEMORY_CONFIG);
+  const backup = MEMORY_CONFIG_LEGACY + '.bak';
+  const priorBackup = fs.existsSync(backup) ? fs.readFileSync(backup) : null;
+  fs.unlinkSync(MEMORY_CONFIG);
+  fs.writeFileSync(MEMORY_CONFIG_LEGACY, '{ "max_lines": 222 }');
+  const rename = fs.renameSync;
+  const link = fs.linkSync;
+  const failConfig = (fn, from, to) => { if (to === MEMORY_CONFIG) throw new Error('injected config failure'); return fn(from, to); };
+  fs.renameSync = (from, to) => failConfig(rename, from, to);
+  fs.linkSync = (from, to) => failConfig(link, from, to);
+  try {
+    assert.equal(shared.readMemoryRules(), null);
+    assert.equal(fs.readFileSync(MEMORY_CONFIG_LEGACY, 'utf8'), '{ "max_lines": 222 }');
+    if (priorBackup !== null) assert.deepEqual(fs.readFileSync(backup), priorBackup);
+  } finally {
+    fs.renameSync = rename;
+    fs.linkSync = link;
+    fs.rmSync(MEMORY_CONFIG_LEGACY, { force: true });
+    if (priorBackup !== null) fs.writeFileSync(backup, priorBackup);
+    fs.writeFileSync(MEMORY_CONFIG, config);
+  }
+});
+
+await test('racing config creation never overwrites a user config', () => {
+  const config = fs.readFileSync(MEMORY_CONFIG);
+  fs.unlinkSync(MEMORY_CONFIG);
+  const rename = fs.renameSync;
+  const link = fs.linkSync;
+  const racingCreator = (fn, from, to) => {
+    if (to === MEMORY_CONFIG) fs.writeFileSync(to, '{ "max_lines": 234 }');
+    return fn(from, to);
+  };
+  fs.renameSync = (from, to) => racingCreator(rename, from, to);
+  fs.linkSync = (from, to) => racingCreator(link, from, to);
+  try {
+    assert.equal(shared.readMemoryRules(), '{ "max_lines": 234 }');
+    assert.equal(fs.readFileSync(MEMORY_CONFIG, 'utf8'), '{ "max_lines": 234 }');
+  } finally { fs.renameSync = rename; fs.linkSync = link; fs.writeFileSync(MEMORY_CONFIG, config); }
+});
+
+await test('/memory command paths follow a shared_dir change before execution', async () => {
+  const config = {};
+  await plugin.config(config);
+  assert.ok(config.command.memory.template.includes(MEMORY_DIR));
+  writeRules('{ "shared_dir": true }');
+  try {
+    const output = { parts: [{ type: 'text', text: config.command.memory.template }] };
+    await plugin['command.execute.before']({ command: 'memory' }, output);
+    assert.ok(output.parts[0].text.includes(`Memory dir: ${SHARED_MEMORY_DIR}`));
+    assert.ok(!output.parts[0].text.includes(`Read ${MEMORY_DIR}/MEMORY.md`));
+  } finally { writeRules('{ "shared_dir": false }'); }
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('TUI cache notification never follows a sentinel symlink', async () => {
+  const sentinel = shared.getDirtySentinel(MEMORY_DIR);
+  const previous = fs.existsSync(sentinel) ? fs.readFileSync(sentinel) : null;
+  const outside = path.join(TMP, 'sentinel-target.txt');
+  fs.writeFileSync(outside, 'keep this content');
+  fs.rmSync(sentinel, { force: true });
+  fs.symlinkSync(outside, sentinel);
+  try {
+    const result = await tui.setPin(MEMORY_DIR, path.join(MEMORY_DIR, 'MEMORY.md'), 'metadata-audit.md', false, false);
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'keep this content');
+    assert.match(result, /Index updated.*notification failed/);
+  } finally {
+    fs.rmSync(sentinel, { force: true });
+    if (previous !== null) fs.writeFileSync(sentinel, previous);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('a replaced lock in the same process is not released by its previous owner', async () => {
+  const lp = path.join(MEMORY_DIR, '.lock');
+  let releaseInner;
+  let enteredInner;
+  let inner;
+  const held = new Promise(resolve => { releaseInner = resolve; });
+  const ready = new Promise(resolve => { enteredInner = resolve; });
+  try {
+    await shared.withLock(MEMORY_DIR, async () => {
+      fs.unlinkSync(lp); // simulate a forced replacement while the first caller still runs
+      inner = shared.withLock(MEMORY_DIR, async () => { enteredInner(); await held; });
+      await ready;
+    });
+    assert.ok(fs.existsSync(lp), 'the newer acquisition must retain its lock');
+  } finally { releaseInner(); await inner; fs.rmSync(lp, { force: true }); }
+});
+
+await test('an undeletable stale lock obeys the acquisition deadline', async () => {
+  const lp = path.join(MEMORY_DIR, '.lock');
+  fs.writeFileSync(lp, '999999\t0\tdead');
+  const old = new Date(Date.now() - 20000);
+  fs.utimesSync(lp, old, old);
+  const script = `import fs from 'node:fs'; import { acquireLock, MEMORY_DIR } from ${JSON.stringify(new URL('../.opencode/plugins/ocl-memory-shared.mjs', import.meta.url).href)}; const unlink = fs.unlinkSync; fs.unlinkSync = p => { if (p.endsWith('/.lock')) throw Object.assign(new Error('denied'), { code: 'EACCES' }); return unlink(p); }; process.stdout.write(JSON.stringify(await acquireLock(MEMORY_DIR, 20)));`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  child.stdout.on('data', data => { output += data; });
+  const timer = setTimeout(() => child.kill(), 1500);
+  try {
+    const code = await new Promise(resolve => child.once('exit', resolve));
+    assert.equal(code, 0, 'stale reclaim must not loop forever when unlink fails');
+    assert.equal(output, 'null');
+  } finally { clearTimeout(timer); child.kill(); fs.rmSync(lp, { force: true }); }
+});
+
+// ═══════════════════════════════════════════════════════════
 // Results
 // ═══════════════════════════════════════════════════════════
+
+await test('store and config FIFO reads are refused without blocking', async () => {
+  if (process.platform === 'win32') return;
+  const { spawnSync } = await import('node:child_process');
+  const dir = fs.mkdtempSync(path.join(TMP, 'fifo-read-'));
+  const script = `import assert from 'node:assert/strict'; import fs from 'node:fs'; import { execFileSync } from 'node:child_process'; const s = await import(${JSON.stringify(new URL('../.opencode/plugins/ocl-memory-shared.mjs', import.meta.url).href)}); fs.mkdirSync(s.CONFIG_ROOT, { recursive: true }); const pipe = ${JSON.stringify(path.join(dir, 'pipe.md'))}; execFileSync('mkfifo', [pipe, s.MEMORY_CONFIG]); assert.throws(() => s.readStoreFileSync(pipe), /regular/); assert.equal(s.readMemoryRules(), null);`;
+  try {
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, XDG_CONFIG_HOME: dir }, timeout: 2000 });
+    assert.equal(child.status, 0, child.error?.message || child.stderr.toString());
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+await test('config target edits through a symlink refresh the active store', async () => {
+  const before = fs.readFileSync(MEMORY_CONFIG, 'utf8');
+  const target = path.join(TMP, 'symlink-config.jsonc');
+  try {
+    fs.writeFileSync(target, '{ "shared_dir": false, "inject_every_n_turns": 9999 }');
+    fs.unlinkSync(MEMORY_CONFIG);
+    fs.symlinkSync(target, MEMORY_CONFIG);
+    const first = { system: [] };
+    await plugin['experimental.chat.system.transform']({}, first);
+    assert.ok(first.system.join('\n').includes(`Memory dir: ${MEMORY_DIR}`));
+    fs.writeFileSync(target, '{ "shared_dir": true, "inject_every_n_turns": 9999 }');
+    const next = { system: [] };
+    await plugin['experimental.chat.system.transform']({}, next);
+    assert.ok(next.system.join('\n').includes(`Memory dir: ${SHARED_MEMORY_DIR}`));
+  } finally { fs.unlinkSync(MEMORY_CONFIG); fs.writeFileSync(MEMORY_CONFIG, before); fs.rmSync(target, { force: true }); }
+});
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);

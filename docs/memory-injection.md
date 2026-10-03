@@ -2,43 +2,28 @@
 
 [Back to README](../README.md)
 
-A common misconception: that the injected memory index would become "stale" in context as the conversation grows. This is not how opencode works.
+## Per-request system prompts
 
-## System prompt persistence
+OpenCode 1.18.34 constructs a fresh system prompt for each model request and invokes `experimental.chat.system.transform`. A plugin's previous `output.system` mutation is not retained for the next request. Openclaude-memory therefore appends `## Global Memory` and `## Memory Rules` on every invocation, including later steps, other sessions, title generation, and compaction requests. There is no process-global first-turn gate.
 
-opencode builds a system prompt at the start of each session. When this plugin fires its `experimental.chat.system.transform` hook on turn 1, it pushes the `## Global Memory` and `## Memory Rules` blocks into `output.system`. That system prompt is **fixed for the life of the session** — opencode sends it on every LLM call. The agent has the memory index in context on turn 1, turn 10, turn 50. It never disappears mid-session.
+## Cache freshness
 
-There is no token overhead per turn from persistence — the system prompt is part of the request structure, not the conversation messages. You are not paying to "re-send" it each turn; opencode handles this at the API level.
+The index and rendered behavioral rules are cached to avoid repeated content reads. Before reuse, the plugin checks file identity, size, and nanosecond modification/change timestamps for `memory.jsonc`, the active directory, `MEMORY.md`, `.ocl-removed`, and `.invalidate`. A change rebuilds the cache. Config changes also re-resolve `shared_dir`; `/memory` refreshes its directory paths before execution.
 
-## What re-injection actually does
+`inject_every_n_turns` retains its historical name, but now forces a full disk refresh every N model requests, default 5. This is a process-wide request counter, not a user-turn or session counter. Memory is injected regardless of the interval. Memory tool mutations invalidate the cache; compaction always forces a refresh. TUI notifications are not consumed or deleted, so another server process can observe the same change. Ordinary manual and co-tenant edits are detected through file stamps without a sentinel.
 
-The plugin re-injects memory on three conditions (not just turn 1):
+## Compaction and consolidation
 
-1. **First turn** — cold load and initial injection.
-2. **After any memory tool call** — `write_memory`, `remove_memory`, or `pin_memory` mutate `MEMORY.md`. The dirty flag is set and the next turn injects the updated index so the agent sees the change it just made.
-3. **Every `inject_every_n_turns` turns** (default: 5) — the plugin re-injects its cached memory state. This is **not** to keep memory present (it already is), and it does not itself reread arbitrary manual disk edits.
+`experimental.session.compacting` freshly reads memory into the compaction context. Subsequent model requests also receive their own memory blocks; no injection-state reset is needed.
 
-If you only use memory tools, condition 3 is mostly a no-op. Tool mutations invalidate the cache, so the next injection already has current content. TUI mutations are also detected by their `.invalidate` sentinel when the server checks the same active directory. Ordinary manual file/config edits require a tool mutation, compaction, or session restart to refresh the cache.
+With `consolidate_on_compact: true`, the automatic continuation hook fetches the latest compaction summary and saves a consolidation prompt with `client.session.prompt({ body: { noReply: true, ... } })`. Saving returns immediately instead of awaiting the session loop that is already running. The queued prompt preserves the active agent, model, and variant. Native continuation is disabled only after a successful API response; failures leave it enabled.
 
-## Compaction
+The summary-backed prompt resumes pending work from `Next Move`. If no summary can be fetched, the full-conversation fallback also instructs the agent to resume pending work. Manual `/compact` and automatic compaction paths that replay a user message do not invoke this continuation hook; run `/memory consolidate` explicitly when needed.
 
-When opencode triggers automatic context compaction (context overflow prevention), it fires the `experimental.session.compacting` hook. The plugin:
+## Token cost
 
-1. Force-reads `MEMORY.md` fresh from disk and pushes it into `output.context` — the compaction summary includes current memory state.
-2. Resets `_injectedOnce`, `_dirty`, and `_turnCount` to zero.
+The memory blocks form part of every model request's input tokens. Provider prompt caching may discount repeated content, but this plugin does not guarantee free system-prompt tokens or a particular cache hit rate. Increasing `inject_every_n_turns` reduces periodic content rereads, not prompt size or injection frequency. Topic bodies are loaded on demand rather than injected automatically. The index block is capped at configured whole lines and 50 KiB; behavioral rules and tool schemas add their own tokens.
 
-After compaction, opencode replaces the agent's context window. The first turn of the new context re-injects memory into the fresh system prompt — the same as session start. Memory does not get lost across compaction.
+## Verification
 
-## Summary
-
-| Scenario | Memory in context? |
-|---|---|
-| Turn 1 | Injected for the first time |
-| Turn 2–4 | Still present via system prompt (no re-injection needed) |
-| Turn 5 (default N=5) | Re-injected from cached state (not a disk freshness check) |
-| After `write_memory` / `remove_memory` / `pin_memory` | Re-injected with updated content |
-| After TUI browser edit | Cache invalidated by `.invalidate`; re-injected on next server cache check in the same active dir |
-| After context compaction | Re-injected on first post-compaction turn |
-
-The `inject_every_n_turns` config value controls how often cached memory is re-emitted — it has no effect on whether memory is present. Raise it to save tokens on long sessions; it does not make arbitrary manual edits visible sooner.
-</content>
+`npm run test:host` starts the installed OpenCode server with temporary config and memory paths and a local fake model. It verifies native tool execution, memory on subsequent requests, another session's first request, and automatic consolidation completing without re-entrant deadlock. OpenCode 1.18.34 passed this check; this establishes host integration, not a real model's memory-writing judgment.

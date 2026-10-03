@@ -4,8 +4,8 @@ import {
   MEMORY_DIR, MEMORY_CONFIG, INITIAL_MEMORY, parseIndexLine,
   stripJsonc, readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel,
   ensureMemoryDir, atomicWriteFileSync, sleep, withLock, acquireLock, releaseLock, LockContendedError,
-  maybeCarryOverToSharedDir, isSafeFilename,
-  readRemovedList, addToRemovedList, removeFromRemovedList,
+  maybeCarryOverToSharedDir, isSafeFilename, isRegularFile, readStoreFileSync,
+  readRemovedList, addToRemovedList, removeFromRemovedList, hasIndexFlag,
 } from './ocl-memory-shared.mjs';
 
 const MAX_BYTES = 50 * 1024;
@@ -18,7 +18,7 @@ const CONSOLIDATION_PROMPT = `Review the current conversation for facts, decisio
 
 Then write or update a topic named "OCL Last Session Recap" (toSlug of that name is exactly ocl-last-session-recap.md — use this topic string verbatim so repeated consolidations update ONE recap instead of creating duplicates) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
 
-If nothing new was found to persist, say so plainly and do not call any tools.`;
+If no new durable facts were found, say so plainly and only refresh the recap.`;
 
 // Consolidation prompt used after automatic compaction. Instead of asking the
 // agent to re-scan the whole conversation (the compaction LLM already did that),
@@ -38,43 +38,44 @@ Then write or update a topic named "OCL Last Session Recap" (toSlug of that name
 After consolidating, continue with any pending work described in the summary's "Next Move" section. If there is no pending work, stop.`;
 
 // --- In-process cache ---
-// Loaded once per session (or after any tool mutation / compaction).
-// Avoids re-reading memory.jsonc and MEMORY.md on every turn.
-// Caveat: manual edits to memory.jsonc or MEMORY.md between turns are not
-// reflected until the next tool call or compaction event.
-// process-global state; safe for single-user plugin.
-// Upgrade path: per-session Map keyed by session ID if multi-session needed.
+// Memory is global, so sessions can share a cache. Check filesystem identity
+// before reuse; never consume a notification that another process still needs.
 let _cache = null;
+let _requestCount = 0;
 
-// Injection state — controls whether system.transform injects memory this turn.
-// _injectedOnce: false until first injection; reset to false after compaction.
-// _dirty: set to true by tool.execute.after when a memory tool mutates MEMORY.md;
-//         cleared after system.transform injects the updated content.
-// _turnCount: incremented each turn; used to enforce the inject_every_n_turns interval.
-let _injectedOnce = false;
-let _dirty = false;
-let _turnCount = 0;
+function fileStamp(filePath) {
+  try {
+    const s = fs.lstatSync(filePath, { bigint: true });
+    let stamp = `${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+    if (s.isSymbolicLink()) {
+      try {
+        const target = fs.statSync(filePath, { bigint: true });
+        stamp += `>${target.dev}:${target.ino}:${target.size}:${target.mtimeNs}:${target.ctimeNs}`;
+      } catch (err) { stamp += `>${err.code}`; }
+    }
+    return stamp;
+  } catch (err) { if (err.code === 'ENOENT') return ''; throw err; }
+}
+
+function cacheSignature(memDir, configStamp = fileStamp(MEMORY_CONFIG)) {
+  return [configStamp, ...[memDir, path.join(memDir, 'MEMORY.md'), path.join(memDir, '.ocl-removed'), getDirtySentinel(memDir)].map(fileStamp)].join('|');
+}
 
 async function getCache(forceRefresh = false) {
-  // If TUI mutated MEMORY.md directly, it writes a sentinel file to signal us.
-  // The sentinel lives alongside whichever dir was active last time we
-  // resolved (_cache.memDir) — matches wherever the TUI actually wrote it.
-  if (_cache && !forceRefresh && fs.existsSync(getDirtySentinel(_cache.memDir))) {
-    try { fs.unlinkSync(getDirtySentinel(_cache.memDir)); } catch {}
-    _cache = null;
-    _dirty = true;
-  }
+  if (_cache && _cache.signature !== cacheSignature(_cache.memDir)) _cache = null;
   if (!_cache || forceRefresh) {
+    const configStamp = fileStamp(MEMORY_CONFIG);
     const rules = readMemoryRules();
     const config = parseRules(rules);
     await maybeCarryOverToSharedDir(config);
     const renderedRules = renderRulesForInjection(rules);
     const memDir = getMemoryDir(config);
+    const signature = cacheSignature(memDir, configStamp);
     const content = readMemoryIndex(config.maxLines, memDir);
     // Only meaningful under shared_dir (a co-tenant is the realistic cause of
     // index/file drift); cheap readdir+read, computed once per cache refresh.
     const drift = config.sharedDir ? countMemoryFiles(memDir, getMemoryIndex(config)) : null;
-    _cache = { renderedRules, config, content, memDir, drift };
+    _cache = { renderedRules, config, content, memDir, drift, signature };
   }
   return _cache;
 }
@@ -111,7 +112,7 @@ function readMemoryIndex(maxLines, memDir) {
     if (!fs.existsSync(indexPath)) {
       return INITIAL_MEMORY; // do not create on a read path; tools create it under lock
     }
-    const raw = fs.readFileSync(indexPath, 'utf8');
+    const raw = readStoreFileSync(indexPath, MAX_BYTES + 1);
     const lines = raw.split('\n');
     const lineLimitExceeded = lines.length > maxLines;
     const limitedLines = lines.slice(0, maxLines);
@@ -167,15 +168,18 @@ function maintainIndex(lines, config, memDir = MEMORY_DIR) {
 
   // Pass 1: for each filename, pick the entry with the most-recent date; skip orphans.
   const best = new Map(); // filename -> raw line (winner)
+  const pinned = new Set();
+  const timestamp = rest => Date.parse((rest.split(' -- ')[0].match(/\d{4}-\d{2}-\d{2}(?:T[\d:.]+(?:Z|[+-]\d{2}:\d{2}))?/) || [''])[0]) || 0;
   for (const line of lines) {
     const parsed = parseIndexLine(line);
     if (!parsed) continue;
     const { filename } = parsed;
     if (!isSafeFilename(filename)) continue; // corrupted/unsafe entry — drop like an orphan
-    if (!fs.existsSync(path.join(memDir, filename))) continue;
-    const date = (parsed.rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
+    if (!isRegularFile(path.join(memDir, filename))) continue;
+    const date = timestamp(parsed.rest);
+    if (hasIndexFlag(parsed.rest, '[pin]')) pinned.add(filename);
     const prev = best.get(filename);
-    const prevDate = prev ? ((parseIndexLine(prev).rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '') : '';
+    const prevDate = prev ? timestamp(parseIndexLine(prev).rest) : 0;
     if (!prev || date > prevDate) best.set(filename, line);
   }
 
@@ -192,9 +196,14 @@ function maintainIndex(lines, config, memDir = MEMORY_DIR) {
     // Apply stale stamping to the winner's rest
     const winner = parseIndexLine(best.get(filename));
     let rest = winner.rest;
-    const isPinned = rest.includes('[pin]');
+    const isPinned = pinned.has(filename);
+    if (isPinned && !hasIndexFlag(rest, '[pin]')) rest = ' [pin]' + rest;
+    const separator = rest.indexOf(' -- ');
+    const summary = separator === -1 ? '' : rest.slice(separator);
+    rest = separator === -1 ? rest : rest.slice(0, separator);
+    if (isPinned || staleAfterDays === 0) rest = rest.replace(/\s*\[stale\?\]/g, '');
     if (!isPinned && staleAfterDays > 0) {
-      const dateMatch = rest.match(/(\d{4}-\d{2}-\d{2}(?:T[\d:.+-]+)?)/);
+      const dateMatch = rest.match(/(\d{4}-\d{2}-\d{2}(?:T[\d:.]+(?:Z|[+-]\d{2}:\d{2}))?)/);
       if (dateMatch) {
         const age = daysSince(dateMatch[1]);
         if (age !== null && age > staleAfterDays) {
@@ -205,7 +214,7 @@ function maintainIndex(lines, config, memDir = MEMORY_DIR) {
       }
     }
 
-    result.push(winner.prefix + winner.name + winner.mid + rest);
+    result.push(winner.prefix + winner.name + winner.mid + rest + summary);
   }
 
   return result;
@@ -274,7 +283,7 @@ function upsertIndexLine(lines, filename, name, summary, pin) {
     const parsed = parseIndexLine(lines[i]);
     if (!parsed) continue;
     if (parsed.filename === filename) {
-      const effectivePin = parsed.rest.includes('[pin]') || pin;
+      const effectivePin = hasIndexFlag(parsed.rest, '[pin]') || pin;
       const pinToken = effectivePin ? ' [pin]' : '';
       lines[i] = `- [${name}](${filename})${pinToken} ${dateStr} -- ${summary}`;
       return lines;
@@ -294,10 +303,14 @@ function upsertIndexLine(lines, filename, name, summary, pin) {
 function readFrontmatter(filePath) {
   const fallbackName = path.basename(filePath).replace(/\.md$/, '');
   try {
-    const text = fs.readFileSync(filePath, 'utf8');
-    const m = text.match(/^---\n([\s\S]*?)\n---\n/);
+    const text = readStoreFileSync(filePath, MAX_BYTES);
+    const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
     const block = m ? m[1] : '';
-    const unquote = v => v.trim().replace(/^["']|["']$/g, '');
+    const unquote = v => {
+      const value = v.trim();
+      if (value.startsWith('"')) { try { const decoded = JSON.parse(value); if (typeof decoded === 'string') return decoded; } catch {} }
+      return value.replace(/^['"]|['"]$/g, '');
+    };
     const grab = key => {
       const km = block.match(new RegExp(`^${key}:\\s*(.*)$`, 'm'));
       return km ? unquote(km[1]) : '';
@@ -326,12 +339,12 @@ function countMemoryFiles(memDir, memIndex) {
   try {
     const removed = readRemovedList(memDir);
     fileCount = fs.readdirSync(memDir)
-      .filter(f => f.endsWith('.md') && f !== 'MEMORY.md' && isSafeFilename(f) && !removed.has(f)).length;
+      .filter(f => isSafeFilename(f) && !removed.has(f) && isRegularFile(path.join(memDir, f))).length;
   } catch {}
   let indexedCount = 0;
   try {
     indexedCount = new Set(
-      fs.readFileSync(memIndex, 'utf8').split('\n').map(parseIndexLine).filter(Boolean).map(e => e.filename)
+      readStoreFileSync(memIndex).split('\n').map(parseIndexLine).filter(e => e && isSafeFilename(e.filename)).map(e => e.filename)
     ).size;
   } catch {}
   return { fileCount, indexedCount };
@@ -344,8 +357,9 @@ function countMemoryFiles(memDir, memIndex) {
 // frontmatter timestamp. Safe to call repeatedly (idempotent). Returns
 // { added, alreadyIndexed }.
 function repairMemoryIndex({ memDir, memIndex }) {
-  const index = fs.existsSync(memIndex) ? fs.readFileSync(memIndex, 'utf8') : INITIAL_MEMORY;
+  const index = fs.existsSync(memIndex) ? readStoreFileSync(memIndex) : INITIAL_MEMORY;
   const indexed = new Set(index.split('\n').map(parseIndexLine).filter(Boolean).map(e => e.filename));
+  const alreadyIndexed = indexed.size;
   const removed = readRemovedList(memDir); // intentionally-removed topics — never resurrect
   const added = [];
   let files = [];
@@ -353,19 +367,22 @@ function repairMemoryIndex({ memDir, memIndex }) {
   for (const file of files) {
     if (!file.endsWith('.md') || file === 'MEMORY.md') continue;
     if (!isSafeFilename(file)) continue;      // never re-introduce an unsafe/traversal name
+    if (!isRegularFile(path.join(memDir, file))) continue;
     if (indexed.has(file)) continue;           // already present — additive only
     if (removed.has(file)) continue;           // deliberately removed via remove_memory — skip
     const fm = readFrontmatter(path.join(memDir, file));
     // sanitizeIndexField on every recovered field — including ts: a corrupted
     // co-tenant frontmatter timestamp like "2026-01-01 [pin]" must not smuggle
     // a pin token (or a phantom `--` summary separator) onto the index line.
-    added.push(`- [${sanitizeIndexField(fm.name)}](${file}) ${sanitizeIndexField(fm.ts).trim()} [stale?] -- ${sanitizeIndexField(fm.description || fm.name)}`);
+    const name = sanitizeIndexField(fm.name).trim() || file.slice(0, -3).trim() || file;
+    const ts = sanitizeIndexField(fm.ts).trim().split(' -- ')[0];
+    added.push(`- [${name}](${file}) ${ts} [stale?] -- ${sanitizeIndexField(fm.description || name)}`);
     indexed.add(file);
   }
   if (added.length) {
     atomicWriteFileSync(memIndex, index.replace(/\n+$/, '') + '\n' + added.join('\n') + '\n');
   }
-  return { added: added.length, alreadyIndexed: indexed.size };
+  return { added: added.length, alreadyIndexed };
 }
 
 // --- Tool definitions ---
@@ -407,7 +424,7 @@ const tools = {
       // Collapse to one clean line and cap length (openpi-memory parity) BEFORE
       // any use, so the frontmatter description, the index line, and the
       // returned Entry line all carry the SAME summary value.
-      const cleanSummary = summary.replace(/\s+/g, ' ').trim().slice(0, MAX_SUMMARY_LENGTH);
+      const cleanSummary = sanitizeIndexField(summary).replace(/\s+/g, ' ').trim().slice(0, MAX_SUMMARY_LENGTH);
       const pinBool = pin === true || pin === 'true';
 
       const { config } = await getCache();
@@ -419,7 +436,7 @@ const tools = {
         return await withLock(memDir, async () => {
           // Read index once — reuse for topic-name lookup and upsert
           const rawIndex = fs.existsSync(memIndex)
-            ? fs.readFileSync(memIndex, 'utf8')
+            ? readStoreFileSync(memIndex)
             : INITIAL_MEMORY;
 
           // Check if an existing index entry matches this topic name — use its filename if so
@@ -455,56 +472,48 @@ const tools = {
             // bumped like an unrelated slug collision. removeFromRemovedList()
             // below clears the tombstone. Only genuinely-unrelated existing files
             // force a numeric suffix.
-            while (fs.existsSync(path.join(memDir, filename)) && !removedSet.has(filename)) {
+            while (fs.existsSync(path.join(memDir, filename))) {
+              const candidate = path.join(memDir, filename);
+              if (removedSet.has(filename) && isRegularFile(candidate)
+                && readFrontmatter(candidate).name.toLowerCase() === cleanTopic.toLowerCase()) break;
               filename = `${base}-${n}.md`;
               n++;
             }
           }
           const topicPath = path.join(memDir, filename);
-
-          let isNew = false;
-          if (!fs.existsSync(topicPath)) {
-            isNew = true;
-            const now = nowIso();
-            const frontmatter = `---\nname: ${JSON.stringify(cleanTopic)}\ndescription: ${JSON.stringify(cleanSummary)}\ncreated: ${now}\nlast_updated: ${now}\nmetadata:\n  node_type: memory\n---\n\n`;
-            atomicWriteFileSync(topicPath, frontmatter + content + '\n');
-          } else if (mode === 'replace') {
-            const now = nowIso();
-            const existing = fs.readFileSync(topicPath, 'utf8');
-            const fmMatch = existing.match(/^(---\n[\s\S]*?\n---\n)/);
-            let fm = fmMatch ? fmMatch[1] : '';
-            if (fm.includes('last_updated:')) {
-              fm = fm.replace(/^(last_updated:\s*).*$/m, `$1${now}`);
-            } else if (fm.includes('created:')) {
-              fm = fm.replace(/^(created:.*)$/m, `$1\nlast_updated: ${now}`);
-            }
-            atomicWriteFileSync(topicPath, fm + '\n' + content + '\n');
-          } else {
-            const now = nowIso();
-            const existing = fs.readFileSync(topicPath, 'utf8');
-            const fmMatch = existing.match(/^(---\n[\s\S]*?\n---\n)/);
-            let updated = existing;
-            if (fmMatch) {
-              let fm = fmMatch[1];
-              if (fm.includes('last_updated:')) {
-                fm = fm.replace(/^(last_updated:\s*).*$/m, `$1${now}`);
-              } else if (fm.includes('created:')) {
-                fm = fm.replace(/^(created:.*)$/m, `$1\nlast_updated: ${now}`);
-              }
-              updated = fm + existing.slice(fmMatch[1].length);
-            }
-            atomicWriteFileSync(topicPath, updated + `\n## ${now}\n\n` + content + '\n');
+          const previous = fs.existsSync(topicPath) ? readStoreFileSync(topicPath) : null;
+          const isNew = previous === null;
+          const now = nowIso();
+          const match = previous?.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+          let fm = match ? match[1].replace(/\r\n/g, '\n') : 'metadata:\n  node_type: memory';
+          const fields = { name: JSON.stringify(cleanTopic), description: JSON.stringify(cleanSummary), last_updated: now };
+          if (!/^created:/m.test(fm)) fields.created = now;
+          for (const [key, value] of Object.entries(fields)) {
+            const re = new RegExp(`^${key}:.*$`, 'm');
+            fm = re.test(fm) ? fm.replace(re, () => `${key}: ${value}`) : fm + `\n${key}: ${value}`;
           }
-
-          // Update index
-          let lines = rawIndex.split('\n');
-
-          lines = upsertIndexLine(lines, filename, cleanTopic, cleanSummary, pinBool);
-          lines = maintainIndex(lines, config, memDir);
-
-          atomicWriteFileSync(memIndex, lines.join('\n'));
-          removeFromRemovedList(memDir, filename); // re-storing clears any prior intentional-removal tombstone
-          invalidateCache(); // nuke cache so the next caller re-reads the fresh index
+          const oldBody = match ? previous.slice(match[0].length) : previous || '';
+          const body = isNew || mode === 'replace' ? '\n' + content + '\n' : oldBody + `\n## ${now}\n\n${content}\n`;
+          const wasRemoved = readRemovedList(memDir).has(filename);
+          let indexWritten = false;
+          try {
+            atomicWriteFileSync(topicPath, `---\n${fm}\n---\n${body}`);
+            let lines = upsertIndexLine(rawIndex.split('\n'), filename, cleanTopic, cleanSummary, pinBool);
+            lines = maintainIndex(lines, config, memDir);
+            atomicWriteFileSync(memIndex, lines.join('\n'));
+            indexWritten = true;
+            removeFromRemovedList(memDir, filename);
+          } catch (error) {
+            try {
+              if (indexWritten) atomicWriteFileSync(memIndex, rawIndex);
+              if (previous !== null) atomicWriteFileSync(topicPath, previous);
+              else if (fs.existsSync(topicPath)) fs.unlinkSync(topicPath);
+              if (wasRemoved) addToRemovedList(memDir, filename);
+            } catch (rollbackError) {
+              throw new AggregateError([error, rollbackError], `Memory update and rollback failed; inspect ${topicPath} and ${memIndex}.`);
+            }
+            throw error;
+          } finally { invalidateCache(); }
 
           return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${memIndex}\nEntry: [${cleanTopic}](${filename}) ${nowIso()} -- ${cleanSummary}`;
         }, { strict: config.sharedDir });
@@ -535,7 +544,7 @@ const tools = {
 
       try {
         return await withLock(memDir, async () => {
-          const raw = fs.readFileSync(memIndex, 'utf8');
+          const raw = readStoreFileSync(memIndex);
           const lines = raw.split('\n');
 
           const found = findIndexEntry(lines, search);
@@ -551,17 +560,16 @@ const tools = {
             return `Entry has an unsafe filename (${parsed.filename}) and was not modified. This may indicate a corrupted index — inspect it manually.`;
           }
 
-          if (parsed.rest.includes('[pin]')) {
+          if (lines.map(parseIndexLine).some(p => p && p.filename === parsed.filename && hasIndexFlag(p.rest, '[pin]'))) {
             return `Entry is pinned and cannot be removed. Use pin_memory with pin: false to unpin it first.`;
           }
 
           const removedLine = lines[foundIdx];
-          lines.splice(foundIdx, 1);
+          const remaining = lines.filter(line => parseIndexLine(line)?.filename !== parsed.filename);
+          const maintained = maintainIndex(remaining, config, memDir);
 
-          const maintained = maintainIndex(lines, config, memDir);
-
-          atomicWriteFileSync(memIndex, maintained.join('\n'));
           addToRemovedList(memDir, parsed.filename); // tombstone: repair must not resurrect this
+          atomicWriteFileSync(memIndex, maintained.join('\n'));
           invalidateCache();
 
           const topicFile = path.join(memDir, parsed.filename);
@@ -600,7 +608,7 @@ const tools = {
 
       try {
         return await withLock(memDir, async () => {
-          const raw = fs.readFileSync(memIndex, 'utf8');
+          const raw = readStoreFileSync(memIndex);
           const lines = raw.split('\n');
 
           const found = findIndexEntry(lines, search);
@@ -612,18 +620,22 @@ const tools = {
           }
           const { idx: foundIdx, parsed } = found;
 
+          if (!isSafeFilename(parsed.filename)) return 'Entry has an unsafe filename and was not modified.';
           const line = lines[foundIdx];
-          const alreadyPinned = parsed.rest.includes('[pin]');
+          const alreadyPinned = lines.map(parseIndexLine).some(p => p && p.filename === parsed.filename && hasIndexFlag(p.rest, '[pin]'));
 
           if (pinBool && alreadyPinned) return `Already pinned: ${line.trim()}`;
           if (!pinBool && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
 
-          const newRest = pinBool
-            ? ' [pin]' + parsed.rest
-            : parsed.rest.replace(/\s*\[pin\]/, '');
-
           const before = line.trim();
-          lines[foundIdx] = parsed.prefix + parsed.name + parsed.mid + newRest;
+          for (let i = 0; i < lines.length; i++) {
+            const entry = parseIndexLine(lines[i]);
+            if (!entry || entry.filename !== parsed.filename) continue;
+            const rest = pinBool
+              ? (hasIndexFlag(entry.rest, '[pin]') ? entry.rest : ' [pin]' + entry.rest)
+              : (hasIndexFlag(entry.rest, '[pin]') ? entry.rest.replace(/\s*\[pin\]/, '') : entry.rest);
+            lines[i] = entry.prefix + entry.name + entry.mid + rest;
+          }
           const after = lines[foundIdx].trim();
 
           const maintained = maintainIndex(lines, config, memDir);
@@ -669,6 +681,8 @@ const tools = {
 export default async (input) => {
   const client = input && input.client;
   const skillsDir = new URL('../../skills', import.meta.url).pathname;
+  let commandTemplate;
+  let commandDir;
 
   // Fetch the text of the most recent compaction summary for a session.
   // opencode stores it as an assistant message with `summary === true`.
@@ -704,10 +718,7 @@ export default async (input) => {
         config.skills.paths.push(skillsDir);
       }
 
-      // Resolve the active memory dir/index once at startup for display in the
-      // command template. If shared_dir is toggled later, this stays stale
-      // until the next restart — same one-time-resolution behavior the rest
-      // of the plugin already has for config.
+      // Register an initial template; command.execute.before refreshes its paths.
       const { config: memConfig } = await getCache();
       const activeDir = getMemoryDir(memConfig);
       const activeIndex = getMemoryIndex(memConfig);
@@ -759,12 +770,21 @@ It additively re-indexes any .md topic file that exists in the memory dir but is
 ## Arguments provided (not starting with "pin ", "unpin ", or "remove ", and not exactly "consolidate" or "repair"): store a memory
 
 Treat the arguments as a fact or note to persist. Decide the topic, a slug filename, a one-line summary, and whether the topic is permanent (hardware, user identity, core workflows = pin it). Then call the write_memory tool:
-  write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false> })
+  write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false>, mode: "append" })
 
 The tool creates a new topic file or appends to an existing one, and updates the MEMORY.md index automatically.
 
 Any text including single words is treated literally as content to store. Do not interpret "show", "list", or similar words as subcommands unless the full argument starts with "pin ", "unpin ", or "remove ", or is exactly "consolidate" or "repair".`,
       };
+      commandTemplate = config.command.memory.template;
+      commandDir = activeDir;
+    },
+
+    'command.execute.before': async (hookInput, output) => {
+      if (hookInput.command !== 'memory' || !commandTemplate) return;
+      const { memDir } = await getCache();
+      const part = output.parts.find(p => p.type === 'text');
+      if (part) part.text = commandTemplate.split(commandDir).join(memDir).replaceAll('$ARGUMENTS', () => hookInput.arguments || '');
     },
 
     tool: tools,
@@ -773,43 +793,28 @@ Any text including single words is treated literally as content to store. Do not
     // asserted directly without going through the full hook surface.
     __test__: { repairMemoryIndex, readFrontmatter, countMemoryFiles },
 
-    // Set _dirty when a memory tool mutates MEMORY.md so system.transform
-    // knows to re-inject the updated index on the next turn.
+    // Refresh the cache after memory tools, including mutations by other plugins.
     'tool.execute.after': async (input, _output) => {
       if (MEMORY_TOOL_NAMES.has(input.tool)) {
-        _dirty = true;
+        invalidateCache();
       }
     },
 
-    // Inject memory into system prompt on:
-    //   1. First turn of the session (_injectedOnce === false)
-    //   2. Any turn following a memory tool mutation (_dirty === true)
-    //   3. Every N turns per inject_every_n_turns config (default: 5)
-    // All other turns skip injection, saving tokens while keeping memory salient.
+    // OpenCode constructs a fresh system prompt for EVERY model request.
+    // Cache disk reads, never the presence of memory in the outgoing request.
     'experimental.chat.system.transform': async (_input, output) => {
-      _turnCount++;
-      const { renderedRules, content, config, memDir, drift } = await getCache();
-      const shouldInject = !_injectedOnce || _dirty || (_turnCount % config.injectEveryNTurns === 0);
-
-      if (shouldInject) {
-        if (content) {
-          output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
-          // Passive, non-mutating drift signal: many topic files exist but are
-          // absent from the index (a co-tenant likely rewrote MEMORY.md).
-          // Point at /memory repair instead of silently auto-mutating the
-          // shared index at turn time.
-          if (config.sharedDir && drift && drift.fileCount > drift.indexedCount + DRIFT_NOTE_THRESHOLD) {
-            const missing = drift.fileCount - drift.indexedCount;
-            output.system.push(`<!-- MEMORY MAINTENANCE: ~${missing} topic file(s) exist in the memory dir but are not in the index (possibly a co-tenant rewrote MEMORY.md). Run "/memory repair" to re-index them. -->`);
-          }
+      let cache = await getCache();
+      if (++_requestCount % cache.config.injectEveryNTurns === 0) cache = await getCache(true);
+      const { renderedRules, content, config, memDir, drift } = cache;
+      if (content) {
+        output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
+        if (config.sharedDir && drift && drift.fileCount > drift.indexedCount + DRIFT_NOTE_THRESHOLD) {
+          const missing = drift.fileCount - drift.indexedCount;
+          output.system.push(`<!-- MEMORY MAINTENANCE: ~${missing} topic file(s) exist in the memory dir but are not in the index (possibly a co-tenant rewrote MEMORY.md). Run "/memory repair" to re-index them. -->`);
         }
-
-        if (renderedRules) {
-          output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
-        }
-
-        _injectedOnce = true;
-        _dirty = false;
+      }
+      if (renderedRules) {
+        output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
       }
     },
 
@@ -825,11 +830,6 @@ Any text including single words is treated literally as content to store. Do not
         output.context.push(`## Memory Rules\n\n${renderedRules}`);
       }
 
-      // Reset so the first turn after compaction re-injects memory into the
-      // system prompt — the agent's context window was just replaced.
-      _injectedOnce = false;
-      _dirty = false;
-      _turnCount = 0;
     },
 
     // After automatic compaction, opencode sends a synthetic "continue"
@@ -847,16 +847,23 @@ Any text including single words is treated literally as content to store. Do not
     'experimental.compaction.autocontinue': async (hookInput, output) => {
       const { config } = await getCache();
       if (!config.consolidateOnCompact || !client) return;
-      output.enabled = false;
       try {
         const summary = await fetchLatestCompactionSummary(hookInput.sessionID);
         const text = summary
           ? buildCompactConsolidationPrompt(summary)
-          : CONSOLIDATION_PROMPT;
-        await client.session.prompt({
+          : CONSOLIDATION_PROMPT + '\n\nAfter consolidating, resume any pending work from the conversation. If there is no pending work, stop.';
+        const result = await client.session.prompt({
           path: { id: hookInput.sessionID },
-          body: { parts: [{ type: 'text', text }] },
+          body: {
+            noReply: true,
+            agent: hookInput.agent,
+            model: hookInput.model && { providerID: hookInput.model.providerID, modelID: hookInput.model.id },
+            variant: hookInput.message?.model?.variant,
+            parts: [{ type: 'text', text }],
+          },
         });
+        if (result?.error) return;
+        output.enabled = false;
       } catch {
         // best-effort — fall back to the native continue if the prompt call fails
         output.enabled = true;

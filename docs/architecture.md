@@ -4,163 +4,374 @@
 
 ## Plugin architecture
 
-```
-openclaude-memory/
-├── CHANGELOG.md                        # release history
-├── package.json                        # npm package manifest
-├── .opencode/
-│   ├── plugins/ocl-memory.mjs          # server plugin — tools, system prompt injection
-│   ├── plugins/ocl-memory-shared.mjs   # shared path/config resolution, locking, atomic writes
-│   ├── plugins/ocl-memory-tui.mjs      # TUI plugin — interactive memory browser
-│   └── command/memory.md               # /memory slash command definition
-└── skills/
-    └── memory/SKILL.md                 # agent instructions for reading/writing memory
-```
-
-| File | Role |
+| Path | Role |
 |---|---|
-| `ocl-memory.mjs` | Loads `MEMORY.md` and `memory.jsonc` into an in-process cache on first turn; injects into system prompt. Memory persists in the system prompt for the whole session — re-injection fires after tool mutations and every `inject_every_n_turns` turns (default: 5) to re-emit cached state, not to reread arbitrary disk edits or keep memory present. Invalidates cache and sets dirty flag after every tool call. Forces fresh read and resets injection state on compaction. Registers `write_memory`, `remove_memory`, `pin_memory`, `repair_memory` tools — all validate their required arguments (clean error instead of an unhandled exception) and treat `pin` as a strict boolean. `write_memory` rejects unsafe existing index filenames and falls back to a numeric-suffixed filename if a new topic's slug collides with an unrelated existing file. `repair_memory` additively re-indexes on-disk topic files missing from `MEMORY.md` (marked `[stale?]`), skipping any filename tombstoned by `remove_memory`. Runs index maintenance (orphan removal, duplicate removal, unsafe-filename removal, `[stale?]` stamping) after every tool call. Creates `memory.jsonc` on first run and `MEMORY.md` on the first write (never on the read path); migrates legacy `RULES.jsonc` automatically. Caps injected index content at configured lines and 50 KB; under `shared_dir`, emits a non-mutating "run /memory repair" note when many topic files are unindexed. Supports `shared_dir` (cross-process lock + atomic writes + one-time carry-over) and `consolidate_on_compact` (via `experimental.compaction.autocontinue`, requires the plugin's `client` capability). |
-| `ocl-memory-shared.mjs` | Pure-logic module with no plugin hooks — path/config resolution (`getMemoryDir`, `getMemoryIndex`, `getDirtySentinel`), config parsing (`readMemoryRules`, `parseRules`, string-literal-aware `stripJsonc`), a filename safety check (`isSafeFilename`, rejects path separators and `..` segments in filenames read back from `MEMORY.md`), file I/O (`atomicWriteFileSync`, `ensureMemoryDir`), the cross-process lock (`acquireLock`/`releaseLock`, holding a `pid\tts\trand` token — stale reclaim requires a failed `process.kill(pid,0)` liveness check *and* an unchanged re-`statSync` (inode+mtime) before unlinking, and release is compare-and-delete), the single `withLock(memDir, fn, {strict})` mutation entry point (fail-closed with one auto-retry under `shared_dir`, best-effort locally), `LockContendedError`, and the one-time `shared_dir` carry-over. Identical pre-existing topic files still gain a missing shared index entry. Imported by both `ocl-memory.mjs` and `ocl-memory-tui.mjs` so both plugins resolve the exact same active directory and share identical lock semantics. |
-| `ocl-memory-tui.mjs` | TUI plugin — registered in `tui.jsonc`. Registers `ctrl+alt+m` keybinding. Provides an interactive, arrow-key-navigable browser over the memory index — view topic content, pin/unpin, and remove entries. All actions are direct file I/O; no LLM turn required. Resolves the active dir fresh on every open via `ocl-memory-shared.mjs`, so it follows `shared_dir` exactly like the server plugin; mutations are locked and written atomically, and the `.invalidate` sentinel is written at the active dir (local or shared). |
-| `memory.md` (command) | `/memory` shows the index (retained - with LLM turn). `/memory <text>` stores a fact via `write_memory`. `/memory pin <topic>` pins via `pin_memory`. `/memory unpin <topic>` unpins. `/memory remove <topic>` removes via `remove_memory`. `/memory consolidate` reviews the session and writes undocumented facts. `/memory repair` re-indexes orphaned topic files via `repair_memory`. |
-| `SKILL.md` | Loaded on-demand by the agent — full instructions for memory tools, format, index discipline, staleness handling, cap remediation, `shared_dir`, and consolidation. |
+| `.opencode/plugins/ocl-memory.mjs` | Server hooks, four native tools, per-request injection, stamp-checked cache, dynamic `/memory`, and automatic consolidation. |
+| `.opencode/plugins/ocl-memory-shared.mjs` | Pure shared module: path/config resolution, JSONC parsing, safe reads, atomic file writes, tombstones, locks, and carry-over. |
+| `.opencode/plugins/ocl-memory-tui.mjs` | Separate TUI entry: `ctrl+alt+m`, bounded topic previews, locked pin/removal actions, and visible errors. |
+| `.opencode/command/memory.md` | Static `/memory` fallback; resolves the active directory before reads. Dynamic registration normally replaces it. |
+| `skills/memory/SKILL.md` | Agent reference for reading, writing, pinning, repair, and consolidation. |
+| `tests/smoke-test.mjs` | Sequential isolated regression suite, including injected filesystem failures. |
+| `tests/shared-store-test.mjs` | Two real writer processes; optional sibling pi core exercises cross-harness storage. |
+| `tests/host-test.mjs` | Real OpenCode server with a local fake model and temporary storage. |
+
+Server and TUI entry points remain separate because current OpenCode modules cannot export both targets from one entry. The server's legacy function export loads through the manifest `main`; TUI loads through `exports["./tui"]`. The shared module exports no plugin hooks.
 
 ## Scope
 
-**In scope:**
-
-- Flat markdown persistence (`MEMORY.md` + topic files)
-- System prompt injection on first turn, every `inject_every_n_turns` turns (default: 5), and immediately after any memory tool mutation
-- Native plugin tools for write, remove, pin, and repair operations
-- TUI memory browser (`ctrl+alt+m`): interactive, arrow-key-navigable browser
-- Automatic writes triggered by agent activity (issues solved, infra discovered, commands identified, hardware/model facts)
-- Manual `/memory` command for show, explicit storage, pin, unpin, remove, and consolidate
-- Auto-creation of `memory.jsonc` on first run and `MEMORY.md` on first write; automatic migration from legacy `RULES.jsonc`
-- Cap handling with truncation warning when index exceeds configured limit (default 300 lines) or 50 KB
-- Configurable `max_lines`, `stale_after_days`, `shared_dir`, and `consolidate_on_compact` via `memory.jsonc`
-- Index metadata: `[pin]` flag, `YYYY-MM-DDTHH:MM:SS±HH:MM` ISO datetime, `[stale?]` staleness flag per entry
-- Index maintenance: orphan removal, duplicate removal, staleness flagging on tool calls
-- Cross-tool shared memory store (`shared_dir`) with a cross-process file lock and atomic writes, followed consistently by both the server plugin and the TUI browser; under `shared_dir` writes fail closed (auto-retry once) on contention, and `/memory repair` recovers topic files a co-tenant left unindexed
-- Consolidation (`/memory consolidate`, `consolidate_on_compact`)
-
-**Out of scope:**
-
-- Semantic or fuzzy search across memories
-- Custom MCP/remote/local server (the agent uses plugin-registered tools)
-- Encryption
-- Per-project memory (this is global, or shared cross-tool via `shared_dir` — never per-project)
-- Real-time staleness monitoring (flags are stamped on tool calls, not on session load)
-- Compaction handoff / mid-task state preservation across compaction
+Memory is global: one active index plus topic files, either local or shared across tools. It supports native write/remove/pin/repair tools, behavioral persist rules, a model-free TUI browser, and consolidation prompts. It does not provide semantic retrieval, encryption, per-project storage, or a distributed database.
 
 ## System Compatibility
 
-| Requirement | Notes                                                                                                                                                                                              |
-| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| opencode    | >= 1.4.3                                                                                                                                                                                           |
-| Node.js     | >= 18 (ESM,`fs`, `os`, `path` stdlib only)                                                                                                                                                         |
-| Linux       | Full support                                                                                                                                                                                       |
-| macOS       | Supported. opencode follows XDG on macOS, so`~/.config/opencode/` is used by default. If your opencode config lives elsewhere, set `XDG_CONFIG_HOME` to the parent of your `opencode/` config dir. |
-| Windows     | Not supported                                                                                                                                                                                      |
+| Requirement | Status |
+|---|---|
+| OpenCode | 1.18.34 verified against release source and the real-server check; older releases have not been revalidated. |
+| Node.js | Manifest requires >=18; local checks used Node 26.10.0 and CI uses Node 22. No runtime dependencies. |
+| macOS | Verified locally; paths follow `XDG_CONFIG_HOME` or `~/.config/opencode/`. |
+| Linux | Supported local-filesystem design; this verification ran on macOS. |
+| Windows | Not supported. |
 
-## Token overhead
+TUI signatures and mutations are verified against the current API and isolated tests. The host test does not exercise interactive terminal rendering.
 
-The plugin injects the `MEMORY.md` index and rendered `memory.jsonc` (behavioral rules only, as markdown) into the system prompt on the first turn of each session. Memory then persists in the system prompt automatically for the session — re-injection fires every `inject_every_n_turns` turns (default: 5) to re-emit cached state, and immediately after any memory tool mutation to reflect the change just made. All other turns receive no injection. Cost scales with index size, but only pays on turns where injection actually occurs:
+## Storage and mutation safety
 
+An index record has one physical line: `- [Name](topic.md) [pin] timestamp [stale?] -- summary`. Topic names and summaries are sanitized before writing; summaries are capped at 500 characters. Metadata flags are read only before the summary separator, and duplicate timestamps are compared at full precision. Repair remains additive-only and reports existing plus newly added entries without double-counting.
 
-| State                                            | Est. tokens / injection |
-| ------------------------------------------------ | ----------------------- |
-| Fresh install (empty index, default memory.jsonc) | ~200                    |
-| Typical use (10–30 entries, default memory.jsonc) | ~400–900               |
-| Custom memory.jsonc (typical, 10–20 rules)        | similar to above        |
-| At cap (configured limit, default 300 lines)     | ~6,500–7,400           |
-| Hard cap (50 KB)                                 | ~12,800                  |
+Topic filenames must be safe non-hidden `.md` basenames, excluding `MEMORY.md`, separators, `..`, control characters, and link-breaking characters. Store reads open without following final-component symlinks, use nonblocking open to avoid hanging on FIFOs, and verify a regular descriptor. Trusted config symlinks are supported, with target changes included in cache stamps. Index injection reads at most 50 KiB plus an overflow byte; frontmatter and TUI previews are bounded too. Mutation reads retain full content so updates do not truncate existing files.
 
-Estimates based on [Claude's tokenizer](https://www.claudetokenizer.com/) averaging 3.5–4 characters per token for markdown prose. Topic files are **not** injected — only the index line — so even a large memory store stays cheap until the index itself grows large. ISO 8601 datetimes in index lines add ~4 tokens/entry vs bare dates. Only the behavioral rule arrays are injected from `memory.jsonc`; scalar config keys (`max_lines`, `stale_after_days`, `inject_every_n_turns`, `shared_dir`, `consolidate_on_compact`) are plugin internals and do not appear in the system prompt.
+Writes use exclusive temporary files in the destination directory, flush their contents, and rename over regular-file targets. Temporary files are cleaned on exceptions. Config bootstrap uses exclusive publication instead of overwriting another creator's config; legacy config is copied successfully before its original is renamed, and an existing backup is preserved.
+
+Every index mutation holds the active directory lock. Local contention refuses after about 500 ms; shared contention uses two acquisition windows of about 2 s with a 1 s retry delay. Lock tokens contain PID, timestamp, and randomness; `EPERM` means alive. Stale reclaim checks holder liveness and rechecks inode/mtime, and release verifies ownership. No local write proceeds unlocked.
+
+Removal persists its tombstone before dropping index discoverability. A re-store reuses a removed file only when its frontmatter identifies the same topic; unrelated slug collisions get a numeric suffix. Writes refresh current frontmatter metadata and roll back topic/index changes if a subsequent ordinary filesystem operation fails. Rollback failure is reported explicitly. The TUI rechecks pin protection inside the lock and shows busy, refusal, and filesystem errors.
+
+Carry-over takes the local lock before the shared lock, copies atomically, respects both tombstone lists, and records completion only after success. Failed or contended attempts retry on a later cache refresh. See [shared storage](shared-directory.md).
 
 ## Disk I/O and injection overhead
 
-Two standing design rules shape all disk and prompt traffic: **read from disk only when the answer could have changed**, and **inject into the system prompt only when the agent's view of memory could have drifted**. The "before" columns in the tables below refer to the naive baseline these rules replaced — a full re-read of the memory files and a full index re-injection on every single turn.
+Every model request receives the cached index and rendered behavioral rules. File-stamp checks detect changes before cache reuse; tool mutations, compaction, and the configured request interval trigger full content refreshes. Sentinels are observed, not consumed. There is no file watcher and no session-wide injection gate. See [memory injection](memory-injection.md) for details.
 
-**Disk reads.** `memory.jsonc` and `MEMORY.md` are loaded once into an in-process cache on first use (creating a fresh default `memory.jsonc` if none exists — legacy `RULES.jsonc` installs are migrated in place on first read). Ordinary turns touch no disk at all. The cache is invalidated only by events that can genuinely change memory state:
+## Token overhead
 
-- a memory tool mutation — `write_memory`, `remove_memory`, `pin_memory`, `repair_memory` each hold the cross-process `.lock` for their read-modify-write section and write atomically (temp-file + rename), so a reader never sees a partial file or a torn index line;
-- the TUI memory browser's `.invalidate` sentinel (`ctrl+alt+m` actions write it in whichever dir is active);
-- the forced fresh read that runs before compaction.
-
-`MEMORY.md` itself is created only by a locked write path (first `write_memory`, or the carry-over merge) — never by a read. When `shared_dir` is active every rule above applies unchanged to the shared directory, with the added guarantee that writes fail closed on lock contention rather than proceed unlocked. Manual edits to either file take effect only at the next cache refresh (a tool mutation, compaction, sentinel, or restart) — there is no file watcher.
-
-**Injection cadence.** The cached index and the rendered behavioral rules from `memory.jsonc` (the rule arrays only — scalar config keys are plugin internals and never appear in the prompt) are pushed into the system prompt:
-
-- Turn 1 (session start)
-- Every `inject_every_n_turns` turns thereafter (default: 5 — so turns 1, 6, 11, 16...)
-- Any turn immediately following a memory tool mutation
-
-Memory persists in the system prompt for the rest of the session; periodic re-injection re-emits cached state rather than re-reading the disk, and all other turns receive no injection at all. `inject_every_n_turns` is tunable in `memory.jsonc`: lower values (e.g. `2`) re-emit cached state more often, higher values (e.g. `10`) trade freshness for fewer tokens. Compaction is the deliberate exception: the current index and rules are also injected into the compaction *context* (so memory survives summarization cleanly), and injection state resets so the first post-compaction turn re-injects. Index content itself is sanitized at write time to keep the "one topic = one physical line" flatfile contract (newlines collapsed, link metacharacters stripped, summaries capped at 500 chars) and the injected block is hard-capped at the configured line count and 50 KB, line by line, so no single oversized record can defeat the budget.
-
-> **Note:** TUI memory browser actions (pin/unpin/remove via `ctrl+alt+m`) write `MEMORY.md` directly without going through the server plugin's `_cache`/`_dirty` state. They write an `.invalidate` sentinel, so the next server cache check picks them up when both use the same active directory. Ordinary manual file edits have no sentinel and require a memory-tool mutation, compaction, or session restart. The TUI does resolve `shared_dir` correctly for where it reads/writes via `ocl-memory-shared.mjs`; the remaining caveat is server cache timing.
-
-**Savings per session — default interval of 5 (typical 10–30 entry index, ~400–900 tokens/injection, your mileage may vary):**
-
-| Session | Turns | Tool calls | Injections (before) | Injections (after, N=5) | Tokens saved (est.) |
-|---|---|---|---|---|---|
-| Read-heavy, 0 writes | 20 | 0 | 20 | 5 | ~6,000–13,500 (75%) |
-| Typical, 3 writes | 20 | 3 | 20 | ~7 | ~5,200–11,700 (65%) |
-| Write-heavy, 10 writes | 30 | 10 | 30 | ~15 | ~6,000–13,500 (50%) |
-| Long session, 5 writes | 100 | 5 | 100 | ~25 | ~30,000–67,500 (75%) |
-
-Injection count formula (default N=5): `ceil(turns / 5) + tool_calls_on_non-interval_turns`. Before: `1 × turns`.
-
-Disk read formula: `reads = 2 (cold load) + 2 × tool_calls`. Before: `2 × turns`.
-
-**Savings at other interval settings (20-turn read-heavy session, 0 writes):**
-
-| `inject_every_n_turns` | Injections | Tokens saved vs every-turn (est.) |
-|---|---|---|
-| `1` (every turn — the naive baseline) | 20 | 0% |
-| `3` | 7 | ~65% |
-| `5` (default) | 5 | ~75% |
-| `10` | 2 | ~90% |
-
-Savings are most pronounced in long read-heavy sessions (debugging, exploration, code review) where the agent rarely writes to memory but turns are numerous. For write-heavy sessions the interval matters less since tool mutations trigger injection regardless.
+Index and rule tokens are part of each request, regardless of the refresh interval. Cost depends on index length, tokenizer, and provider caching. Non-empty behavioral arrays render as markdown; malformed JSONC or config with no non-empty behavioral arrays falls back to raw text. Topic bodies add context only when loaded. The 50 KiB index cap is a byte bound, not a fixed token count.
 
 ## Model compatibility
 
-The plugin injects plain markdown into the system prompt and registers structured tools — no model-specific features required. Tool calls are more reliable than free-form write instructions, especially on smaller models.
+The host integration needs structured tool calls and ordinary system-prompt support. Filesystem validation, formatting, timestamps, and locking are handled by the plugin. Which facts to persist, their correctness, and whether to follow the persist rules remain model decisions; model-free TUI actions avoid that dependency.
 
-As of mid-2026, capable tool-calling models exist at every size tier. The boundaries that previously separated "small" from "capable" have largely collapsed: Qwen3-8B carries a 131K context window and native tool calling; Gemma 4 E2B (2.3B effective) runs on a phone and still supports native function calling; Nanbeige4.1-3B sustains up to 600 tool-call turns on a 256K context. The tier labels below reflect operational reliability on this plugin's specific workload — structured tool calls against a markdown index — not general model capability.
+## Recovery boundaries
 
-Where a feature is backed by a plugin tool, the tool guarantees correct format and index integrity regardless of model tier — only the model's decision to call the tool (and what args to pass) varies.
+Atomicity is per file, not a transaction across topic, index, and tombstone files. Normal exceptions trigger write rollback, but abrupt termination can leave an unindexed topic or stale index metadata; `/memory repair` recovers missing entries, not metadata for entries already indexed. Directory entries are not fsynced, so this is not a power-loss durability guarantee. Cooperating writers must share the `.lock` protocol on a local filesystem; manual writers and network filesystem behavior are outside that guarantee. Token and inode checks narrow lock replacement races, but the filesystem provides no atomic compare-and-unlink operation.
 
-| Feature | Large (20B+, e.g. Qwen3.6-27B, Mistral Small 3.1 24B) | Small-Mid (>7B <20B, e.g. Qwen3-8B, Gemma 4 12B, Llama 3.2 8B) | Compact (<7B, e.g. Qwen3-4B, Gemma 4 E4B, Nanbeige4.1-3B) |
-|---|---|---|---|
-| `/memory` show index | Reliable | Reliable | Reliable |
-| `/memory <text>` store via `write_memory` | Reliable | Reliable | Reliable |
-| `/memory pin/unpin <topic>` via `pin_memory` | Reliable | Reliable | Reliable |
-| `/memory remove <topic>` via `remove_memory` | Reliable | Reliable | Reliable |
-| `/memory repair` via `repair_memory` | Reliable | Reliable | Reliable |
-| `/memory consolidate` | Reliable | Reliable | Usually works |
-| TUI browser — pin/unpin/remove (`ctrl+alt+m`) | Model-free | Model-free | Model-free |
-| Auto-trigger writes (persist rules) | Reliable | Reliable | Usually works |
-| Topic/summary quality on auto-writes | Reliable | Reliable | Usually works |
-| Date stamping on auto-writes | Plugin-guaranteed | Plugin-guaranteed | Plugin-guaranteed |
-| `[pin]` on auto-writes (arg passed correctly) | Reliable | Reliable | Usually works; verify with `/memory` after |
-| `[stale?]` flagging and self-healing | Plugin-guaranteed | Plugin-guaranteed | Plugin-guaranteed |
+## Architecture diagrams
 
-**Representative models by tier (mid-2026):**
+These diagrams trace the 0.6.7 implementation in the three plugin modules, command template, skill, and tests. Solid arrows show calls or data flow; dotted arrows show observation, guidance, or verification. OpenCode integration is verified on 1.18.34. The pi co-tenant is an external cooperating writer, not part of this plugin's runtime.
 
-| Tier | Examples | Context | Tool calling |
-|---|---|---|---|
-| Large (20B+) | Qwen3.6-27B, Mistral Small 3.1 24B, Devstral 24B, Gemma 4 31B | 128K–256K | Native |
-| Small-Mid (>7B <20B) | Qwen3-8B, Gemma 4 12B, GLM-4-9B, Llama 3.2 8B | 128K–256K | Native |
-| Compact (<7B) | Qwen3-4B, Qwen3.1-7B, Gemma 4 E4B (4.5B), Nanbeige4.1-3B, Llama 3.2 3B | 128K–256K | Native |
-| Edge/on-device | Gemma 4 E2B (2.3B, 0.8GB mobile), Qwen3-0.6B, LittleLamb 0.3B | 128K | Native |
+## Complete system map
 
-**Mitigations already in place:**
-- Structured tool calls replace free-form write instructions — format, frontmatter, and index integrity are guaranteed by the plugin
-- Date stamping is handled by the plugin, not the model — no model tier can get it wrong
-- `[stale?]` flagging and orphan/duplicate cleanup run entirely in the plugin
-- `/memory pin`, `/memory unpin`, and `/memory remove` are single structured tool calls — reliable even on compact and edge models
-- TUI browser pin/unpin/remove (`ctrl+alt+m`) are direct file writes — no model involved at any tier
+```mermaid
+flowchart TB
+  subgraph host["OpenCode host"]
+    user["User"]
+    loader["Plugin loading and config hook"]
+    command["/memory command"]
+    requests["Fresh model requests<br/>conversation steps, other sessions, internal calls"]
+    compact["Compaction"]
+    model["Model / agent<br/>chooses persistence and loads details on demand"]
+    readtool["Host file-read tool<br/>topic bodies are not automatically injected"]
+  end
 
-If you are using an older model, compact, or edge models, `/memory <text>` explicit commands will always be more reliable than auto-trigger writes.
-</content>
+  subgraph server["Server entry: ocl-memory.mjs"]
+    register["Register skill path, dynamic command, four tools"]
+    cmdhook["command.execute.before<br/>refresh active paths and substitute arguments"]
+    systemhook["experimental.chat.system.transform<br/>attach index and rules every request"]
+    compacthook["experimental.session.compacting<br/>force fresh memory into output.context"]
+    autohook["experimental.compaction.autocontinue<br/>optional queued consolidation"]
+    cache["getCache / process-global cache<br/>config, rendered rules, index, drift, signature"]
+    stamps["Signature checks before reuse<br/>config and symlink target, directory,<br/>index, tombstones, notification sentinel"]
+    refresh["Rebuild on miss, changed stamps, force refresh<br/>or every N model requests"]
+    render["Render non-empty behavioral arrays<br/>raw-config fallback if absent or invalid"]
+    indexread["Bounded index read<br/>line limit and 50 KiB injection cap"]
+    drift["Shared-mode drift count<br/>more than 5 missing topics: repair reminder"]
+    write["write_memory<br/>append or replace"]
+    remove["remove_memory<br/>exact match wins; ambiguous partial refuses"]
+    pin["pin_memory<br/>exact match wins; ambiguous partial refuses"]
+    repair["repair_memory<br/>explicit additive recovery"]
+    invalidate["invalidateCache<br/>tool mutations and memory tool.execute.after"]
+  end
+
+  subgraph tui["TUI entry: ocl-memory-tui.mjs"]
+    key["ctrl+alt+m<br/>registered keymap layer; disposed on lifecycle end"]
+    resolve["resolveActiveDir<br/>read config on each browser open"]
+    browser["Index browser<br/>50 KiB read; filter and select"]
+    preview["Topic preview<br/>64 KiB read; strip frontmatter; first 10 lines"]
+    tuipin["Pin / unpin matching filename"]
+    tuiremove["Confirm removal<br/>recheck pins inside lock"]
+    alerts["Busy, refusal and filesystem alerts<br/>notification failure reports committed index"]
+  end
+
+  subgraph shared["Shared pure module: ocl-memory-shared.mjs"]
+    rules["readMemoryRules / stripJsonc / parseRules<br/>exclusive bootstrap; legacy copy then backup"]
+    paths["getMemoryDir / getMemoryIndex<br/>capture active directory before mutation lock"]
+    migration["maybeCarryOverToSharedDir<br/>one successful local-to-shared merge"]
+    lock["withLock<br/>fail closed; capture acquisition token"]
+    safe["Safe filenames and descriptor reads<br/>nonblocking, no-follow, regular-file verification"]
+    atomic["Atomic file publication<br/>exclusive temp, file fsync, rename, cleanup<br/>config creation uses exclusive hard-link publication"]
+    tombhelpers["Read / add / remove tombstones"]
+  end
+
+  subgraph disk["Filesystem"]
+    cfg[("Local memory.jsonc<br/>XDG_CONFIG_HOME/opencode or ~/.config/opencode")]
+    legacy[("Local memory/RULES.jsonc<br/>legacy fallback and preserved .bak")]
+    local[("Local memory directory<br/>migration source or active local store")]
+    marker[("Local .shared-dir-migrated<br/>written only after successful merge")]
+    subgraph active["Active store: local memory/ OR ~/.agents/memory/"]
+      idx[("MEMORY.md<br/>one physical record per topic")]
+      topics[("Safe topic .md files<br/>quoted frontmatter and Markdown body")]
+      removed[(".ocl-removed<br/>intentional-removal filenames")]
+      notification[(".invalidate<br/>observed, never consumed")]
+      lockfile[(".lock<br/>PID, timestamp, random token")]
+    end
+  end
+
+  subgraph guidance["Agent guidance and verification"]
+    skill["skills/memory/SKILL.md<br/>loaded on demand"]
+    fallback[".opencode/command/memory.md<br/>static fallback resolves config and active paths"]
+    tests["smoke-test: isolated regressions and fault injection<br/>shared-store-test: real writer processes<br/>host-test: real server with local fake model"]
+    pi["Updated pi co-tenant<br/>independent local config and injection semantics"]
+  end
+
+  user --> command --> cmdhook --> model
+  user --> key --> resolve --> browser
+  loader --> register
+  register --> skill
+  register --> command
+  fallback -.-> command
+  skill -.-> model
+  requests --> systemhook --> cache
+  compact --> compacthook --> cache
+  compact --> autohook
+  autohook --> cache
+  cache --> stamps
+  stamps --> refresh
+  refresh --> rules --> cfg
+  rules --> legacy
+  refresh --> migration
+  refresh --> paths
+  refresh --> render
+  refresh --> indexread --> safe
+  refresh --> drift
+  indexread --> idx
+  drift --> topics
+  drift --> removed
+  cache --> systemhook
+  systemhook --> model
+  cache --> compacthook
+  compacthook --> compact
+  stamps -.-> cfg
+  stamps -.-> idx
+  stamps -.-> removed
+  stamps -.-> notification
+  model --> readtool --> topics
+  model --> write
+  model --> remove
+  model --> pin
+  model --> repair
+  write & remove & pin & repair --> paths --> lock
+  write & remove & pin & repair --> invalidate --> cache
+  resolve --> rules
+  resolve --> paths
+  resolve --> migration
+  browser --> safe
+  browser --> idx
+  browser --> preview --> safe
+  preview --> topics
+  browser --> tuipin & tuiremove
+  tuipin & tuiremove --> lock
+  tuipin & tuiremove --> alerts
+  tuipin & tuiremove --> notification
+  lock --> lockfile
+  lock --> safe
+  lock --> atomic
+  lock --> tombhelpers --> removed
+  atomic --> idx & topics
+  atomic -->|"exclusive config publication"| cfg
+  rules --> atomic
+  migration --> local
+  migration --> lock
+  migration --> marker
+  safe --> idx & topics & removed
+  pi --> lockfile
+  pi --> idx & topics & removed
+  tests -.-> server
+  tests -.-> tui
+  tests -.-> shared
+  tests -.-> pi
+```
+
+The model's ordinary host file reads are distinct from the plugin's guarded storage reads. Persist rules and the skill guide model choices; they are not permission enforcement. The TUI performs mutations directly, without a model turn, and does not run the server's general index-maintenance pass.
+
+## Request injection and cache lifecycle
+
+```mermaid
+sequenceDiagram
+  participant H as OpenCode request
+  participant S as system.transform
+  participant C as getCache
+  participant F as Filesystem
+  participant M as Model
+  H->>S: Fresh output.system
+  S->>C: getCache()
+  C->>F: Compare config / active-store stamps
+  alt Cache absent or signature changed
+    C->>F: Read/create config and parse settings
+    C->>F: Attempt eligible locked carry-over
+    C->>F: Capture signature, bounded index read and shared drift scan
+    C->>C: Cache content, rendered rules, config and signature
+  else Signature unchanged
+    C->>C: Reuse cached content
+  end
+  C-->>S: Cache
+  S->>S: Increment process-wide request counter
+  opt Every inject_every_n_turns model requests
+    S->>C: getCache(true)
+    C->>F: Rebuild from disk
+    C-->>S: Refreshed cache
+  end
+  S->>H: Append Global Memory, rules and eligible drift reminder
+  H->>M: Send fresh prompt
+  opt Model chooses a memory tool
+    M->>H: Structured tool call
+    H->>F: Plugin executes locked mutation
+    H->>C: Invalidate cache
+  end
+  Note over H,M: Repeat for each model request, including other sessions and internal calls
+  Note over C,F: Missing index stays in memory and reads do not create MEMORY.md
+```
+
+## Mutation, maintenance and recovery
+
+```mermaid
+flowchart TB
+  args["Native tool arguments<br/>write requires topic, content, summary, pin, mode"] --> validate["Validate and sanitize<br/>topic; one-line summary capped at 500 characters"]
+  validate --> capture["Resolve config and capture active directory"]
+  capture --> acquire["Acquire directory lock"]
+  acquire -->|"contended past deadline"| busy["Return busy; do not mutate"]
+  acquire -->|"owned token"| dispatch{"Operation"}
+  dispatch -->|"write"| identity["Exact indexed name selects filename<br/>new slug collision gets numeric suffix<br/>removed file reused only for matching identity"]
+  identity --> snapshot["Read previous topic and raw index<br/>remember prior tombstone"]
+  snapshot --> metadata["Refresh name, description, last_updated<br/>preserve created and unknown fields<br/>append dated section or replace body"]
+  metadata --> topicwrite["Atomically publish topic"]
+  topicwrite --> upsert["Upsert index record; preserve pin"]
+  upsert --> maintain["Server maintainIndex<br/>drop unsafe/non-regular/missing files<br/>deduplicate by full timestamp, retain pins<br/>stamp or heal stale metadata"]
+  maintain --> indexwrite["Atomically publish index"]
+  indexwrite -->|"write only"| clear["Clear successful re-store tombstone"]
+  dispatch -->|"remove"| match["Exact name/filename wins<br/>ambiguous substring refuses"]
+  match --> protected{"Any matching file reference pinned?"}
+  protected -->|"yes"| refuse["Refuse removal"]
+  protected -->|"no"| intent["Publish tombstone first"]
+  intent --> drop["Drop all references to filename<br/>preserve topic file"]
+  drop --> maintain
+  dispatch -->|"pin / unpin"| pinmatch["Exact-wins / ambiguous-refuses lookup<br/>change matching references' metadata flags"]
+  pinmatch --> maintain
+  dispatch -->|"repair"| scan["Scan safe regular .md files<br/>skip indexed names and tombstones"]
+  scan --> recover["Bounded frontmatter recovery<br/>decode and sanitize; usable-name fallback<br/>append stale-marked entries only"]
+  recover --> repairpublish["Atomic index append<br/>separate existing and added counts"]
+  topicwrite & indexwrite & clear -.->|"write_memory exception"| rollback["Attempt previous index/topic restoration<br/>restore removal intent where needed"]
+  rollback --> failure["Rethrow failure<br/>rollback failure names affected paths"]
+  clear & repairpublish --> finish["Invalidate cache; release captured lock token"]
+  indexwrite -->|"remove or pin"| finish
+  refuse & failure --> release["Release captured lock token"]
+  intent -.-> partial["Removal index failure can leave visible entry plus tombstone"]
+  topicwrite -.-> crash["Abrupt termination skips rollback<br/>possible unindexed topic or stale index metadata"]
+  crash -.-> scan
+```
+
+Rollback applies to the server's `write_memory` publication sequence, not every mutation or migration. Repair only restores missing discoverability; it does not refresh already-indexed metadata or recover pin flags from a lost index. TUI pin/removal updates use the same lock, safe reads, atomic writes, and removal-intent ordering, then atomically notify through `.invalidate`; they show errors instead of silently swallowing results.
+
+## Locking and one-time migration
+
+```mermaid
+flowchart TB
+  mutation["withLock: local or shared directory"] --> wx["Exclusive .lock creation<br/>capture PID/time/random token synchronously"]
+  wx -->|"created"| critical["Run callback"]
+  critical --> finally["Finally: release only captured token<br/>leave replacement lock untouched"]
+  wx -->|"already exists"| age{"Lock older than 10 seconds?"}
+  age -->|"no"| wait["Poll every 25 ms within deadline"]
+  age -->|"yes"| live["Read holder PID; probe liveness<br/>EPERM means alive; ESRCH means dead<br/>unknown payload protected until 60 seconds"]
+  live -->|"alive / protected"| wait
+  live -->|"eligible"| recheck["Recheck regular file, inode and mtime<br/>attempt unlink only if unchanged"]
+  recheck --> wait
+  wait -->|"time remains"| wx
+  wait -->|"local: about 500 ms expired"| refuse["LockContendedError; never run callback unlocked"]
+  wait -->|"shared: first 2 s expired"| retry["Sleep 1 s; second 2 s acquisition window"]
+  retry -->|"acquired"| critical
+  retry -->|"still busy"| refuse
+
+  config["shared_dir enabled"] --> guard["Check in-process success / pending attempt<br/>and local success sentinel"]
+  guard -->|"already succeeded"| skip["Skip carry-over scan"]
+  guard -->|"no local index"| later["No merge; no success marker"]
+  guard -->|"eligible"| locallock["Acquire local lock first"]
+  locallock --> sharedlock["Acquire shared lock second"]
+  sharedlock --> merge["Read both indexes and removal lists<br/>copy safe indexed local topics atomically"]
+  merge --> collision["Free filename: keep name<br/>identical bytes: reuse file<br/>different bytes: -oclm, then numeric suffix"]
+  collision --> append["Append missing shared index lines<br/>skip union of both tombstone lists"]
+  append --> success["Publish local .shared-dir-migrated<br/>mark in-process success"]
+  success --> unlock["Release shared, then local lock"]
+  locallock & sharedlock & merge & append & success -.->|"failure"| deferred["Log deferred attempt; release held locks<br/>retry on later cache refresh"]
+```
+
+The protocol is advisory and has no atomic compare-and-unlink primitive. Data files are flushed, but directory entries are not fsynced. Migration copies rather than moves and has no whole-operation rollback; successful path toggles do not restart migration or synchronize inactive stores.
+
+## Compaction and automatic consolidation
+
+```mermaid
+sequenceDiagram
+  participant H as OpenCode
+  participant P as Memory server plugin
+  participant C as Cache / store
+  participant API as Session SDK
+  participant M as Model / native loop
+  H->>P: experimental.session.compacting
+  P->>C: getCache(true)
+  C-->>P: Current index and rules
+  P->>H: Append memory to output.context
+  H->>M: Generate compaction summary
+  Note over H,M: Summary request also receives per-request system memory
+  opt Automatic continuation hook is reached
+    H->>P: experimental.compaction.autocontinue
+    P->>C: Read consolidate_on_compact setting
+    alt Enabled and SDK client available
+      P->>API: session.messages(sessionID)
+      API-->>P: Latest assistant summary or unavailable
+      P->>P: Build summary-backed or full-scan prompt<br/>persist new facts, replace unpinned OCL recap, resume pending work
+      P->>API: session.prompt(noReply=true, agent, model, variant)
+      alt Prompt saved successfully
+        API-->>P: Return without waiting on active loop
+        P->>H: output.enabled = false
+        H->>M: Continue with queued consolidation prompt
+        M->>P: Chosen write_memory calls
+        P->>C: Locked persistence
+      else API error or exception
+        P->>H: Retain / restore native continuation
+      end
+    else Disabled or no client
+      P->>H: Leave native continuation unchanged
+    end
+  end
+  Note over H,P: Manual compact and some automatic user-message replay paths bypass this hook
+  Note over H,M: Explicit /memory consolidate remains available and persistence is a model decision
+```
+
+## Implementation anchors
+
+| Area | Code to inspect |
+|---|---|
+| Registration, dynamic command, injection, compaction and consolidation | [`ocl-memory.mjs`](../.opencode/plugins/ocl-memory.mjs): plugin factory and returned hooks |
+| Cache and rule rendering | `fileStamp`, `cacheSignature`, `getCache`, `renderRulesForInjection`, `readMemoryIndex` |
+| Tools, maintenance, repair and drift | `tools`, `maintainIndex`, `findIndexEntry`, `upsertIndexLine`, `readFrontmatter`, `repairMemoryIndex`, `countMemoryFiles` |
+| File boundaries, config and locks | [`ocl-memory-shared.mjs`](../.opencode/plugins/ocl-memory-shared.mjs): `readStoreFileSync`, `atomicWriteFileSync`, `isSafeFilename`, `readMemoryRules`, `parseRules`, `withLock` |
+| Migration and collision handling | `maybeCarryOverToSharedDir`, `mergeLocalIntoSharedDir`, `resolveDestName`, `filesEqual` |
+| TUI navigation, mutations and notifications | [`ocl-memory-tui.mjs`](../.opencode/plugins/ocl-memory-tui.mjs): `resolveActiveDir`, `parseIndex`, `readTopic`, `setPin`, `removeEntry`, `runMutation` |
+| Behavioral guidance | [`memory command`](../.opencode/command/memory.md), [`memory skill`](../skills/memory/SKILL.md) |
+| Executable verification | [`smoke tests`](../tests/smoke-test.mjs), [`shared writer tests`](../tests/shared-store-test.mjs), [`host tests`](../tests/host-test.mjs) |

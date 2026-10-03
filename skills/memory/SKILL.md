@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.6.6
+version: 0.6.7
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -28,7 +28,7 @@ The plugin registers four native tools. Use these instead of raw Write/Edit tool
 
 | Tool | Args | What it does |
 |---|---|---|
-| `write_memory` | `topic`, `content`, `summary`, `pin?`, `mode?` | Creates or appends to a topic file; upserts MEMORY.md index entry |
+| `write_memory` | `topic`, `content`, `summary`, `pin`, `mode` | Creates or updates a topic and its current frontmatter metadata; upserts MEMORY.md. Supply all fields in native tool calls; use `pin: false`, `mode: "append"` when defaults are intended. |
 | `remove_memory` | `topic` | Removes the index entry (refuses if pinned; partial match must be unique — exact name wins, ambiguous matches are refused); topic file preserved on disk and tombstoned in `.ocl-removed` so `repair_memory` won't resurrect it |
 | `pin_memory` | `topic`, `pin` (bool) | Pins or unpins an index entry |
 | `repair_memory` | — | Additively re-indexes topic files on disk missing from MEMORY.md (marked `[stale?]`); idempotent; skips tombstoned (intentionally removed) files. Mostly for `shared_dir` co-tenancy drift. |
@@ -77,10 +77,10 @@ If `## Memory Rules` is not in your current context, read `~/.config/opencode/me
 
 ## Reading memory
 
-`MEMORY.md` is injected into your context by the plugin on the first turn of each session, every `inject_every_n_turns` turns (default: 5), and immediately after any memory tool call. Periodic injection re-emits cached state; ordinary manual disk edits require a memory-tool mutation, compaction, or session restart to refresh. If it is not in your current context, read it directly:
+`MEMORY.md` and behavioral rules are attached to every fresh model request, including later steps, other sessions, and post-compaction requests. File-stamp checks detect manual/co-tenant edits and config changes before cache reuse. `inject_every_n_turns` now controls forced disk refreshes every N model requests (default 5), not injection or token costs. A missing index stays in memory until a locked mutation creates it. If memory is absent from context, read the active index directly:
 
 ```
-Read ~/.config/opencode/memory/MEMORY.md
+Read ~/.config/opencode/memory.jsonc, then the local memory/MEMORY.md or ~/.agents/memory/MEMORY.md when shared_dir is true
 ```
 
 You do not need to re-read it unless you have just written to it and want to verify.
@@ -127,7 +127,7 @@ The plugin will:
 Call `write_memory` with the same `topic` name and one of two modes:
 
 - `mode: "append"` (default) — adds the new content under a `## YYYY-MM-DDTHH:MM:SS±HH:MM` heading. Use for new information that extends an existing topic. The full history is preserved.
-- `mode: "replace"` — overwrites the body, preserving frontmatter and advancing `last_updated`. Use when existing content is stale and the new content fully supersedes it. No dated heading is added.
+- `mode: "replace"`: overwrites the body, refreshes `name`, `description`, and `last_updated`, and preserves `created` and other frontmatter. Append refreshes the same metadata while retaining the previous body. Use replace when new content fully supersedes old content.
 
 **Pin-preservation**: passing `pin: false` to `write_memory` on an already-pinned entry does NOT unpin it — the existing `[pin]` is preserved. Use `pin_memory({ topic, pin: false })` to explicitly unpin.
 
@@ -194,7 +194,7 @@ If the injected `## Global Memory` block contains a truncation warning (`memory 
 1. Read `MEMORY.md` in full to assess all entries.
 2. Identify entries that are candidates for removal. Check in this order:
    - **Skip immediately**: any entry with `[pin]` — never a removal candidate.
-   - **Objective (remove without judgment)**: entry points to a topic file that no longer exists on disk; or two entries point to the same filename (keep the one with the more recent date, remove the other). Use `remove_memory` for these.
+   - **Maintenance**: committed writes, removals, and pin changes drop missing/unsafe files and deduplicate filenames using full timestamps while preserving pins. Do not use `remove_memory` to discard one duplicate record; it removes all references to the topic file and tombstones it.
    - **Conservative judgment (remove only if clearly obsolete)**: topic was session-specific and no longer applies; topic is fully superseded by a newer broader entry. When in doubt, keep the entry. Use `remove_memory` for these.
    - **`[stale?]` entries**: these are prioritised candidates — review them first.
 3. If all entries are still valid but the count is high, consolidate: merge two closely related topic files into one using `write_memory`, then `remove_memory` on the now-redundant entry.
@@ -205,17 +205,17 @@ If the injected `## Global Memory` block contains a truncation warning (`memory 
 
 The optional TUI plugin (`ocl-memory-tui.mjs`, registered in `tui.jsonc`) provides an interactive memory browser at `ctrl+alt+m`. From it you can view, pin/unpin, and remove index entries without an LLM turn.
 
-TUI mutations (pin/unpin, remove) write a `.invalidate` sentinel file to the memory directory (whichever one is active — local or shared). On the next agent interaction, the server plugin detects the sentinel, discards its cache, and re-reads the index from disk. Changes made via the TUI are therefore visible after the next agent turn — not instantly within the current one.
+TUI mutations atomically update the index and write `.invalidate` in the active directory. Each server observes file-stamp changes without consuming the sentinel, so all processes can refresh. Pinned removal is refused inside the lock, even when pinned after opening the dialog. Busy, refusal, and filesystem errors are displayed; a notification failure reports that the index was already updated.
 
-The TUI resolves `shared_dir` through the same shared internal module as the server plugin, but re-reads `memory.jsonc` fresh every time the browser opens. After a manual `shared_dir` change, the server keeps its cached directory until a memory tool mutation, compaction, or session restart refreshes it.
+The TUI resolves config on every open; server cache checks and dynamic `/memory` execution also detect path changes. Restart after changing plugin code or skill files. Changing `shared_dir` switches paths but does not continuously reconcile previously migrated stores.
 
 ## Cross-tool shared memory (`shared_dir`)
 
 Setting `"shared_dir": true` in `memory.jsonc` moves `MEMORY.md` and topic files to `~/.agents/memory/` — a location other memory-aware tools (e.g. pi's `openpi-memory`) can also read and write, using the same on-disk format. `memory.jsonc` itself always stays local regardless of this setting.
 
-The first time `shared_dir` resolves `true`, existing local memory is merged into the shared directory — copied, never moved. If another tool (e.g. openpi-memory) already wrote there, local entries are merged in rather than skipped: same-name-different-content collisions get renamed with a `-oclm` suffix; identical content is skipped. Originals stay untouched in `~/.config/opencode/memory/`. This full merge scan runs at most once ever per local install — a sentinel file written after the first successful merge short-circuits every later opencode session straight to a single existence check. Toggling `shared_dir` off and back on does not re-run it or reconcile any drift that happened while it was off — treat it as a one-way move. See [docs/shared-directory.md](../../docs/shared-directory.md) for a worked example.
+Enabling `shared_dir` merges local memory into the shared directory by copying, never moving. Different-content filename collisions get `-oclm` suffixes; identical files are reused and still gain missing index lines. Failed/contended attempts retry on later refreshes. A success sentinel makes the completed merge run once per installation; subsequent path toggles do not reconcile drift. Originals stay local. See [shared storage](https://github.com/linellazatin/openclaude-memory/blob/main/docs/shared-directory.md) for examples; the npm package does not bundle the `docs/` directory.
 
-Writes to the shared directory are protected by a cross-process advisory lock (`.lock` file) so this tool and another tool sharing the directory don't corrupt the index with interleaved writes.
+All mutations use a directory lock and atomic file replacement. Local contention refuses after about 500 ms; shared contention uses about 2 s, a 1 s delay, and a second 2 s window. Retry busy results instead of editing files around the lock. Safe regular `.md` files only: reserved `MEMORY.md`, directories, symlinks, and unsafe names are refused. Re-storing a removed topic checks its frontmatter identity before reusing its file. Carry-over locks local then shared and respects both removal lists. Atomicity is per file; ordinary failed writes attempt rollback, while abrupt termination may require repair or inspection of existing index metadata.
 
 ## Consolidation
 
@@ -223,8 +223,10 @@ Writes to the shared directory are protected by a cross-process advisory lock (`
 
 Setting `"consolidate_on_compact": true` in `memory.jsonc` runs the same consolidation automatically after opencode's automatic (threshold-triggered) compaction, replacing opencode's default synthetic "continue" message. To avoid re-scanning the whole conversation, the consolidation turn is seeded with the compaction summary opencode just generated, and it tells the agent to resume any pending work from the summary's "Next Move" section afterwards — so consolidation persists the session's facts without abandoning an in-progress task. Default is `false` — opencode already sends that default continue message on its own; this setting only matters if you want a consolidation pass to run instead. **This only fires on automatic (overflow-triggered) compaction.** Manual `/compact` does not trigger consolidation — run `/memory consolidate` explicitly if you compact manually and want the same effect.
 
+If there are no new durable facts, say so and only refresh the unpinned recap. Automatic consolidation is queued with `noReply: true`, preserving agent/model/variant; API failure retains native continuation. The full-conversation fallback also instructs resuming pending work. Automatic user-message replay paths may bypass this hook, like manual `/compact`; use explicit consolidation when needed.
+
 ## Persist rules
 
-Your persist rules are in `~/.config/opencode/memory.jsonc` and are injected into your context under `## Memory Rules` on the first turn, every `inject_every_n_turns` turns, and after memory tool calls. Follow them.
+Your persist rules are in `~/.config/opencode/memory.jsonc` and attached under `## Memory Rules` on every model request. Follow the user's configured rules.
 
 If no `## Memory Rules` block is in your context, read `~/.config/opencode/memory.jsonc` directly.
