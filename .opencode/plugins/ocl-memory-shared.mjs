@@ -98,7 +98,7 @@ const INITIAL_RULES_JSONC = `{
   "max_lines": 300,
   // stale_after_days: 0 = disable age flagging
   "stale_after_days": 180,
-  // inject_every_n_turns: re-inject memory every N user prompts; 1 = every prompt
+  // inject_every_n_turns: full disk refresh every N model requests; memory is always injected
   "inject_every_n_turns": 5,
   // shared_dir: true = store MEMORY.md and topic files at ~/.agents/memory/
   // so other tools (e.g. pi's openpi-memory) can read/write the same files.
@@ -146,6 +146,10 @@ export function getRemovedListPath(memDir) {
   return path.join(memDir, '.ocl-removed');
 }
 
+export function hasIndexFlag(rest, flag) {
+  return rest.split(' -- ')[0].includes(flag);
+}
+
 export function readRemovedList(memDir) {
   try {
     return new Set(
@@ -184,7 +188,7 @@ export function ensureMemoryDir(dir = MEMORY_DIR) {
 
 // Writes via temp file + rename so a crash or concurrent read never observes
 // a partially-written file. Same directory as the target to keep rename atomic.
-export function atomicWriteFileSync(filePath, data) {
+export function atomicWriteFileSync(filePath, data, { exclusive = false } = {}) {
   assertWritableFile(filePath);
   const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
@@ -192,7 +196,8 @@ export function atomicWriteFileSync(filePath, data) {
     try { fs.writeFileSync(fd, data, 'utf8'); fs.fsyncSync(fd); }
     finally { fs.closeSync(fd); }
     assertWritableFile(filePath);
-    fs.renameSync(tmp, filePath);
+    if (exclusive) fs.linkSync(tmp, filePath); // publish complete contents without replacing a racing creator
+    else fs.renameSync(tmp, filePath);
   } finally {
     try { fs.unlinkSync(tmp); } catch (err) { if (err.code !== 'ENOENT') throw err; }
   }
@@ -238,14 +243,12 @@ export function sleep(ms) {
 // RE-STAT and compare inode+mtime against the lock we observed: a competing
 // reclaimer may already have replaced it (its wx-create succeeded after our
 // age check), and unlinking THAT would put us both inside the critical
-// section. Residual window between the recheck and the unlink is microseconds,
-// and the compare-and-delete release means neither loser clobbers the other's
-// lock on exit. A lock with an unparseable pid (foreign writer, empty file)
-// is only stolen past LOCK_STALE_HARD_MS, so it is at worst briefly unfair,
-// never silently clobbering an active writer.
+// section. A lock with an unparseable pid is only reclaimed past LOCK_STALE_HARD_MS.
+// ponytail: the shared protocol has no atomic compare-and-unlink; native filesystem
+// locks are needed if strict lease safety across replacement races is required.
 // Returns the lockPath on success, or null after `timeoutMs` of contention.
 // Callers that must not proceed unlocked should use withLock() instead.
-export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS) {
+export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS, owner) {
   ensureMemoryDir(memDir);
   const lockPath = path.join(memDir, '.lock');
   const deadline = Date.now() + timeoutMs;
@@ -257,6 +260,7 @@ export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS) {
       catch (err) { fs.unlinkSync(lockPath); throw err; }
       finally { fs.closeSync(fd); }
       _lockTokens.set(lockPath, token);
+      if (owner) owner.token = token; // capture this acquisition, not the latest token for its path
       return lockPath;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
@@ -266,11 +270,10 @@ export async function acquireLock(memDir, timeoutMs = LOCK_ACQUIRE_TIMEOUT_MS) {
         const age = Date.now() - stat.mtimeMs;
         if (age > LOCK_STALE_MS && !lockHolderAlive(lockPath, age)) {
           let fresh;
-          try { fresh = fs.statSync(lockPath); } catch { continue; } // vanished — retry acquire
-          if (fresh.ino === stat.ino && fresh.mtimeMs === stat.mtimeMs) {
+          try { fresh = fs.lstatSync(lockPath); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+          if (fresh?.isFile() && fresh.ino === stat.ino && fresh.mtimeMs === stat.mtimeMs) {
             try { fs.unlinkSync(lockPath); } catch {}
           }
-          continue; // retry acquire (immediately, or against the new holder)
         }
       } catch {}
       if (Date.now() > deadline) return null;
@@ -297,10 +300,9 @@ function lockHolderAlive(lockPath, age) {
   return age <= LOCK_STALE_HARD_MS; // unknown pid: alive unless very old
 }
 
-export function releaseLock(lockPath) {
+export function releaseLock(lockPath, token = _lockTokens.get(lockPath)) {
   if (!lockPath) return;
-  const token = _lockTokens.get(lockPath);
-  _lockTokens.delete(lockPath);
+  if (_lockTokens.get(lockPath) === token) _lockTokens.delete(lockPath);
   if (token === undefined) return;
   {
     // Compare-and-delete: if a stale-reclaimer stole the lock while our
@@ -323,15 +325,16 @@ export function releaseLock(lockPath) {
 //     clobbering a co-tenant's in-flight index update.
 export async function withLock(memDir, fn, { strict = false, timeoutMs } = {}) {
   const tmo = timeoutMs != null ? timeoutMs : (strict ? LOCK_ACQUIRE_TIMEOUT_MS_SHARED : LOCK_ACQUIRE_TIMEOUT_MS);
-  const lockPath = await acquireLock(memDir, tmo);
+  const owner = {};
+  const lockPath = await acquireLock(memDir, tmo, owner);
   if (lockPath) {
-    try { return await fn(); } finally { releaseLock(lockPath); }
+    try { return await fn(); } finally { releaseLock(lockPath, owner.token); }
   }
   if (!strict) throw new LockContendedError('memory store busy — could not acquire local lock');
   await sleep(LOCK_RETRY_DELAY_MS);
-  const retryPath = await acquireLock(memDir, tmo);
+  const retryPath = await acquireLock(memDir, tmo, owner);
   if (retryPath) {
-    try { return await fn(); } finally { releaseLock(retryPath); }
+    try { return await fn(); } finally { releaseLock(retryPath, owner.token); }
   }
   throw new LockContendedError('memory store busy — could not acquire lock after retry');
 }
@@ -367,6 +370,7 @@ export const stripJsonc = raw => {
     // Block comment: /* ... */ — only outside a string literal. A `*/` inside
     // a config value (e.g. a path glob) must NOT terminate it early.
     if (ch === '/' && raw[i + 1] === '*') {
+      out += ' '; // comments separate tokens, never concatenate them
       i += 2;
       while (i < raw.length && !(raw[i] === '*' && raw[i + 1] === '/')) i++;
       i++; // land on the '/' of the closing '*/' so the for-loop's i++ skips it
@@ -374,7 +378,27 @@ export const stripJsonc = raw => {
     }
     out += ch;
   }
-  return out.replace(/,\s*([}\]])/g, '$1');
+  let clean = '';
+  inString = false;
+  escaped = false;
+  for (let i = 0; i < out.length; i++) {
+    const ch = out[i];
+    if (inString) {
+      clean += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    if (ch === ',') {
+      let j = i + 1;
+      while (/\s/.test(out[j] || '') && j < out.length) j++;
+      if (out[j] === '}' || out[j] === ']') continue;
+    }
+    clean += ch;
+  }
+  return clean;
 };
 
 // Rejects filenames that could escape memDir (path separators, `..` segments)
@@ -435,13 +459,17 @@ export function readMemoryRules() {
     // Back it up in place (never delete) and copy forward to the new location.
     if (fs.existsSync(MEMORY_CONFIG_LEGACY)) {
       const legacy = fs.readFileSync(MEMORY_CONFIG_LEGACY, 'utf8');
-      try { fs.renameSync(MEMORY_CONFIG_LEGACY, `${MEMORY_CONFIG_LEGACY}.bak`); } catch {}
       ensureMemoryDir(CONFIG_ROOT);
-      atomicWriteFileSync(MEMORY_CONFIG, legacy);
+      try { atomicWriteFileSync(MEMORY_CONFIG, legacy, { exclusive: true }); }
+      catch (err) { if (err.code === 'EEXIST') return fs.readFileSync(MEMORY_CONFIG, 'utf8'); throw err; }
+      if (!fs.existsSync(`${MEMORY_CONFIG_LEGACY}.bak`)) {
+        try { fs.renameSync(MEMORY_CONFIG_LEGACY, `${MEMORY_CONFIG_LEGACY}.bak`); } catch {}
+      }
       return legacy;
     }
     ensureMemoryDir(CONFIG_ROOT);
-    atomicWriteFileSync(MEMORY_CONFIG, INITIAL_RULES_JSONC);
+    try { atomicWriteFileSync(MEMORY_CONFIG, INITIAL_RULES_JSONC, { exclusive: true }); }
+    catch (err) { if (err.code === 'EEXIST') return fs.readFileSync(MEMORY_CONFIG, 'utf8'); throw err; }
     return INITIAL_RULES_JSONC;
   } catch (err) {
     console.error('[openclaude-memory] failed to read/write memory config:', err.message);

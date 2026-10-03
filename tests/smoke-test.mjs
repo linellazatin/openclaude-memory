@@ -1913,6 +1913,204 @@ await test('failed carry-over retries in the same process and respects shared to
 });
 
 // ═══════════════════════════════════════════════════════════
+await test('JSONC trailing commas never alter literal strings', () => {
+  const raw = '{ "always_ask": ["literal ,] and ,}",], "max_lines": 200, /* comment */ }';
+  assert.deepEqual(JSON.parse(shared.stripJsonc(raw)), { always_ask: ['literal ,] and ,}'], max_lines: 200 });
+  assert.throws(() => JSON.parse(shared.stripJsonc('{ "max_lines": 1/* gap */2 }')));
+});
+
+await test('updated frontmatter and index carry identical current metadata', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Metadata Audit', content: 'old', summary: 'old' });
+  await plugin.tool.write_memory.execute({ topic: 'Metadata Audit', content: 'new', summary: 'new [bracket] (paren)', mode: 'replace' });
+  const file = path.join(MEMORY_DIR, 'metadata-audit.md');
+  const fm = plugin.__test__.readFrontmatter(file);
+  const line = readIndex().split('\n').find(l => l.includes('(metadata-audit.md)'));
+  assert.equal(fm.description, 'new bracket paren');
+  assert.ok(line.endsWith(' -- ' + fm.description));
+  assert.ok(!fs.readFileSync(file, 'utf8').includes('\nold\n'));
+});
+
+await test('repair reports its pre-existing count without double-counting new entries', () => {
+  const dir = fs.mkdtempSync(path.join(TMP, 'repair-count-'));
+  const index = path.join(dir, 'MEMORY.md');
+  fs.writeFileSync(index, '# Memory Index\n- [Existing](existing.md) -- existing\n');
+  fs.writeFileSync(path.join(dir, 'existing.md'), 'existing');
+  fs.writeFileSync(path.join(dir, 'missing.md'), '---\nname: "Missing"\n---\nbody');
+  assert.deepEqual(plugin.__test__.repairMemoryIndex({ memDir: dir, memIndex: index }), { added: 1, alreadyIndexed: 1 });
+  fs.rmSync(dir, { recursive: true });
+});
+
+await test('same-day duplicate timestamps choose the newest entry without losing a pin', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Dedup Timestamp Audit', content: 'keep', summary: 'keep' });
+  const index = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = readIndex();
+  const without = before.split('\n').filter(l => !l.includes('(dedup-timestamp-audit.md)')).join('\n');
+  fs.writeFileSync(index, without + '\n- [Dedup Timestamp Audit](dedup-timestamp-audit.md) [pin] 2026-10-03T01:00:00+00:00 -- older\n- [Dedup Timestamp Audit](dedup-timestamp-audit.md) 2026-10-03T02:00:00+00:00 -- newest\n');
+  await plugin.tool.write_memory.execute({ topic: 'Dedup Timestamp Trigger', content: 'trigger', summary: 'trigger' });
+  const line = readIndex().split('\n').find(l => l.includes('(dedup-timestamp-audit.md)'));
+  assert.ok(line.endsWith(' -- newest'));
+  assert.ok(line.includes('[pin]'));
+  assert.ok(!line.includes('[stale?]'));
+});
+
+await test('pin-like text in a summary never acts as a metadata flag', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Summary Pin Audit', content: 'keep', summary: 'keep' });
+  const index = path.join(MEMORY_DIR, 'MEMORY.md');
+  fs.writeFileSync(index, readIndex().replace(/(^- \[Summary Pin Audit\].* -- ).*$/m, '$1literal [pin] in a summary'));
+  const entry = tui.parseIndex(index).find(e => e.filename === 'summary-pin-audit.md');
+  assert.equal(entry.pinned, false);
+  const result = await plugin.tool.remove_memory.execute({ topic: 'Summary Pin Audit' });
+  assert.match(result, /Index entry removed/);
+});
+
+await test('failed index commit restores the original topic body', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Write Rollback Audit', content: 'original', summary: 'original' });
+  const topic = path.join(MEMORY_DIR, 'write-rollback-audit.md');
+  const before = fs.readFileSync(topic, 'utf8');
+  const indexBefore = readIndex();
+  const rename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to === path.join(MEMORY_DIR, 'MEMORY.md')) throw new Error('injected index failure');
+    return rename(from, to);
+  };
+  try { await assert.rejects(plugin.tool.write_memory.execute({ topic: 'Write Rollback Audit', content: 'replacement', summary: 'replacement', mode: 'replace' }), /index failure/); }
+  finally { fs.renameSync = rename; }
+  assert.equal(fs.readFileSync(topic, 'utf8'), before);
+  assert.equal(readIndex(), indexBefore);
+});
+
+await test('TUI shows a pinned refusal instead of silently returning to the browser', async () => {
+  const module = await import('../.opencode/plugins/ocl-memory-tui.mjs');
+  let current;
+  let commands;
+  const api = {
+    ui: { dialog: { setSize() {}, replace(fn) { current = fn(); } }, DialogSelect: opts => opts, DialogConfirm: opts => opts, DialogAlert: opts => opts },
+    keymap: { registerLayer(opts) { commands = opts.commands; return () => {}; } },
+    lifecycle: { onDispose() {} },
+  };
+  await module.default.tui(api);
+  await commands[0].run();
+  const target = current.options.find(o => !o.value.pinned);
+  assert.ok(target);
+  current.onSelect(target);
+  const remove = current.options.find(o => o.value === 'remove');
+  assert.ok(remove);
+  current.onSelect(remove);
+  const confirm = current.onConfirm;
+  await tui.setPin(MEMORY_DIR, path.join(MEMORY_DIR, 'MEMORY.md'), target.value.filename, true, false);
+  await confirm();
+  assert.match(current.message || '', /pinned/i);
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('failed config migration preserves the original legacy file and backup', () => {
+  const config = fs.readFileSync(MEMORY_CONFIG);
+  const backup = MEMORY_CONFIG_LEGACY + '.bak';
+  const priorBackup = fs.existsSync(backup) ? fs.readFileSync(backup) : null;
+  fs.unlinkSync(MEMORY_CONFIG);
+  fs.writeFileSync(MEMORY_CONFIG_LEGACY, '{ "max_lines": 222 }');
+  const rename = fs.renameSync;
+  const link = fs.linkSync;
+  const failConfig = (fn, from, to) => { if (to === MEMORY_CONFIG) throw new Error('injected config failure'); return fn(from, to); };
+  fs.renameSync = (from, to) => failConfig(rename, from, to);
+  fs.linkSync = (from, to) => failConfig(link, from, to);
+  try {
+    assert.equal(shared.readMemoryRules(), null);
+    assert.equal(fs.readFileSync(MEMORY_CONFIG_LEGACY, 'utf8'), '{ "max_lines": 222 }');
+    if (priorBackup !== null) assert.deepEqual(fs.readFileSync(backup), priorBackup);
+  } finally {
+    fs.renameSync = rename;
+    fs.linkSync = link;
+    fs.rmSync(MEMORY_CONFIG_LEGACY, { force: true });
+    if (priorBackup !== null) fs.writeFileSync(backup, priorBackup);
+    fs.writeFileSync(MEMORY_CONFIG, config);
+  }
+});
+
+await test('racing config creation never overwrites a user config', () => {
+  const config = fs.readFileSync(MEMORY_CONFIG);
+  fs.unlinkSync(MEMORY_CONFIG);
+  const rename = fs.renameSync;
+  const link = fs.linkSync;
+  const racingCreator = (fn, from, to) => {
+    if (to === MEMORY_CONFIG) fs.writeFileSync(to, '{ "max_lines": 234 }');
+    return fn(from, to);
+  };
+  fs.renameSync = (from, to) => racingCreator(rename, from, to);
+  fs.linkSync = (from, to) => racingCreator(link, from, to);
+  try {
+    assert.equal(shared.readMemoryRules(), '{ "max_lines": 234 }');
+    assert.equal(fs.readFileSync(MEMORY_CONFIG, 'utf8'), '{ "max_lines": 234 }');
+  } finally { fs.renameSync = rename; fs.linkSync = link; fs.writeFileSync(MEMORY_CONFIG, config); }
+});
+
+await test('/memory command paths follow a shared_dir change before execution', async () => {
+  const config = {};
+  await plugin.config(config);
+  assert.ok(config.command.memory.template.includes(MEMORY_DIR));
+  writeRules('{ "shared_dir": true }');
+  try {
+    const output = { parts: [{ type: 'text', text: config.command.memory.template }] };
+    await plugin['command.execute.before']({ command: 'memory' }, output);
+    assert.ok(output.parts[0].text.includes(`Memory dir: ${SHARED_MEMORY_DIR}`));
+    assert.ok(!output.parts[0].text.includes(`Read ${MEMORY_DIR}/MEMORY.md`));
+  } finally { writeRules('{ "shared_dir": false }'); }
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('TUI cache notification never follows a sentinel symlink', async () => {
+  const sentinel = shared.getDirtySentinel(MEMORY_DIR);
+  const previous = fs.existsSync(sentinel) ? fs.readFileSync(sentinel) : null;
+  const outside = path.join(TMP, 'sentinel-target.txt');
+  fs.writeFileSync(outside, 'keep this content');
+  fs.rmSync(sentinel, { force: true });
+  fs.symlinkSync(outside, sentinel);
+  try {
+    const result = await tui.setPin(MEMORY_DIR, path.join(MEMORY_DIR, 'MEMORY.md'), 'metadata-audit.md', false, false);
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'keep this content');
+    assert.match(result, /Index updated.*notification failed/);
+  } finally {
+    fs.rmSync(sentinel, { force: true });
+    if (previous !== null) fs.writeFileSync(sentinel, previous);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('a replaced lock in the same process is not released by its previous owner', async () => {
+  const lp = path.join(MEMORY_DIR, '.lock');
+  let releaseInner;
+  let enteredInner;
+  let inner;
+  const held = new Promise(resolve => { releaseInner = resolve; });
+  const ready = new Promise(resolve => { enteredInner = resolve; });
+  try {
+    await shared.withLock(MEMORY_DIR, async () => {
+      fs.unlinkSync(lp); // simulate a forced replacement while the first caller still runs
+      inner = shared.withLock(MEMORY_DIR, async () => { enteredInner(); await held; });
+      await ready;
+    });
+    assert.ok(fs.existsSync(lp), 'the newer acquisition must retain its lock');
+  } finally { releaseInner(); await inner; fs.rmSync(lp, { force: true }); }
+});
+
+await test('an undeletable stale lock obeys the acquisition deadline', async () => {
+  const lp = path.join(MEMORY_DIR, '.lock');
+  fs.writeFileSync(lp, '999999\t0\tdead');
+  const old = new Date(Date.now() - 20000);
+  fs.utimesSync(lp, old, old);
+  const script = `import fs from 'node:fs'; import { acquireLock, MEMORY_DIR } from ${JSON.stringify(new URL('../.opencode/plugins/ocl-memory-shared.mjs', import.meta.url).href)}; const unlink = fs.unlinkSync; fs.unlinkSync = p => { if (p.endsWith('/.lock')) throw Object.assign(new Error('denied'), { code: 'EACCES' }); return unlink(p); }; process.stdout.write(JSON.stringify(await acquireLock(MEMORY_DIR, 20)));`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '';
+  child.stdout.on('data', data => { output += data; });
+  const timer = setTimeout(() => child.kill(), 1500);
+  try {
+    const code = await new Promise(resolve => child.once('exit', resolve));
+    assert.equal(code, 0, 'stale reclaim must not loop forever when unlink fails');
+    assert.equal(output, 'null');
+  } finally { clearTimeout(timer); child.kill(); fs.rmSync(lp, { force: true }); }
+});
+
+// ═══════════════════════════════════════════════════════════
 // Results
 // ═══════════════════════════════════════════════════════════
 

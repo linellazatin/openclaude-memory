@@ -3,7 +3,7 @@ import path from 'path';
 import {
   readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel, isSafeFilename,
   atomicWriteFileSync, withLock, LockContendedError, maybeCarryOverToSharedDir,
-  addToRemovedList, parseIndexLine, isRegularFile, readStoreFileSync,
+  addToRemovedList, parseIndexLine, isRegularFile, readStoreFileSync, hasIndexFlag,
 } from './ocl-memory-shared.mjs';
 
 // Resolves which directory (local or shared, per memory.jsonc's shared_dir)
@@ -32,8 +32,8 @@ function parseIndex(memIndex) {
     entries.push({
       name:     m[1],
       filename: m[2],
-      pinned:   rest.includes('[pin]'),
-      stale:    rest.includes('[stale?]'),
+      pinned:   hasIndexFlag(rest, '[pin]'),
+      stale:    hasIndexFlag(rest, '[stale?]'),
       date:     dateMatch    ? dateMatch[1].slice(0, 10) : '',
       summary:  summaryMatch ? summaryMatch[1].trim()   : '',
     });
@@ -53,14 +53,16 @@ async function setPin(memDir, memIndex, filename, pin, sharedDir) {
   try {
     return await withLock(memDir, async () => {
       const lines = readStoreFileSync(memIndex).split('\n');
+      if (!lines.some(line => parseIndexLine(line)?.filename === filename)) return 'Entry no longer exists.';
       const updated = lines.map(line => {
         const parsed = parseIndexLine(line);
         if (!parsed || parsed.filename !== filename) return line;
-        if (pin)  return parsed.rest.includes('[pin]') ? line : line.replace(/(\]\([^)]+\))/, '$1 [pin]');
-        return line.replace(/\s*\[pin\]/, '');
+        if (pin) return hasIndexFlag(parsed.rest, '[pin]') ? line : line.replace(/(\]\([^)]+\))/, '$1 [pin]');
+        return hasIndexFlag(parsed.rest, '[pin]') ? line.replace(/\s*\[pin\]/, '') : line;
       });
       atomicWriteFileSync(memIndex, updated.join('\n'));
-      try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
+      try { atomicWriteFileSync(getDirtySentinel(memDir), ''); }
+      catch (err) { return `Index updated, but cache notification failed: ${err.message}`; }
     }, { strict: sharedDir });
   } catch (e) {
     if (e instanceof LockContendedError) return 'Memory store is busy (another tool/process holds the lock) — retry in a moment.';
@@ -79,13 +81,14 @@ async function removeEntry(memDir, memIndex, filename, sharedDir) {
       const lines = readStoreFileSync(memIndex).split('\n');
       const matches = lines.map(parseIndexLine).filter(p => p && p.filename === filename);
       if (!matches.length) return 'Entry no longer exists.';
-      if (matches.some(p => p.rest.split(' -- ')[0].includes('[pin]'))) return 'Entry is pinned; unpin it before removal.';
+      if (matches.some(p => hasIndexFlag(p.rest, '[pin]'))) return 'Entry is pinned; unpin it before removal.';
       addToRemovedList(memDir, filename); // persist removal intent before dropping discoverability
       atomicWriteFileSync(memIndex, lines.filter(l => {
         const parsed = parseIndexLine(l);
         return !(parsed && parsed.filename === filename);
       }).join('\n'));
-      try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
+      try { atomicWriteFileSync(getDirtySentinel(memDir), ''); }
+      catch (err) { return `Index updated, but cache notification failed: ${err.message}`; }
     }, { strict: sharedDir });
   } catch (e) {
     if (e instanceof LockContendedError) return 'Memory store is busy (another tool/process holds the lock) — retry in a moment.';
@@ -115,20 +118,34 @@ function readTopic(memDir, filename) {
 }
 
 const tui = async (api) => {
+  function showError(message) {
+    api.ui.dialog.replace(() => api.ui.DialogAlert({ title: 'Memory', message, onConfirm: showBrowser }));
+  }
+
+  async function runMutation(action) {
+    try {
+      const result = await action();
+      if (typeof result === 'string') showError(result);
+      else await showBrowser();
+    } catch (err) { showError(err.message); }
+  }
+
   async function showBrowser() {
-    const { memDir, memIndex, sharedDir } = await resolveActiveDir();
-    const entries = parseIndex(memIndex);
-    api.ui.dialog.setSize('large');
-    api.ui.dialog.replace(() => api.ui.DialogSelect({
-      title:       `Memory (${entries.length} ${entries.length === 1 ? 'entry' : 'entries'})`,
-      placeholder: 'Filter by topic...',
-      options:     entries.map(e => ({
-        title:       `${e.name}${e.pinned ? ' [pin]' : ''}${e.stale ? ' [stale?]' : ''}`,
-        description: [e.summary, e.date].filter(Boolean).join('  '),
-        value:       e,
-      })),
-      onSelect: opt => showActions(opt.value, memDir, memIndex, sharedDir),
-    }));
+    try {
+      const { memDir, memIndex, sharedDir } = await resolveActiveDir();
+      const entries = parseIndex(memIndex);
+      api.ui.dialog.setSize('large');
+      api.ui.dialog.replace(() => api.ui.DialogSelect({
+        title:       `Memory (${entries.length} ${entries.length === 1 ? 'entry' : 'entries'})`,
+        placeholder: 'Filter by topic...',
+        options:     entries.map(e => ({
+          title:       `${e.name}${e.pinned ? ' [pin]' : ''}${e.stale ? ' [stale?]' : ''}`,
+          description: [e.summary, e.date].filter(Boolean).join('  '),
+          value:       e,
+        })),
+        onSelect: opt => showActions(opt.value, memDir, memIndex, sharedDir),
+      }));
+    } catch (err) { showError(err.message); }
   }
 
   function showActions(entry, memDir, memIndex, sharedDir) {
@@ -165,16 +182,14 @@ const tui = async (api) => {
             }));
             break;
           case 'pin':
-            setPin(memDir, memIndex, entry.filename, true, sharedDir).then(showBrowser);
-            break;
+            return runMutation(() => setPin(memDir, memIndex, entry.filename, true, sharedDir));
           case 'unpin':
-            setPin(memDir, memIndex, entry.filename, false, sharedDir).then(showBrowser);
-            break;
+            return runMutation(() => setPin(memDir, memIndex, entry.filename, false, sharedDir));
           case 'remove':
             api.ui.dialog.replace(() => api.ui.DialogConfirm({
               title:     'Remove from index',
               message:   `Remove "${entry.name}" from the memory index?\n\nThe topic file is preserved on disk.`,
-              onConfirm: () => { removeEntry(memDir, memIndex, entry.filename, sharedDir).then(showBrowser); },
+              onConfirm: () => runMutation(() => removeEntry(memDir, memIndex, entry.filename, sharedDir)),
               onCancel:  () => showActions(entry, memDir, memIndex, sharedDir),
             }));
             break;
