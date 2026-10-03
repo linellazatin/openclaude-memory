@@ -12,11 +12,17 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 
 > <div align="center">
 >
-> ### An [upgraded, small, and deterministic SQLite core (FTS5/BM25) for coding-agent memory](https://github.com/linellazatin/nanomneme) is currently in development - which also has an **opencode** adapter. Feel free to check it out, specially if you're already tired of flat-files as memory store (I won't stop you, though).
-> #### Once nanomneme has been fully adapted, and tested end-to-end, there's a big possibility that we'll be migrating to nanomneme infrastructure for memory system.
+> ### A [local-first, small, and deterministic SQLite core (FTS5/BM25) for coding-agent memory](https://nanomneme.openlines.dev) is currently in development - which also has an **opencode** adapter. Feel free to check it out, specially if you're already tired of flat-files as memory store (I won't stop you, though).
 >
 > </div>
 
+>
+> ## v0.6.7: request injection and flat-file safety
+> - Memory is attached to every model request; filesystem changes refresh the cache automatically.
+> - Automatic consolidation queues a `noReply` prompt without waiting on its own running session.
+> - Local and shared mutations fail closed on contention; migration locks both directories and respects removals.
+> - Topic identity, symlink boundaries, pinned TUI removal, metadata recovery, JSONC literals, repair counts, and failed-write rollback are covered by regressions.
+> - 120 smoke tests, real-process shared-writer checks, and a real OpenCode 1.18.34 host check with a local fake model.
 >
 > ## v0.6.6 — co-tenancy audit fixes (match safety, lock tokens, drift hygiene)
 > - `remove_memory`/`pin_memory` now refuse ambiguous partial matches instead of silently mutating the first matching entry; exact names win outright (openpi-memory parity)
@@ -25,21 +31,6 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 > - `repair_memory` sanitizes recovered frontmatter timestamps so a corrupted co-tenant file can't forge a `[pin]` onto an index line; summaries are collapsed + capped at 500 chars; consolidation recap is now one canonical topic (`OCL Last Session Recap`)
 > - TUI pin/remove match only the parsed entry line, never a line that merely mentions another topic's link; failed carry-over merges now retry within the session
 > - 6 new tests (86 → 92)
->
-> ## v0.6.5 — markdown/flatfile index integrity
-> - a topic name or summary can no longer break the "one topic = one line" index contract: newlines are collapsed and `[]()` stripped before an index line is written (blocks phantom-entry injection under `shared_dir`)
-> - `isSafeFilename` now also rejects leading-dot files (`.lock`, `.ocl-removed`, hidden `.md`) and any `[]()` in a filename — hidden from the TUI, refused by the tools, skipped by repair
-> - `memory.jsonc` now accepts `/* … */` block comments (string-literal-aware, like the existing `//` handling) instead of silently reverting to defaults
-> - 7 new tests (79 → 86)
->
-> ## v0.6.4 — memory dir hardening
-> - writes now fail closed (wait + auto-retry once, then "busy") under `shared_dir` instead of ever writing unlocked — a co-tenant's in-flight write is never clobbered
-> - `.lock` is PID-stamped with a real liveness check before stale reclaim — a live slow holder is never stolen from
-> - new `/memory repair`: re-indexes topic files a co-tenant left out of `MEMORY.md` (additive, idempotent); a maintenance note nudges you when drift is detected
-> - repair now respects intentional removals: `remove_memory` tombstones the topic in `.ocl-removed` so it is never resurrected as an orphan (re-storing it clears the tombstone)
-> - topic frontmatter quoted + recap renamed (`ocl-last-session-recap.md`) to align with openpi-memory
-> - append-mode `last_updated` bump is now frontmatter-scoped, the last unlocked read-path index write is gone, and TUI mutations guard a missing index
-> - 11 new tests (68 → 79)
 >
 > see [CHANGELOG](CHANGELOG.md) for more details
 
@@ -55,7 +46,7 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 
 **Docs — deeper dives, not needed to get started:**
 
-- [How opencode Keeps Memory in Context](docs/memory-injection.md) — why the injected index persists in the system prompt for the whole session, and what periodic re-injection actually refreshes
+- [How opencode Keeps Memory in Context](docs/memory-injection.md): per-request injection, cache freshness, compaction, and token costs
 - [Configuration & Index Reference](docs/configuration.md) — full `memory.jsonc` reference, index metadata format, staleness flagging, cap handling and remediation
 - [Shared Storage Across Tools (shared_dir)](docs/shared-directory.md) — the opt-in `~/.agents/memory/` migration, fresh-install and upgrade walkthroughs
 - [Architecture & Internals](docs/architecture.md) — plugin file layout, scope, system compatibility, token overhead, model compatibility
@@ -98,17 +89,17 @@ Just files, structure, and an agent that knows where to look.
 
 ## How it works
 
-1. **Injection**: On the first turn of a session, the plugin reads `~/.config/opencode/memory/MEMORY.md` and `memory.jsonc` into an in-process cache and injects the contents into the system prompt under `## Global Memory` and `## Memory Rules` headers. Injection repeats every `inject_every_n_turns` turns (default: 5) and after memory tool mutations, not to keep memory present (it persists in the system prompt for the whole session automatically), but to re-emit the current cached state.
+1. **Injection**: OpenCode constructs a fresh system prompt for every model request. The plugin attaches the cached index and behavioral rules under `## Global Memory` and `## Memory Rules` each time, including requests in other sessions and after compaction.
 2. **Topic files**: `MEMORY.md` is a concise index (one line per topic). Detail lives in separate topic files (`~/.config/opencode/memory/<topic>.md`), loaded on-demand by the agent when it needs more context.
-3. **Native tools**: The plugin registers `write_memory`, `remove_memory`, and `pin_memory` tools. The agent calls these instead of raw file operations — the plugin guarantees consistent format, frontmatter, and index maintenance every time. After each tool call the cache is invalidated and a dirty flag is set, so the next turn re-injects the updated index.
+3. **Native tools**: The plugin registers `write_memory`, `remove_memory`, `pin_memory`, and `repair_memory`. Mutations use a directory lock and atomic file replacement; memory tools invalidate the cache so the next request sees the result.
 4. **Auto-writes**: The agent writes to memory proactively — without being asked — when it learns something worth keeping: user preferences, feedback on how to approach work, project constraints, or pointers to external systems. Memories are typed (`user`, `feedback`, `project`, `reference`), and structured entries include a `Why:` + `How to apply:` section so the agent can reason about edge cases, not just recite facts. Reliability varies by model; see [Model compatibility](docs/architecture.md#model-compatibility).
 5. **Manual control**: Use `/memory` to view the current index, `/memory <text>` to store a fact immediately, `/memory pin <topic>` to pin an entry, `/memory unpin <topic>` to unpin, `/memory remove <topic>` to remove one, or `/memory consolidate` to review the session for undocumented facts.
-6. **Compaction**: When context compression runs, the plugin forces a fresh disk read and injects the current memory state into the compaction context, ensuring memory survives the compaction cleanly. The injection counter is also reset so the first turn after compaction re-injects the index. If `consolidate_on_compact` is enabled, opencode's automatic post-compaction continue message is replaced with a consolidation pass — seeded with the compaction summary and told to resume pending work afterwards. Note: this only applies to **automatic** compaction — manual `/compact` does not trigger consolidation automatically.
-7. **Bootstrap**: On first run, the plugin creates `MEMORY.md` and `memory.jsonc` automatically. Nothing to set up.
+6. **Compaction**: The plugin forces a fresh disk read into the compaction context. When `consolidate_on_compact` is enabled and OpenCode invokes its automatic continuation hook, it queues consolidation with `noReply: true` and retains native continuation on API failure. Manual `/compact` does not invoke this hook; an automatic compaction replay path can bypass it too.
+7. **Bootstrap**: `memory.jsonc` is created on first use without replacing a racing creator's config. A missing index is returned in memory; `MEMORY.md` is materialized only by a locked mutation or migration.
 
-> **Note:** Manual edits to `MEMORY.md` or `memory.jsonc` do not invalidate the in-process cache. They take effect after a memory tool mutation, compaction, or session restart. TUI mutations write an `.invalidate` sentinel and are picked up on the server's next cache check when both are using the same active directory.
+The cache checks file identity, size, and nanosecond timestamps before reuse, so manual edits, co-tenant writes, TUI edits, and `shared_dir` changes are picked up on the next cache check. `inject_every_n_turns` retains its name but now controls a forced disk refresh every N model requests, not whether memory is injected. It does not reduce prompt-token costs.
 
-See [How opencode Keeps Memory in Context](docs/memory-injection.md) for the full breakdown of why the injected index persists in the system prompt for the whole session, and what periodic re-injection actually refreshes.
+See [How opencode Keeps Memory in Context](docs/memory-injection.md) for request construction, cache freshness, and compaction details.
 
 ## Native tools
 
@@ -116,12 +107,12 @@ The plugin registers four tools that the agent calls directly. These replace raw
 
 | Tool | Args | What it does |
 |---|---|---|
-| `write_memory` | `topic`, `content`, `summary`, `pin?`, `mode?` | Creates a new topic file with YAML frontmatter, or updates an existing one. `mode: "append"` (default) adds content under a new dated heading; `mode: "replace"` overwrites the body while preserving frontmatter. The index `summary` is collapsed to one line and capped at 500 chars. Upserts the `MEMORY.md` index entry automatically. |
+| `write_memory` | `topic`, `content`, `summary`, `pin`, `mode` | Creates or updates a topic. `append` adds a dated section; `replace` replaces the body. Both refresh `name`, `description`, and `last_updated`, preserve `created` and other frontmatter, and update the index. Summary is sanitized and capped at 500 characters. Native calls supply all fields; direct JS calls default to `pin: false`, `mode: "append"`. |
 | `remove_memory` | `topic` | Removes the index entry. A partial `topic` must match exactly one entry — an exact name wins, multiple substring matches are refused with a candidate list. Refuses if the entry is pinned. Topic file is preserved on disk and its filename is tombstoned in `.ocl-removed` so `/memory repair` will not resurrect it. |
 | `pin_memory` | `topic`, `pin` (bool) | Pins (`true`) or unpins (`false`) an index entry. Same exact-wins / ambiguous-refuses matching as `remove_memory`. Pinned entries are never flagged as stale and cannot be removed. |
 | `repair_memory` | — | Additively re-indexes topic `.md` files present on disk but missing from `MEMORY.md` (marked `[stale?]`, dated from frontmatter). Idempotent; never deletes or reorders. **Skips any file tombstoned by `remove_memory`**, so intentional removals stay gone. |
 
-After every tool call that touches `MEMORY.md`, the plugin runs an index maintenance pass: removes orphaned entries (file no longer on disk), removes duplicates (keeps the more recent), and stamps or removes `[stale?]` flags. See [Configuration & Index Reference](docs/configuration.md) for the full index format and staleness rules.
+Committed writes, removals, and pin changes maintain the index: unsafe or missing files are dropped, duplicate filenames keep the newest full timestamp and preserve pins, and stale flags heal when refreshed, pinned, or disabled. Repair remains additive-only. Reserved `MEMORY.md`, non-markdown names, control characters, directories, and symlink targets are refused. See [Configuration & Index Reference](docs/configuration.md).
 
 ## Consolidation
 
@@ -141,9 +132,9 @@ See [Configuration & Index Reference](docs/configuration.md) for the full `memor
 
 ## Cross-tool shared memory (`shared_dir`)
 
-Setting `"shared_dir": true` in `memory.jsonc` moves `MEMORY.md` and topic files to `~/.agents/memory/` — a location other memory-aware tools can also read and write, using the same on-disk format (e.g. [openpi-memory](https://github.com/linellazatin/openpi-memory), the pi.dev port of this project). `memory.jsonc` itself always stays local regardless of this setting. Writes are protected by a cross-process advisory lock and applied atomically.
+Setting `shared_dir: true` uses `~/.agents/memory/`, shared with compatible tools such as [openpi-memory](https://github.com/linellazatin/openpi-memory). Config remains local. Cooperating mutations lock the directory and atomically replace individual files; operations are not multi-file crash transactions.
 
-**This is a one-way migration, not a togglable setting** — see [Shared Storage Across Tools](docs/shared-directory.md) for the full mechanics, fresh-install and upgrade walkthroughs, and the [FAQ](docs/faq.md) for the biggest watch-out around toggling it off and back on.
+**Carry-over is one-way, not continuous synchronization.** Path changes are detected, but a completed migration does not re-run or reconcile inactive snapshots. See [shared storage](docs/shared-directory.md) and the [FAQ](docs/faq.md).
 
 The TUI memory browser (`ctrl+alt+m`) follows `shared_dir` too — both plugins resolve the active directory through the same shared internal module.
 
@@ -189,7 +180,7 @@ The TUI plugin adds an interactive, arrow-key-navigable memory browser — no LL
 }
 ```
 
-Restart opencode. On the first chat turn of the next session, `~/.config/opencode/memory/MEMORY.md` and `~/.config/opencode/memory.jsonc` will be created automatically, and both `## Global Memory` and `## Memory Rules` blocks will appear in the agent's context. No manual configuration required.
+Restart opencode to load the updated plugins and skill. `memory.jsonc` is created automatically; the empty memory index is injected immediately and written to disk on the first locked mutation. The server lifecycle has been verified on OpenCode 1.18.34 with a local fake model; TUI API contracts and mutation behavior are covered separately.
 
 Once installed:
 
@@ -201,16 +192,13 @@ The TUI plugin reads and writes `MEMORY.md` directly. Pin/unpin/remove are insta
 
 ### Update
 
-opencode resolves `@latest` once at first install and caches it permanently — it does not re-check npm on restart. To update to a newer version, delete the cached package and restart:
-
-```bash
-rm -rf ~/.cache/opencode/packages/@openlines/openclaude-memory
-rm -rf ~/.cache/opencode/packages/@openlines/openclaude-memory@latest
-```
-
-opencode may create one or both directories depending on how the specifier was resolved. Delete whichever exists, then restart — opencode will fetch the newest published version on next start.
+To select a release explicitly, use a published version specifier such as `@openlines/openclaude-memory@<version>` in both plugin arrays and restart OpenCode. Bare package names resolve through OpenCode's `latest` package manager path; cache refresh behavior belongs to the installed OpenCode release. Local-path installs load this checkout after restart.
 
 See [System Compatibility](docs/architecture.md#system-compatibility) for supported platforms and version requirements.
+
+## Verification
+
+Run `npm test` for smoke tests and two real concurrent OpenCode writers. Run `npm run test:host` with `opencode` installed for the isolated real-server check; it uses a local fake model and temporary memory storage. To check the sibling implementation, run `node tests/shared-store-test.mjs /absolute/path/to/openpi-memory/extensions/memory-core.mjs`. Syntax-check each `.opencode/plugins/*.mjs` and `tests/*.mjs` file with `node --check`.
 
 ## License
 

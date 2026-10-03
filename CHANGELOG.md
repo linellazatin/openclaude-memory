@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.7] - 2026-10-03
+
+### Fixed
+
+- Attach memory and rules to every fresh OpenCode model request, including later steps and other sessions. Detect config, index, directory, tombstone, and sentinel changes before cache reuse; do not consume cross-process notifications.
+- Queue automatic consolidation with `noReply: true`, preserve agent/model/variant, retain native continuation on API failure, and resume pending work in the fallback prompt.
+- Fail closed on local and shared contention; treat `EPERM` as alive, capture per-acquisition release tokens, and bound stale reclaim when deletion fails.
+- Validate safe regular topic files and no-follow reads, reserve the index filename, preserve unrelated removed-topic slug collisions, and enforce pinned TUI removal inside the lock.
+- Refuse FIFO reads without blocking; detect trusted config-symlink target edits before cache reuse.
+- Flush and clean atomic temporary writes, persist removal intent before dropping discoverability, roll back ordinary topic/index write failures, and preserve racing config creation and existing legacy backups.
+- Lock local-to-shared migration in consistent order, copy atomically, respect both removal lists, and retry failed migrations only marking success after completion.
+- Preserve JSONC literal commas, refresh topic metadata, compare full duplicate timestamps while retaining pins, heal stale flags, correct repair totals and malformed-field recovery, and surface TUI refusal/filesystem results.
+
+### Changed
+
+- `inject_every_n_turns` now controls forced disk refreshes in model requests; memory is always injected and system tokens are not inherently free.
+- Documentation records current host compatibility, co-tenant coordination, and per-file recovery boundaries.
+
+### Tests
+
+- 92 to 120 smoke tests, plus real-process OpenCode/OpenCode and OpenCode/pi writer checks.
+- `npm run test:host` verifies native tool execution, subsequent requests, another session, and automatic consolidation with a real OpenCode 1.18.34 server and local fake model.
+
 ## [0.6.6] - 2026-09-21 - Co-tenancy audit fixes.
 
 ### Fixed
