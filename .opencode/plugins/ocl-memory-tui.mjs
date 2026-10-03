@@ -3,7 +3,7 @@ import path from 'path';
 import {
   readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel, isSafeFilename,
   atomicWriteFileSync, withLock, LockContendedError, maybeCarryOverToSharedDir,
-  addToRemovedList, parseIndexLine,
+  addToRemovedList, parseIndexLine, isRegularFile, readStoreFileSync,
 } from './ocl-memory-shared.mjs';
 
 // Resolves which directory (local or shared, per memory.jsonc's shared_dir)
@@ -22,7 +22,7 @@ async function resolveActiveDir() {
 function parseIndex(memIndex) {
   if (!fs.existsSync(memIndex)) return [];
   const entries = [];
-  for (const line of fs.readFileSync(memIndex, 'utf8').split('\n')) {
+  for (const line of readStoreFileSync(memIndex, 50 * 1024).split('\n')) {
     const m = line.match(/^- \[([^\]]+)\]\(([^)]+)\)(.*)/);
     if (!m) continue;
     if (!isSafeFilename(m[2])) continue;
@@ -52,7 +52,7 @@ async function setPin(memDir, memIndex, filename, pin, sharedDir) {
   if (!fs.existsSync(memIndex)) return 'No memory index found.';
   try {
     return await withLock(memDir, async () => {
-      const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
+      const lines = readStoreFileSync(memIndex).split('\n');
       const updated = lines.map(line => {
         const parsed = parseIndexLine(line);
         if (!parsed || parsed.filename !== filename) return line;
@@ -76,12 +76,15 @@ async function removeEntry(memDir, memIndex, filename, sharedDir) {
   if (!fs.existsSync(memIndex)) return 'No memory index found.';
   try {
     return await withLock(memDir, async () => {
-      const lines = fs.readFileSync(memIndex, 'utf8').split('\n');
+      const lines = readStoreFileSync(memIndex).split('\n');
+      const matches = lines.map(parseIndexLine).filter(p => p && p.filename === filename);
+      if (!matches.length) return 'Entry no longer exists.';
+      if (matches.some(p => p.rest.split(' -- ')[0].includes('[pin]'))) return 'Entry is pinned; unpin it before removal.';
+      addToRemovedList(memDir, filename); // persist removal intent before dropping discoverability
       atomicWriteFileSync(memIndex, lines.filter(l => {
         const parsed = parseIndexLine(l);
         return !(parsed && parsed.filename === filename);
       }).join('\n'));
-      addToRemovedList(memDir, filename); // tombstone so server repair_memory won't resurrect it
       try { fs.writeFileSync(getDirtySentinel(memDir), '', 'utf8'); } catch {}
     }, { strict: sharedDir });
   } catch (e) {
@@ -94,8 +97,10 @@ async function removeEntry(memDir, memIndex, filename, sharedDir) {
 function readTopic(memDir, filename) {
   if (!isSafeFilename(filename)) return '(unsafe filename refused)';
   const p = path.join(memDir, filename);
-  if (!fs.existsSync(p)) return '(topic file not found on disk)';
-  let body = fs.readFileSync(p, 'utf8');
+  if (!isRegularFile(p)) return '(topic file missing or unsafe)';
+  let body;
+  try { body = readStoreFileSync(p, 64 * 1024); }
+  catch { return '(topic file could not be read safely)'; }
 
   // Strip YAML frontmatter (--- ... ---)
   if (body.startsWith('---')) {
@@ -139,11 +144,11 @@ const tui = async (api) => {
         entry.pinned
           ? { title: 'Unpin',  value: 'unpin',  description: 'Remove [pin] flag from index' }
           : { title: 'Pin',    value: 'pin',    description: 'Add [pin] flag to index'     },
-        {
+        ...(!entry.pinned ? [{
           title:       'Remove from index',
           value:       'remove',
           description: 'Removes index entry; topic file preserved on disk',
-        },
+        }] : []),
         {
           title:       'Back',
           value:       'back',

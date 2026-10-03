@@ -148,12 +148,13 @@ export function getRemovedListPath(memDir) {
 export function readRemovedList(memDir) {
   try {
     return new Set(
-      fs.readFileSync(getRemovedListPath(memDir), 'utf8')
+      readStoreFileSync(getRemovedListPath(memDir))
         .split('\n')
         .map(s => s.trim())
         .filter(s => s && isSafeFilename(s))
     );
-  } catch {
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
     return new Set();
   }
 }
@@ -183,9 +184,41 @@ export function ensureMemoryDir(dir = MEMORY_DIR) {
 // Writes via temp file + rename so a crash or concurrent read never observes
 // a partially-written file. Same directory as the target to keep rename atomic.
 export function atomicWriteFileSync(filePath, data) {
+  assertWritableFile(filePath);
   const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  fs.writeFileSync(tmp, data, 'utf8');
-  fs.renameSync(tmp, filePath);
+  try {
+    const fd = fs.openSync(tmp, 'wx', 0o600);
+    try { fs.writeFileSync(fd, data, 'utf8'); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    assertWritableFile(filePath);
+    fs.renameSync(tmp, filePath);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  }
+}
+
+function assertWritableFile(filePath) {
+  try {
+    if (!fs.lstatSync(filePath).isFile()) throw new Error(`Unsafe non-regular file: ${filePath}`);
+  } catch (err) { if (err.code !== 'ENOENT') throw err; }
+}
+
+export function isRegularFile(filePath) {
+  try { return fs.lstatSync(filePath).isFile(); }
+  catch (err) { if (err.code === 'ENOENT') return false; throw err; }
+}
+
+// Open without following symlinks, then verify the opened object, not a stale path check.
+export function readStoreFileSync(filePath, maxBytes = Infinity) {
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`Unsafe non-regular file: ${filePath}`);
+    if (!Number.isFinite(maxBytes)) return fs.readFileSync(fd, 'utf8');
+    const buffer = Buffer.alloc(Math.min(stat.size, maxBytes));
+    const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    return buffer.toString('utf8', 0, bytes);
+  } finally { fs.closeSync(fd); }
 }
 
 export function sleep(ms) {
@@ -356,6 +389,9 @@ export const stripJsonc = raw => {
 export function isSafeFilename(filename) {
   return typeof filename === 'string'
     && filename.length > 0
+    && filename.endsWith('.md')
+    && filename.toLowerCase() !== 'memory.md'
+    && !/[\x00-\x1f\x7f]/.test(filename)
     && !filename.startsWith('.')
     && !filename.includes('/')
     && !filename.includes('\\')

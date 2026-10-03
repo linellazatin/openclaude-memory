@@ -4,7 +4,7 @@ import {
   MEMORY_DIR, MEMORY_CONFIG, INITIAL_MEMORY, parseIndexLine,
   stripJsonc, readMemoryRules, parseRules, getMemoryDir, getMemoryIndex, getDirtySentinel,
   ensureMemoryDir, atomicWriteFileSync, sleep, withLock, acquireLock, releaseLock, LockContendedError,
-  maybeCarryOverToSharedDir, isSafeFilename,
+  maybeCarryOverToSharedDir, isSafeFilename, isRegularFile, readStoreFileSync,
   readRemovedList, addToRemovedList, removeFromRemovedList,
 } from './ocl-memory-shared.mjs';
 
@@ -101,7 +101,7 @@ function readMemoryIndex(maxLines, memDir) {
     if (!fs.existsSync(indexPath)) {
       return INITIAL_MEMORY; // do not create on a read path; tools create it under lock
     }
-    const raw = fs.readFileSync(indexPath, 'utf8');
+    const raw = readStoreFileSync(indexPath, MAX_BYTES + 1);
     const lines = raw.split('\n');
     const lineLimitExceeded = lines.length > maxLines;
     const limitedLines = lines.slice(0, maxLines);
@@ -162,7 +162,7 @@ function maintainIndex(lines, config, memDir = MEMORY_DIR) {
     if (!parsed) continue;
     const { filename } = parsed;
     if (!isSafeFilename(filename)) continue; // corrupted/unsafe entry — drop like an orphan
-    if (!fs.existsSync(path.join(memDir, filename))) continue;
+    if (!isRegularFile(path.join(memDir, filename))) continue;
     const date = (parsed.rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '';
     const prev = best.get(filename);
     const prevDate = prev ? ((parseIndexLine(prev).rest.match(/(\d{4}-\d{2}-\d{2})/) || [])[1] || '') : '';
@@ -284,10 +284,14 @@ function upsertIndexLine(lines, filename, name, summary, pin) {
 function readFrontmatter(filePath) {
   const fallbackName = path.basename(filePath).replace(/\.md$/, '');
   try {
-    const text = fs.readFileSync(filePath, 'utf8');
-    const m = text.match(/^---\n([\s\S]*?)\n---\n/);
+    const text = readStoreFileSync(filePath, MAX_BYTES);
+    const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
     const block = m ? m[1] : '';
-    const unquote = v => v.trim().replace(/^["']|["']$/g, '');
+    const unquote = v => {
+      const value = v.trim();
+      if (value.startsWith('"')) { try { return JSON.parse(value); } catch {} }
+      return value.replace(/^['"]|['"]$/g, '');
+    };
     const grab = key => {
       const km = block.match(new RegExp(`^${key}:\\s*(.*)$`, 'm'));
       return km ? unquote(km[1]) : '';
@@ -316,12 +320,12 @@ function countMemoryFiles(memDir, memIndex) {
   try {
     const removed = readRemovedList(memDir);
     fileCount = fs.readdirSync(memDir)
-      .filter(f => f.endsWith('.md') && f !== 'MEMORY.md' && isSafeFilename(f) && !removed.has(f)).length;
+      .filter(f => isSafeFilename(f) && !removed.has(f) && isRegularFile(path.join(memDir, f))).length;
   } catch {}
   let indexedCount = 0;
   try {
     indexedCount = new Set(
-      fs.readFileSync(memIndex, 'utf8').split('\n').map(parseIndexLine).filter(Boolean).map(e => e.filename)
+      readStoreFileSync(memIndex).split('\n').map(parseIndexLine).filter(e => e && isSafeFilename(e.filename)).map(e => e.filename)
     ).size;
   } catch {}
   return { fileCount, indexedCount };
@@ -334,7 +338,7 @@ function countMemoryFiles(memDir, memIndex) {
 // frontmatter timestamp. Safe to call repeatedly (idempotent). Returns
 // { added, alreadyIndexed }.
 function repairMemoryIndex({ memDir, memIndex }) {
-  const index = fs.existsSync(memIndex) ? fs.readFileSync(memIndex, 'utf8') : INITIAL_MEMORY;
+  const index = fs.existsSync(memIndex) ? readStoreFileSync(memIndex) : INITIAL_MEMORY;
   const indexed = new Set(index.split('\n').map(parseIndexLine).filter(Boolean).map(e => e.filename));
   const removed = readRemovedList(memDir); // intentionally-removed topics — never resurrect
   const added = [];
@@ -343,6 +347,7 @@ function repairMemoryIndex({ memDir, memIndex }) {
   for (const file of files) {
     if (!file.endsWith('.md') || file === 'MEMORY.md') continue;
     if (!isSafeFilename(file)) continue;      // never re-introduce an unsafe/traversal name
+    if (!isRegularFile(path.join(memDir, file))) continue;
     if (indexed.has(file)) continue;           // already present — additive only
     if (removed.has(file)) continue;           // deliberately removed via remove_memory — skip
     const fm = readFrontmatter(path.join(memDir, file));
@@ -409,7 +414,7 @@ const tools = {
         return await withLock(memDir, async () => {
           // Read index once — reuse for topic-name lookup and upsert
           const rawIndex = fs.existsSync(memIndex)
-            ? fs.readFileSync(memIndex, 'utf8')
+            ? readStoreFileSync(memIndex)
             : INITIAL_MEMORY;
 
           // Check if an existing index entry matches this topic name — use its filename if so
@@ -445,7 +450,10 @@ const tools = {
             // bumped like an unrelated slug collision. removeFromRemovedList()
             // below clears the tombstone. Only genuinely-unrelated existing files
             // force a numeric suffix.
-            while (fs.existsSync(path.join(memDir, filename)) && !removedSet.has(filename)) {
+            while (fs.existsSync(path.join(memDir, filename))) {
+              const candidate = path.join(memDir, filename);
+              if (removedSet.has(filename) && isRegularFile(candidate)
+                && readFrontmatter(candidate).name.toLowerCase() === cleanTopic.toLowerCase()) break;
               filename = `${base}-${n}.md`;
               n++;
             }
@@ -460,7 +468,7 @@ const tools = {
             atomicWriteFileSync(topicPath, frontmatter + content + '\n');
           } else if (mode === 'replace') {
             const now = nowIso();
-            const existing = fs.readFileSync(topicPath, 'utf8');
+            const existing = readStoreFileSync(topicPath);
             const fmMatch = existing.match(/^(---\n[\s\S]*?\n---\n)/);
             let fm = fmMatch ? fmMatch[1] : '';
             if (fm.includes('last_updated:')) {
@@ -471,7 +479,7 @@ const tools = {
             atomicWriteFileSync(topicPath, fm + '\n' + content + '\n');
           } else {
             const now = nowIso();
-            const existing = fs.readFileSync(topicPath, 'utf8');
+            const existing = readStoreFileSync(topicPath);
             const fmMatch = existing.match(/^(---\n[\s\S]*?\n---\n)/);
             let updated = existing;
             if (fmMatch) {
@@ -525,7 +533,7 @@ const tools = {
 
       try {
         return await withLock(memDir, async () => {
-          const raw = fs.readFileSync(memIndex, 'utf8');
+          const raw = readStoreFileSync(memIndex);
           const lines = raw.split('\n');
 
           const found = findIndexEntry(lines, search);
@@ -550,8 +558,8 @@ const tools = {
 
           const maintained = maintainIndex(lines, config, memDir);
 
-          atomicWriteFileSync(memIndex, maintained.join('\n'));
           addToRemovedList(memDir, parsed.filename); // tombstone: repair must not resurrect this
+          atomicWriteFileSync(memIndex, maintained.join('\n'));
           invalidateCache();
 
           const topicFile = path.join(memDir, parsed.filename);
@@ -590,7 +598,7 @@ const tools = {
 
       try {
         return await withLock(memDir, async () => {
-          const raw = fs.readFileSync(memIndex, 'utf8');
+          const raw = readStoreFileSync(memIndex);
           const lines = raw.split('\n');
 
           const found = findIndexEntry(lines, search);
@@ -602,6 +610,7 @@ const tools = {
           }
           const { idx: foundIdx, parsed } = found;
 
+          if (!isSafeFilename(parsed.filename)) return 'Entry has an unsafe filename and was not modified.';
           const line = lines[foundIdx];
           const alreadyPinned = parsed.rest.includes('[pin]');
 

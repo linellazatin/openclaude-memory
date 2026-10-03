@@ -631,7 +631,8 @@ console.log('\n--- 14. cap bump ---');
 
 await test('max_lines clamps to 1000 maximum (live truncation)', async () => {
   writeRules('{ "max_lines": 5000 }');
-  const entries = Array.from({ length: 1005 }, (_, i) => `- [MX Mock ${i}](mock-mx-${i}.md) 2026-01-01T00:00:00+00:00 -- mock ${i}`);
+  const entries = Array.from({ length: 1005 }, (_, i) => `- [MX ${i}](mx-${i}.md)`);
+  assert.ok(Buffer.byteLength(entries.join('\n')) < 50 * 1024, 'isolate the line cap from the byte cap');
   fs.writeFileSync(path.join(MEMORY_DIR, 'MEMORY.md'), ['# Memory Index', ...entries].join('\n') + '\n', 'utf8');
   try {
     await plugin['tool.execute.after']({ tool: 'write_memory' }, {});
@@ -1164,6 +1165,7 @@ await test('TUI removeEntry: removes from the shared MEMORY.md, topic file prese
   const before = tui.parseIndex(memIndex);
   const target = before[0];
 
+  await tui.setPin(memDir, memIndex, target.filename, false);
   await tui.removeEntry(memDir, memIndex, target.filename);
 
   const after = tui.parseIndex(memIndex);
@@ -1738,6 +1740,7 @@ await test('TUI setPin/removeEntry only act on the parsed entry line, not on sum
     const mentioner = afterPin.find(l => l.includes('(mentioner.md)'));
     assert.ok(!/\[pin\]/.test(mentioner), 'a line that only MENTIONS the link in its summary must not be pinned');
     assert.ok(/\[pin\]/.test(afterPin.find(l => l.startsWith('- [Real Topic]'))), 'the real entry got its pin');
+    await tui.setPin(MEMORY_DIR, idxPath, 'real-topic.md', false, false);
     await tui.removeEntry(MEMORY_DIR, idxPath, 'real-topic.md', false);
     const afterRm = fs.readFileSync(idxPath, 'utf8');
     assert.ok(afterRm.includes('(mentioner.md)'), 'the mentioning line must survive removal of the real entry');
@@ -1747,6 +1750,89 @@ await test('TUI setPin/removeEntry only act on the parsed entry line, not on sum
     shared.removeFromRemovedList(MEMORY_DIR, 'real-topic.md'); // removeEntry tombstoned it
     try { fs.unlinkSync(shared.getDirtySentinel(MEMORY_DIR)); } catch {}
   }
+});
+
+// ═══════════════════════════════════════════════════════════
+// 0.6.7 storage regressions
+// ═══════════════════════════════════════════════════════════
+
+await test('tombstoned slug collisions preserve the original topic', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'XY+Audit', content: 'original', summary: 'original' });
+  await plugin.tool.remove_memory.execute({ topic: 'XY+Audit' });
+  const original = fs.readFileSync(path.join(MEMORY_DIR, 'xyaudit.md'), 'utf8');
+  await plugin.tool.write_memory.execute({ topic: 'XYAudit', content: 'unrelated', summary: 'unrelated' });
+  assert.equal(fs.readFileSync(path.join(MEMORY_DIR, 'xyaudit.md'), 'utf8'), original);
+  assert.ok(fs.readFileSync(path.join(MEMORY_DIR, 'xyaudit-2.md'), 'utf8').includes('unrelated'));
+  assert.ok(shared.readRemovedList(MEMORY_DIR).has('xyaudit.md'));
+});
+
+await test('TUI removal refuses freshly pinned entries', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Pinned Audit', content: 'keep', summary: 'keep', pin: true });
+  const before = readIndex();
+  const result = await tui.removeEntry(MEMORY_DIR, path.join(MEMORY_DIR, 'MEMORY.md'), 'pinned-audit.md', false);
+  assert.match(result, /pinned/i);
+  assert.equal(readIndex(), before);
+  assert.ok(!shared.readRemovedList(MEMORY_DIR).has('pinned-audit.md'));
+});
+
+await test('topic filenames exclude the index, non-markdown and control characters', () => {
+  for (const filename of ['MEMORY.md', 'memory.md', 'config.json', 'bad\nfile.md', 'bad\0file.md']) {
+    assert.equal(shared.isSafeFilename(filename), false, filename);
+  }
+});
+
+await test('write refuses reserved topics without changing the index', async () => {
+  const before = readIndex();
+  const result = await plugin.tool.write_memory.execute({ topic: 'Memory', content: 'bad', summary: 'bad' });
+  assert.match(result, /Error|reserved|unsafe/i);
+  assert.equal(readIndex(), before);
+});
+
+await test('symlink topics are not read, repaired or overwritten', async () => {
+  const outside = path.join(TMP, 'outside.md');
+  const link = path.join(MEMORY_DIR, 'symlink-audit.md');
+  const idxPath = path.join(MEMORY_DIR, 'MEMORY.md');
+  const before = readIndex();
+  fs.writeFileSync(outside, 'PRIVATE_OUTSIDE_MARKER');
+  fs.symlinkSync(outside, link);
+  try {
+    assert.ok(!tui.readTopic(MEMORY_DIR, 'symlink-audit.md').includes('PRIVATE_OUTSIDE_MARKER'));
+    plugin.__test__.repairMemoryIndex({ memDir: MEMORY_DIR, memIndex: idxPath });
+    assert.ok(!readIndex().includes('(symlink-audit.md)'));
+    fs.writeFileSync(idxPath, before + '\n- [Symlink Audit](symlink-audit.md) 2026-10-01 -- unsafe\n');
+    await assert.rejects(plugin.tool.write_memory.execute({ topic: 'Symlink Audit', content: 'bad', summary: 'bad' }), /unsafe|regular|symlink|ELOOP/i);
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'PRIVATE_OUTSIDE_MARKER');
+    assert.ok(fs.lstatSync(link).isSymbolicLink());
+  } finally {
+    fs.unlinkSync(link);
+    fs.unlinkSync(outside);
+    fs.writeFileSync(idxPath, before);
+  }
+});
+
+await test('atomic write failure preserves the target and removes its temporary file', () => {
+  const target = path.join(MEMORY_DIR, 'atomic-failure.md');
+  fs.writeFileSync(target, 'original');
+  const rename = fs.renameSync;
+  fs.renameSync = () => { throw new Error('injected rename failure'); };
+  try { assert.throws(() => shared.atomicWriteFileSync(target, 'replacement'), /rename failure/); }
+  finally { fs.renameSync = rename; }
+  assert.equal(fs.readFileSync(target, 'utf8'), 'original');
+  assert.ok(!fs.readdirSync(MEMORY_DIR).some(f => f.startsWith('atomic-failure.md.tmp-')));
+  fs.unlinkSync(target);
+});
+
+await test('failed tombstone write leaves the index entry discoverable', async () => {
+  await plugin.tool.write_memory.execute({ topic: 'Removal Failure Audit', content: 'keep', summary: 'keep' });
+  const before = readIndex();
+  const rename = fs.renameSync;
+  fs.renameSync = (from, to) => {
+    if (to.endsWith('.ocl-removed')) throw new Error('injected tombstone failure');
+    return rename(from, to);
+  };
+  try { await assert.rejects(plugin.tool.remove_memory.execute({ topic: 'Removal Failure Audit' }), /tombstone failure/); }
+  finally { fs.renameSync = rename; }
+  assert.equal(readIndex(), before);
 });
 
 // ═══════════════════════════════════════════════════════════
