@@ -46,15 +46,6 @@ After consolidating, continue with any pending work described in the summary's "
 // Upgrade path: per-session Map keyed by session ID if multi-session needed.
 let _cache = null;
 
-// Injection state — controls whether system.transform injects memory this turn.
-// _injectedOnce: false until first injection; reset to false after compaction.
-// _dirty: set to true by tool.execute.after when a memory tool mutates MEMORY.md;
-//         cleared after system.transform injects the updated content.
-// _turnCount: incremented each turn; used to enforce the inject_every_n_turns interval.
-let _injectedOnce = false;
-let _dirty = false;
-let _turnCount = 0;
-
 async function getCache(forceRefresh = false) {
   // If TUI mutated MEMORY.md directly, it writes a sentinel file to signal us.
   // The sentinel lives alongside whichever dir was active last time we
@@ -62,7 +53,6 @@ async function getCache(forceRefresh = false) {
   if (_cache && !forceRefresh && fs.existsSync(getDirtySentinel(_cache.memDir))) {
     try { fs.unlinkSync(getDirtySentinel(_cache.memDir)); } catch {}
     _cache = null;
-    _dirty = true;
   }
   if (!_cache || forceRefresh) {
     const rules = readMemoryRules();
@@ -773,43 +763,26 @@ Any text including single words is treated literally as content to store. Do not
     // asserted directly without going through the full hook surface.
     __test__: { repairMemoryIndex, readFrontmatter, countMemoryFiles },
 
-    // Set _dirty when a memory tool mutates MEMORY.md so system.transform
-    // knows to re-inject the updated index on the next turn.
+    // Refresh the cache after memory tools, including mutations by other plugins.
     'tool.execute.after': async (input, _output) => {
       if (MEMORY_TOOL_NAMES.has(input.tool)) {
-        _dirty = true;
+        invalidateCache();
       }
     },
 
-    // Inject memory into system prompt on:
-    //   1. First turn of the session (_injectedOnce === false)
-    //   2. Any turn following a memory tool mutation (_dirty === true)
-    //   3. Every N turns per inject_every_n_turns config (default: 5)
-    // All other turns skip injection, saving tokens while keeping memory salient.
+    // OpenCode constructs a fresh system prompt for EVERY model request.
+    // Cache disk reads, never the presence of memory in the outgoing request.
     'experimental.chat.system.transform': async (_input, output) => {
-      _turnCount++;
       const { renderedRules, content, config, memDir, drift } = await getCache();
-      const shouldInject = !_injectedOnce || _dirty || (_turnCount % config.injectEveryNTurns === 0);
-
-      if (shouldInject) {
-        if (content) {
-          output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
-          // Passive, non-mutating drift signal: many topic files exist but are
-          // absent from the index (a co-tenant likely rewrote MEMORY.md).
-          // Point at /memory repair instead of silently auto-mutating the
-          // shared index at turn time.
-          if (config.sharedDir && drift && drift.fileCount > drift.indexedCount + DRIFT_NOTE_THRESHOLD) {
-            const missing = drift.fileCount - drift.indexedCount;
-            output.system.push(`<!-- MEMORY MAINTENANCE: ~${missing} topic file(s) exist in the memory dir but are not in the index (possibly a co-tenant rewrote MEMORY.md). Run "/memory repair" to re-index them. -->`);
-          }
+      if (content) {
+        output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
+        if (config.sharedDir && drift && drift.fileCount > drift.indexedCount + DRIFT_NOTE_THRESHOLD) {
+          const missing = drift.fileCount - drift.indexedCount;
+          output.system.push(`<!-- MEMORY MAINTENANCE: ~${missing} topic file(s) exist in the memory dir but are not in the index (possibly a co-tenant rewrote MEMORY.md). Run "/memory repair" to re-index them. -->`);
         }
-
-        if (renderedRules) {
-          output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
-        }
-
-        _injectedOnce = true;
-        _dirty = false;
+      }
+      if (renderedRules) {
+        output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
       }
     },
 
@@ -825,11 +798,6 @@ Any text including single words is treated literally as content to store. Do not
         output.context.push(`## Memory Rules\n\n${renderedRules}`);
       }
 
-      // Reset so the first turn after compaction re-injects memory into the
-      // system prompt — the agent's context window was just replaced.
-      _injectedOnce = false;
-      _dirty = false;
-      _turnCount = 0;
     },
 
     // After automatic compaction, opencode sends a synthetic "continue"
@@ -847,16 +815,23 @@ Any text including single words is treated literally as content to store. Do not
     'experimental.compaction.autocontinue': async (hookInput, output) => {
       const { config } = await getCache();
       if (!config.consolidateOnCompact || !client) return;
-      output.enabled = false;
       try {
         const summary = await fetchLatestCompactionSummary(hookInput.sessionID);
         const text = summary
           ? buildCompactConsolidationPrompt(summary)
           : CONSOLIDATION_PROMPT;
-        await client.session.prompt({
+        const result = await client.session.prompt({
           path: { id: hookInput.sessionID },
-          body: { parts: [{ type: 'text', text }] },
+          body: {
+            noReply: true,
+            agent: hookInput.agent,
+            model: hookInput.model && { providerID: hookInput.model.providerID, modelID: hookInput.model.id },
+            variant: hookInput.message?.model?.variant,
+            parts: [{ type: 'text', text }],
+          },
         });
+        if (result?.error) return;
+        output.enabled = false;
       } catch {
         // best-effort — fall back to the native continue if the prompt call fails
         output.enabled = true;

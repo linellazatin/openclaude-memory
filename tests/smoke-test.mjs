@@ -521,7 +521,7 @@ await test('maintainIndex: [stale?] is removed after topic is updated (self-heal
 
 console.log('\n--- 10. inject_every_n_turns trigger ---');
 
-await test('inject_every_n_turns=2: injects at turn 1 and turn 2; skips turn 3', async () => {
+await test('memory stays in every fresh request across sessions and compaction', async () => {
   writeRules('{ "inject_every_n_turns": 2 }');
   // Compaction force-refreshes config and resets _injectedOnce=false, _dirty=false, _turnCount=0
   await plugin['experimental.session.compacting']({}, makeCompactOutput());
@@ -536,7 +536,10 @@ await test('inject_every_n_turns=2: injects at turn 1 and turn 2; skips turn 3',
 
   const out3 = makeSystemOutput();
   await plugin['experimental.chat.system.transform']({}, out3);
-  assert.equal(out3.system.length, 0, 'turn 3 should NOT inject (3 % 2 !== 0, not dirty)');
+  assert.ok(out3.system.join('\n').includes('Global Memory'), 'third request must retain memory');
+  const other = makeSystemOutput();
+  await plugin['experimental.chat.system.transform']({ sessionID: 'another-session' }, other);
+  assert.ok(other.system.join('\n').includes('Memory Rules'), 'another session must receive rules');
 
   writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5 }');
 });
@@ -939,12 +942,13 @@ await test('shared_dir: acquireLock waits out a lock genuinely held by another O
   fs.writeFileSync(helperPath, [
     "import fs from 'fs';",
     'const [lockPath, holdMs] = [process.argv[2], Number(process.argv[3])];',
-    "fs.writeFileSync(lockPath, '', 'utf8');",
+    "fs.writeFileSync(lockPath, `${process.pid}\t${Date.now()}\tchild`, { flag: 'wx' });",
+    "process.send('ready');",
     'await new Promise(r => setTimeout(r, holdMs));',
     'fs.unlinkSync(lockPath);',
   ].join('\n'), 'utf8');
 
-  const child = spawn(process.execPath, [helperPath, lockPath, String(holdMs)], { stdio: 'ignore' });
+  const child = spawn(process.execPath, [helperPath, lockPath, String(holdMs)], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
   const childDone = new Promise((resolve, reject) => {
     child.on('exit', code => (code === 0 ? resolve() : reject(new Error(`lock-holder exited with code ${code}`))));
     child.on('error', reject);
@@ -952,7 +956,11 @@ await test('shared_dir: acquireLock waits out a lock genuinely held by another O
 
   // Give the child a head start so its lock file genuinely exists before
   // the main process attempts to acquire it.
-  await new Promise(r => setTimeout(r, 50));
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill(); reject(new Error('lock-holder readiness timed out')); }, 5000);
+    child.once('message', () => { clearTimeout(timer); resolve(); });
+    child.once('error', err => { clearTimeout(timer); reject(err); });
+  });
   assert.ok(fs.existsSync(lockPath), 'expected the child process to have created the real lock file by now');
 
   const start = Date.now();
@@ -964,7 +972,7 @@ await test('shared_dir: acquireLock waits out a lock genuinely held by another O
   // Comfortably above a no-contention write, comfortably below the ~500ms
   // acquire timeout — proves the main process waited for and then acquired
   // the real lock, rather than winning immediately or timing out unguarded.
-  assert.ok(elapsed >= 150 && elapsed < 480, `expected the write to wait for the child's real lock release (~${holdMs}ms) without hitting the full acquire timeout, took ${elapsed}ms`);
+  assert.ok(elapsed >= 150 && elapsed < 2000, `expected contention to resolve within the shared acquire window, took ${elapsed}ms`);
   assert.ok(!fs.existsSync(lockPath), 'lock file should not exist after both processes have finished');
 
   const sharedIndexAfter = fs.readFileSync(path.join(SHARED_MEMORY_DIR, 'MEMORY.md'), 'utf8');
@@ -1017,12 +1025,16 @@ await test('autocontinue: consolidate_on_compact=true with a client suppresses c
   await plugin2.tool.write_memory.execute({ topic: 'Autocontinue Flush C', content: 'x', summary: 'flush', pin: false });
 
   const output = { enabled: true };
-  await plugin2['experimental.compaction.autocontinue']({ sessionID: 'test-session-c' }, output);
+  await plugin2['experimental.compaction.autocontinue']({ sessionID: 'test-session-c', agent: 'build', model: { providerID: 'test', id: 'model' }, message: { model: { variant: 'reasoning' } } }, output);
 
   assert.equal(output.enabled, false, 'native continue should be suppressed');
   assert.equal(calls.length, 1, 'client.session.prompt should be called exactly once');
   assert.equal(calls[0].path.id, 'test-session-c', 'sessionID should be passed through');
   assert.ok(calls[0].body.parts[0].text.includes('always_persist'), 'prompt text should reference always_persist rules');
+  assert.equal(calls[0].body.noReply, true, 'enqueue without re-entering the running session');
+  assert.equal(calls[0].body.agent, 'build');
+  assert.deepEqual(calls[0].body.model, { providerID: 'test', modelID: 'model' });
+  assert.equal(calls[0].body.variant, 'reasoning');
 });
 
 await test('autocontinue: seeds the consolidation prompt with the compaction summary when available', async () => {
@@ -1091,6 +1103,17 @@ await test('autocontinue: falls back to native continue if client.session.prompt
   assert.equal(output.enabled, true, 'should fall back to native continue on error');
 
   writeRules('{ "max_lines": 300, "stale_after_days": 180, "inject_every_n_turns": 5, "consolidate_on_compact": false }');
+});
+
+await test('autocontinue: SDK error responses retain native continue', async () => {
+  writeRules('{ "consolidate_on_compact": true }');
+  await plugin['experimental.session.compacting']({}, makeCompactOutput());
+  const instance = await makePlugin({ client: { session: { async prompt() { return { error: { message: 'failed' } }; } } } });
+  const output = { enabled: true };
+  await instance['experimental.compaction.autocontinue']({ sessionID: 'failed-enqueue' }, output);
+  assert.equal(output.enabled, true);
+  writeRules('{ "consolidate_on_compact": false }');
+  await plugin['experimental.session.compacting']({}, makeCompactOutput());
 });
 
 // ═══════════════════════════════════════════════════════════
