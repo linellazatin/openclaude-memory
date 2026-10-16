@@ -40,7 +40,7 @@ process.on('exit', () => {
 });
 
 // --- Import plugin (after env vars are set) ---
-const { default: pluginFactory } = await import('../.opencode/plugins/ocl-memory.mjs');
+const { default: pluginFactory, __core } = await import('../.opencode/plugins/ocl-memory.mjs');
 const tui = await import('../.opencode/plugins/ocl-memory-tui.mjs');
 const shared = await import('../.opencode/plugins/ocl-memory-shared.mjs');
 
@@ -2154,6 +2154,16 @@ await test('config target edits through a symlink refresh the active store', asy
     await plugin['experimental.chat.system.transform']({}, next);
     assert.ok(next.system.join('\n').includes(`Memory dir: ${SHARED_MEMORY_DIR}`));
   } finally { fs.unlinkSync(MEMORY_CONFIG); fs.writeFileSync(MEMORY_CONFIG, before); fs.rmSync(target, { force: true }); }
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('toObjectSchema builds a V2 object schema from a flat args map', () => {
+  assert.ok(__core && __core.toObjectSchema, '__core.toObjectSchema must be exported');
+  const s = __core.toObjectSchema({ a: { type: 'string' }, b: { type: 'boolean', default: false } });
+  assert.deepEqual(Object.keys(s.properties), ['a', 'b']);
+  assert.deepEqual(s.required, ['a']);
+  assert.equal(s.additionalProperties, false);
+  assert.equal(s.properties.a.default, undefined);
 });
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);

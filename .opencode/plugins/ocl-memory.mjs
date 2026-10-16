@@ -695,6 +695,25 @@ const tools = Object.fromEntries(
   TOOL_SPECS.map(({ name, description, args }) => [name, { description, args, execute: toolExecutors[name] }])
 );
 
+// Build a V2 JSON Schema object from a V1 flat args map. `required` lists every
+// key without a `default`; each property is the flat entry minus its `default`.
+// This is the inverse companion to the flat map — V1 needs the flat map, V2
+// needs the object schema, and mixing them up would make every arg `undefined`
+// (the 0.5.1 outage).
+function toObjectSchema(flatArgs) {
+  const properties = {};
+  const required = [];
+  for (const [key, entry] of Object.entries(flatArgs)) {
+    const { default: _default, ...rest } = entry;
+    properties[key] = rest;
+    if (!('default' in entry)) required.push(key);
+  }
+  return { type: 'object', properties, required, additionalProperties: false };
+}
+
+// Test/adaptation seam. `setupV2` is added in Task 9; `toObjectSchema` here.
+export const __core = { toObjectSchema };
+
 // --- Plugin export ---
 
 export default async (input) => {
