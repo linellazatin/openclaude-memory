@@ -84,6 +84,26 @@ function invalidateCache() {
   _cache = null;
 }
 
+// Pure rendering of the injected markdown from a resolved cache: the memory
+// block (with the shared-dir drift note), then the rules block. Returns string
+// parts in insertion order. Shared by the V1 system transform (pushes strings)
+// and the V2 context hook (wraps each in a SystemPart object).
+function buildInjectionParts(cache) {
+  const parts = [];
+  const { renderedRules, content, config, memDir, drift } = cache;
+  if (content) {
+    parts.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
+    if (config.sharedDir && drift && drift.fileCount > drift.indexedCount + DRIFT_NOTE_THRESHOLD) {
+      const missing = drift.fileCount - drift.indexedCount;
+      parts.push(`<!-- MEMORY MAINTENANCE: ~${missing} topic file(s) exist in the memory dir but are not in the index (possibly a co-tenant rewrote MEMORY.md). Run "/memory repair" to re-index them. -->`);
+    }
+  }
+  if (renderedRules) {
+    parts.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
+  }
+  return parts;
+}
+
 // Transforms memory.jsonc content into markdown for agent injection.
 // Renders only the behavioral array keys (always_persist, never_persist, always_ask)
 // as markdown bullet lists. Scalar config keys are plugin internals — not injected.
@@ -730,10 +750,27 @@ async function registerV2Tools(ctx) {
   });
 }
 
+// V2 injection + cache-invalidation hooks. The context hook mirrors the V1
+// system transform exactly, but wraps each rendered part in a SystemPart
+// object (`{ type: 'text', text }`) instead of pushing a bare string. The
+// execute.after hook invalidates the cache after any memory tool (including a
+// mutation by another plugin).
+async function registerV2Injection(ctx) {
+  await ctx.session.hook('context', async (e) => {
+    let cache = await getCache();
+    if (++_requestCount % cache.config.injectEveryNTurns === 0) cache = await getCache(true);
+    for (const part of buildInjectionParts(cache)) e.system.push({ type: 'text', text: part });
+  });
+  await ctx.tool.hook('execute.after', (e) => {
+    if (MEMORY_TOOL_NAMES.has(e.tool)) invalidateCache();
+  });
+}
+
 // Test/adaptation seam. `setupV2` is the V2 adapter body (Tasks 6-9); tests
 // drive it with a fake context. `toObjectSchema` is the V2 schema builder.
 const setupV2 = async (ctx) => {
   await registerV2Tools(ctx);
+  await registerV2Injection(ctx);
 };
 
 export const __core = { toObjectSchema, setupV2 };
@@ -867,17 +904,7 @@ Any text including single words is treated literally as content to store. Do not
     'experimental.chat.system.transform': async (_input, output) => {
       let cache = await getCache();
       if (++_requestCount % cache.config.injectEveryNTurns === 0) cache = await getCache(true);
-      const { renderedRules, content, config, memDir, drift } = cache;
-      if (content) {
-        output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
-        if (config.sharedDir && drift && drift.fileCount > drift.indexedCount + DRIFT_NOTE_THRESHOLD) {
-          const missing = drift.fileCount - drift.indexedCount;
-          output.system.push(`<!-- MEMORY MAINTENANCE: ~${missing} topic file(s) exist in the memory dir but are not in the index (possibly a co-tenant rewrote MEMORY.md). Run "/memory repair" to re-index them. -->`);
-        }
-      }
-      if (renderedRules) {
-        output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
-      }
+      for (const part of buildInjectionParts(cache)) output.system.push(part);
     },
 
     'experimental.session.compacting': async (_input, output) => {

@@ -64,8 +64,9 @@ function makeFakeV2Ctx() {
   const ctx = {
     tool: {
       added: [],
+      hooks: {},
       async transform(cb) { cb({ add: (t) => ctx.tool.added.push(t) }); },
-      async hook() {},
+      async hook(name, cb) { ctx.tool.hooks[name] = cb; },
       async list() { return []; },
     },
     session: {
@@ -2211,6 +2212,27 @@ await test('setupV2 registers four tools as object-schema codemode tools returni
   assert.equal(typeof result, 'object');
   assert.equal(typeof result.content, 'string');
   assert.match(result.content, /Memory (created|updated)/);
+});
+
+await test('setupV2 injects memory/rules as SystemPart objects and registers execute.after', async () => {
+  const ctx = makeFakeV2Ctx();
+  await __core.setupV2(ctx);
+  assert.ok(ctx.session.hooks.context, 'context hook must be registered');
+  writeRules('{ "always_persist": ["Persist Rule Marker"] }');
+  const write = ctx.tool.added.find(t => t.name === 'write_memory');
+  await write.execute({ topic: 'V2 Injection Seed', content: 'body', summary: 'seed', pin: false, mode: 'append' });
+  const e = { system: [] };
+  await ctx.session.hooks.context(e);
+  assert.ok(e.system.length > 0, 'context hook must push system parts');
+  for (const part of e.system) {
+    assert.equal(part.type, 'text');
+    assert.equal(typeof part.text, 'string');
+  }
+  const joined = e.system.map(p => p.text).join('\n');
+  assert.ok(joined.includes('## Global Memory'), 'memory block must be present');
+  assert.ok(joined.includes('## Memory Rules'), 'rules block must be present');
+  assert.ok(ctx.tool.hooks['execute.after'], 'execute.after hook must be registered');
+  assert.doesNotThrow(() => ctx.tool.hooks['execute.after']({ tool: 'write_memory' }));
 });
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);
