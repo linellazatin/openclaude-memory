@@ -1,81 +1,98 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for AI agents working in this repository.
 
 ## What this is
 
-An opencode plugin (`@openlines/openclaude-memory`) that gives AI agents persistent markdown-based memory across sessions. Plain JavaScript ESM, no dependencies, no build step, no TypeScript.
+An opencode plugin (`@openlines/openclaude-memory`) giving agents persistent markdown memory across sessions. Plain ES JavaScript + Markdown — no TypeScript, no bundler, no lint, no formatter, zero runtime dependencies. Supports OpenCode V1 (floor 1.18.29) and V2 (2.0.31) from the same entrypoints.
 
 ## Commands
 
 ```sh
-npm test                    # 120 sequential smoke checks plus real-process shared writers
-node tests/smoke-test.mjs   # smoke checks only; no single-test filter
-npm run test:host           # real OpenCode server plus local fake model
+npm test                              # 126 sequential smoke checks + real-process shared writers
+npm run test:host:v1                  # real OpenCode 1.18.x server + local fake model (needs OPENCODE_BIN)
+npm run test:host:v2                  # real OpenCode 2.0.x server + local fake model
 node tests/shared-store-test.mjs /absolute/path/to/openpi-memory/extensions/memory-core.mjs
 for file in .opencode/plugins/*.mjs tests/*.mjs; do node --check "$file" || exit; done
+# run INSIDE .opencode/ (not root) for @opencode-ai/plugin + @opencode/plugin type hints
+cd .opencode && npm install
 ```
 
-No build, lint, or typecheck commands exist.
+No build / typecheck / lint / format. No single-test runner: `smoke-test.mjs` runs the whole suite (`node:assert`, order-dependent).
 
 ## Architecture
 
-Three plugin files, all in `.opencode/plugins/`:
+Three plugin files in `.opencode/plugins/`, all dual V1/V2:
 
-- **`ocl-memory.mjs`** — the main server-side plugin, registered in `opencode.json`. Exports a factory function (`export default async () => { return { config, tool, ... }; }`).
-- **`ocl-memory-tui.mjs`** — interactive TUI browser (`ctrl+alt+m`), registered in `tui.jsonc`. Writes `MEMORY.md` directly through the same `withLock` (strict under `shared_dir`) atomic-write path as server tools and leaves an `.invalidate` sentinel; the server picks it up on its next cache check when both use the same active directory.
-- **`ocl-memory-shared.mjs`**: path/config resolution, fail-closed locks in both modes, no-follow regular-file reads, flushed/cleaned atomic writes, metadata-flag parsing, and locked carry-over. Local acquisition waits about 500 ms; shared uses 2 s, a 1 s delay, and a second 2 s window. Config/file stamps refresh server caches; the TUI resolves config on open.
+- **`ocl-memory.mjs`** — server plugin. Default-exports `{ id, setup, server }`: V2 calls `setup` (performs all `registerV2*` registrations), V1 calls `server(input)` → `buildV1Hooks(input)` (the legacy hook object). Published entry `exports["."]`.
+- **`ocl-memory-tui.mjs`** — TUI browser (`ctrl+alt+m`). Default-exports `{ id, setup, tui }`: V2 uses promise dialogs + a `keymap.layer`, V1 uses the callback `tui(api)` interface. Published entry `exports["./tui"]`.
+- **`ocl-memory-shared.mjs`** — pure logic, NO plugin hooks; imported by both. Path/config resolution, `withLock`/`acquireLock`/`releaseLock` + `LockContendedError`, atomic writes, carry-over, `parseIndexLine`, `isSafeFilename`, `stripJsonc`, `readMemoryRules`.
 
-Module-level state (no reset API between tests):
+The two entry-point files stay separate: the type system forbids a server plugin exporting `tui` and a TUI plugin exporting `server` (`TuiPluginModule.server?: never` / `PluginModule.tui?: never`). The shared module is exempt (exports no hooks).
 
-- `ocl-memory.mjs`: `_cache` holds config, content, and file-stamp signature; `_requestCount` controls forced refresh frequency. Memory and rules are attached to every fresh model request, with no first-session gate.
-- `ocl-memory-shared.mjs`: `_carryOverChecked` is set only after success/persisted sentinel; `_carryOverPending` coalesces concurrent attempts. Failed migration retries on a later refresh.
+Storage: index at `~/.config/opencode/memory/MEMORY.md` (or `~/.agents/memory/` when `shared_dir`), config at `~/.config/opencode/memory.jsonc`; resolved from `XDG_CONFIG_HOME`/`os.homedir()` at module load. `V2` note: configured plugin paths must be directory form (`index.mjs`/`tui.mjs`); the published package is unaffected (uses `exports`).
 
-Memory is stored at `$XDG_CONFIG_HOME/opencode/memory/` (defaults to `~/.config/opencode/memory/`), or `~/.agents/memory/` if `"shared_dir": true`:
-- `MEMORY.md` — index; one line per topic (ISO datetime timestamps throughout, not bare dates)
-- `<slug>.md` — per-topic detail files
+Module-level state (no reset API between tests): `ocl-memory.mjs` `_cache` (config/content/stamps) and `_requestCount`; `ocl-memory-shared.mjs` `_carryOverChecked` (set only after success) and `_carryOverPending`.
 
-Config lives at local `~/.config/opencode/memory.jsonc`, with string-aware line/block comments and trailing commas. Legacy `memory/RULES.jsonc` is copied exclusively into a missing config before renaming the original to `.bak`; existing config/backups are preserved, and failed publication keeps the original intact.
-
-Store reads use nonblocking, no-follow opens and verify regular descriptors; injection and previews are bounded before allocation. Trusted config symlinks are supported and target edits refresh cache stamps. Reserved `MEMORY.md`, unsafe filenames, directories, and symlink topic targets are refused. Removal records a tombstone before dropping all index references; reclaim requires matching frontmatter identity. TUI removal rechecks pins inside the lock and displays failures.
-
-The plugin registers `config`, `tool`, `tool.execute.after`, `command.execute.before`, `experimental.chat.system.transform`, `experimental.session.compacting`, and `experimental.compaction.autocontinue`. Dynamic `/memory` paths refresh before execution. Automatic consolidation queues with `noReply: true` and preserves agent/model/variant; errors retain native continuation. Manual compaction and automatic user-message replay paths may bypass that hook.
-
-### Injection behavior
-
-`renderRulesForInjection` renders non-empty behavioral arrays (`always_persist`, `never_persist`, `always_ask`). Malformed JSONC or config with no non-empty behavioral arrays falls back to raw text, including scalar settings. Memory content is capped by both the configurable line limit (default 300) and a hard 50 KB byte cap; exceeding either truncates what the agent sees without modifying the file on disk.
-
-### Tool arg schema invariant
-
-Tool args use a **flat** `{ paramName: JSONSchema }` object. Do not wrap in a `{ type: 'object', properties: ... }` envelope — opencode's `legacyJsonSchema()` rejects the envelope and the arg-taking tools silently break (v0.5.1 hotfix). The plugin registers four tools: `write_memory`, `remove_memory`, `pin_memory`, and `repair_memory` (no args — additively re-indexes orphaned topic files).
-
-### `write_memory` mode param
-
-Both modes refresh current name/description/timestamp metadata, preserving creation and other fields. Append retains the body plus a dated section; replace overwrites it. Native flat-schema calls supply `pin` and `mode` explicitly. Ordinary failed publication attempts topic/index rollback; abrupt termination remains outside per-file atomicity. No directory-fsync or atomic lock compare-and-unlink guarantee is implied.
-
-## Test quirks
-
-`tests/smoke-test.mjs` sets `XDG_CONFIG_HOME` to a temp dir **before** importing the plugin — `MEMORY_DIR` is fixed at module load time and cannot be changed after import. Test order is load-bearing; there is no state reset API between tests. The comment "read the section comments before reordering" is accurate.
-
-## Publishing
-
-Push a `v*` tag (e.g. `v0.5.3`) → GitHub Actions publishes to npm via OIDC Trusted Publishing and auto-creates a release from `CHANGELOG.md`. `NODE_AUTH_TOKEN: ''` in `publish.yml` is intentional — do not replace it with a real token or OIDC breaks.
-
-Current worktree version is 0.6.7. Update package version, skill frontmatter, and dated changelog together; publish CI verifies consistency before release. Documentation remains uncommitted by the user's current instruction, so do not tag a release until those versioned documents are included.
-
-`.opencode/package.json` is gitignored and never published. Run `npm install` **inside `.opencode/`** (not root) to get type hints for `@opencode-ai/plugin`.
-
-## Key files
+## Key paths
 
 | Path | Role |
 |------|------|
-| `.opencode/plugins/ocl-memory.mjs` | Server plugin (factory export) |
-| `.opencode/plugins/ocl-memory-tui.mjs` | TUI browser (ctrl+alt+m) |
-| `.opencode/plugins/ocl-memory-shared.mjs` | Shared path/config/lock logic, no plugin hooks |
-| `tests/smoke-test.mjs` | 120 sequential, order-dependent checks |
-| `tests/shared-store-test.mjs` | Real-process OpenCode/OpenCode or OpenCode/pi writers |
-| `tests/host-test.mjs` | Real OpenCode 1.18.34 tool/injection/consolidation integration |
-| `skills/memory/SKILL.md` | Agent skill loaded on-demand |
-| `.opencode/command/memory.md` | Static `/memory` fallback resolves config and the active directory; dynamic registration wins at runtime and refreshes paths before execution |
+| `.opencode/plugins/ocl-memory.mjs` | Server plugin — hooks/tools/injection/consolidation (`exports["."]`) |
+| `.opencode/plugins/ocl-memory-shared.mjs` | Pure shared logic, no hooks |
+| `.opencode/plugins/ocl-memory-tui.mjs` | TUI browser (`exports["./tui"]`) |
+| `.opencode/command/memory.md` | Static `/memory` fallback; dynamic registration overrides at runtime |
+| `skills/memory/SKILL.md` | Agent skill, on-demand; carries `version:` frontmatter |
+| `package.json` | Root manifest, published; `files: ["skills/", ".opencode/"]` |
+| `tests/smoke-test.mjs` / `shared-store-test.mjs` / `host-test.mjs` / `host-test-v2.mjs` | test suites |
+| `docs/` | User-facing prose; behavior-coupled, update on behavior changes |
 
-See `AGENTS.md` for OIDC and dual command registration details.
+## Invariants (each was a real bug — do not "simplify" away)
+
+- **No zod — flat args map required.** `args` = `{ topic: {type:'string'}, ... }` per param. opencode's `legacyJsonSchema()` fallback needs FLAT. Wrapping in `{ type:'object', properties }` makes `type`/`required`/`properties` be read as param names → every arg `undefined` (the 0.5.1 outage). V2 derives its object schema from the SAME flat map via `toObjectSchema` (inverse companion — do not mix them up).
+- **Tool arg guards return a string, never throw.** Validate `topic` non-empty string, `content`/`summary` as strings first. Empty content/summary allowed; fs failures may throw. `repair_memory` takes no args. Native flat-schema calls must pass `pin` and `mode` explicitly.
+- **`pin` coerced via `pin === true || pin === 'true'`, never JS truthiness** (string `"false"` is truthy). Applied in `write_memory`/`pin_memory`.
+- **`findIndexEntry` is exact-wins / ambiguous-refuses.** Exact case-insensitive name-or-filename wins; a single substring match is returned; MULTIPLE substring matches → `{ambiguous, names}` and the caller refuses. Never regress to first-substring-wins.
+- **`write_memory` collapses + caps `summary` at 500 chars** (`MAX_SUMMARY_LENGTH`) into `cleanSummary` BEFORE first use, so frontmatter description, index line, and result message are identical.
+- **`isSafeFilename()` guards filenames read back from `MEMORY.md`.** `toSlug()` only sanitizes NEW write filenames; it is never a validator on read. Guards at every read-time path boundary (`write_memory`/`remove_memory`/`maintainIndex`/`mergeLocalIntoSharedDir`/TUI `parseIndex`+read/mutate). Since 0.6.5 also rejects a leading `.` and `[]()`. `write_memory` guards its own generated slug too (else punctuation-only topic → `.md`, then a silent orphan).
+- **`write_memory` slug-collision fallback.** New topic whose slug hits a file owned by a DIFFERENT topic → bump `-2`, `-3`… before touching (pre-fix cross-topic corruption). Same-name rewrite reuses the file.
+- **Removals are tombstoned in `.ocl-removed`** before index references drop; topic file preserved. Re-store reclaims only on matching frontmatter identity; unrelated slugs get a numeric suffix. Clear tombstone only after successful publication. Every mutation stays inside `withLock`.
+- **`stripJsonc` is string-literal-aware.** A naive `//` strip truncates URL values; since 0.6.5 also strips `/* … */` block comments. `parseRules`/`readMemoryRules` `console.error` before default-fallback. Do not revert to a regex one-liner.
+- **Index lines are one physical record — `sanitizeIndexField`.** A topic is one `- [name](file.md) date -- summary` line; sanitize collapses `\r\n` and strips `[]()`. `write_memory` sanitizes `topic` → `cleanTopic` ONCE at the top of `execute()` so slug/match/frontmatter/index line all agree. Topic-file CONTENT is NOT sanitized (newlines are normal markdown).
+- **50 KB injection cap is enforced line-by-line.** `readMemoryIndex()` keeps only whole lines fitting `MAX_BYTES` (never `lines.slice(0, maxLines)` after a byte overflow).
+- **`readMemoryIndex()` never writes on the read path.** Absent → returns `INITIAL_MEMORY` in-memory only (else an unlocked write under `shared_dir` could clobber a co-tenant's fresh index). `MEMORY.md` first materializes on a locked write.
+- **`write_memory` timestamp bump is frontmatter-scoped.** Both modes extract the `^---\n...\n---\n` block and regex only inside it (else a body line beginning `last_updated:` gets rewritten and frontmatter never stamped).
+- **Two `package.json` files.** Root is published; `.opencode/package.json` is gitignored (with `node_modules`, `bun.lock`) and holds only type hints (`@opencode-ai/plugin` V1 + `@opencode/plugin` V2).
+
+## shared_dir, locking, cache
+
+- **`memory.jsonc` is the single local config source.** Publish a missing config exclusively before renaming legacy `memory/RULES.jsonc` to `.bak`; preserve a racing creator + existing backups; failed publication keeps the legacy original.
+- **`getMemoryDir(config)`/`getMemoryIndex(config)` resolve the active directory; capture before the mutation lock.** Stamp checks detect config/path changes before cache reuse; TUI resolves on open and `/memory` refreshes before executing. No restart for ordinary edits.
+- **Carry-over is merge-aware + double-guarded.** `maybeCarryOverToSharedDir()` runs once ever per install: `_carryOverChecked` short-circuits in-process only after full success; `CARRY_OVER_SENTINEL` (`.shared-dir-migrated`) across restarts. MERGES (never skips when shared `MEMORY.md` exists): copy originals under original name; identical bytes → skip; different → `-oclm` suffix. Respects both removal lists (tombstones); an identical pre-existing shared file still gets its missing index line appended so it stays discoverable. One-way copy, no re-run on toggle. `parseIndexLine`/`INITIAL_MEMORY` live in the shared module.
+- **`withLock` is the single mutation entry point, fail-closed.** Local waits ~500 ms; shared 2 s + 1 s delay + another 2 s, then `LockContendedError`/`BUSY_MESSAGE`. Capture each acquisition token synchronously before awaiting; release verifies it. `EPERM` means alive; stale reclaim checks PID + inode/mtime; unknown payloads use a 60 s threshold. No atomic compare-and-unlink — not a strict lease guarantee.
+- **Repair is additive-only and idempotent.** Scan safe regular `.md` files missing from the index/removal list; append `[stale?]` entries dated from frontmatter; never delete/reorder. Report pre-existing vs added separately. Drift notes above five non-tombstoned missing topics; never auto-repair a co-tenant's possible in-flight write.
+- **Recap topic is `ocl-last-session-recap.md` (`"OCL Last Session Recap"`), NOT `last-session-recap`** (openpi reserves that slug and strips it every session). Set in both `CONSOLIDATION_PROMPT` and `buildCompactConsolidationPrompt`. Do not rename to a parenthetical.
+- **Topic frontmatter uses quoted names/descriptions** (`JSON.stringify`). Both modes refresh name/description/`last_updated`, preserving `created` + unknown fields. Migration compares whole-file bytes.
+- **`.invalidate` is computed from the active directory and never consumed.** TUI writes it atomically; each server cache stamps independently; notification failure must report the index already committed.
+
+## Injection & consolidation
+
+- **Always attach memory/rules.** V1 injects via `experimental.chat.system.transform`; V2 via `ctx.session.hook("context")` pushing `{type:'text',text}` SystemParts. Fresh output every request (other sessions, internal calls) — no first-turn gate. `_requestCount`/`inject_every_n_turns` control forced disk refresh, not injection.
+- **Per-file durability:** no-follow reads verify regular descriptors; UI/injection reads bounded before allocation; atomic writes (exclusive temp, flush, cleanup); ordinary publish failures attempt rollback (report paths if rollback fails). Directory entries not fsynced — recoverable drift on abrupt termination.
+- **Reads never block on special files:** nonblocking open before verifying regular descriptor. Store reads reject final-component symlinks; trusted config symlinks supported (target stamps in cache).
+- **Compaction** forces `getCache(true)` into `output.context` (V1 `experimental.session.compacting`; V2 `ctx.session.hook("compaction")`).
+- **`consolidate_on_compact`:** V1 runs via `experimental.compaction.autocontinue` (captures `client` from `input.client`; seeds from `fetchLatestCompactionSummary` → latest assistant with `info.summary===true`, `res.data||res`; fallback full-scan `CONSOLIDATION_PROMPT`). Queues with `noReply: true`, retains agent/model/variant; SDK errors retain native continuation. **V2 has no continuation hook** — a `session.compacted` event loop enqueues an *additional* queued prompt; it cannot replace the running loop (documented limitation).
+- **`autocontinue` never fires on manual `/compact`** (upstream gates on `input.auto`; manual is `auto:false`). Consolidation only on automatic compaction; manual consolidation is `/memory consolidate`.
+
+## Testing quirks
+
+- `XDG_CONFIG_HOME` (→ temp) and `OCL_SHARED_MEMORY_HOME` must be set at the TOP of `smoke-test.mjs` BEFORE the plugin `import`s — `MEMORY_DIR`/`SHARED_MEMORY_DIR` are fixed at module load. Both plugin files import the same cached shared module (one shared state instance).
+- State (`_cache`, `_requestCount`, `_carryOverChecked`, `_carryOverPending`) is process-global with no reset API; test order is load-bearing.
+- Use `experimental.session.compacting({}, makeCompactOutput())` for a forced full refresh, not an injection-state reset.
+- Cross-process lock tests wait for child IPC readiness (no fixed sleeps); held-lock check ≥150 ms and below the 2 s window.
+
+## Releasing
+
+- Version bump touches 3 files with NO single source of truth: `package.json` (`version`), `skills/memory/SKILL.md` (`version:`), a dated `## [X.Y.Z]` entry in `CHANGELOG.md`. Publish CI checks consistency. **Current worktree version is 0.7.0.**
+- CI publishes on a `v*` tag; `publish.yml` scrapes the release body from `CHANGELOG.md` by matching the `## [<version>]` heading, so that heading MUST equal the tag version (minus `v`). `NODE_AUTH_TOKEN: ''` is intentional (OIDC Trusted Publishing) — never put a real token there.
+- CI gates: `test.yml` runs `node --check` + `npm test` on every push/PR; `publish.yml` re-runs both plus the 3-way version-consistency check before publishing. Still run `npm test` + `node --check` locally before tagging.
