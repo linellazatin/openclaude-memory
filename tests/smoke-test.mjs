@@ -2048,6 +2048,50 @@ await test('TUI shows a pinned refusal instead of silently returning to the brow
   assert.match(current.message || '', /pinned/i);
 });
 
+await test('TUI V2 setup registers a keymap layer and drives pin via promise dialogs', async () => {
+  const module = await import('../.opencode/plugins/ocl-memory-tui.mjs');
+  writeRules('{}');
+  fs.mkdirSync(MEMORY_DIR, { recursive: true });
+  const idxP = path.join(MEMORY_DIR, 'MEMORY.md');
+  const priorIndex = fs.existsSync(idxP) ? fs.readFileSync(idxP, 'utf8') : null;
+  const topicFile = path.join(MEMORY_DIR, 'seed-topic.md');
+  const priorTopic = fs.existsSync(topicFile) ? fs.readFileSync(topicFile, 'utf8') : null;
+  try {
+    fs.writeFileSync(topicFile, 'seed body');
+    fs.writeFileSync(idxP, '# Memory Index\n\n- [Seed Topic](seed-topic.md) 2026-01-01T00:00:00+00:00 -- seed summary\n');
+    let selectCalls = 0;
+    let layer;
+    const fakeCtx = {
+      ui: {
+        dialog: {
+          set() {},
+          async select(opts) { selectCalls++; if (selectCalls === 1) return opts.options[0].value; if (selectCalls === 2) return 'pin'; return undefined; },
+          async alert() {},
+          async confirm() { return true; },
+          async prompt() {},
+          clear() {},
+        },
+        toast: { show() {} },
+        format: { path: v => v },
+      },
+      keymap: { layer(factory) { layer = factory(); } },
+      app: { version: '2.0.31' },
+    };
+    await module.default.setup(fakeCtx);
+    assert.ok(layer, 'keymap layer must be registered');
+    const cmd = layer.commands[0];
+    assert.equal(cmd.id, 'ocl-memory.browser');
+    assert.equal(cmd.bind, 'ctrl+alt+m');
+    assert.deepEqual(layer.bindings, ['ocl-memory.browser']);
+    await cmd.run();
+    const index = fs.readFileSync(idxP, 'utf8');
+    assert.ok(index.includes('[pin]'), 'pin path must pin the entry');
+  } finally {
+    if (priorIndex === null) fs.rmSync(idxP, { force: true }); else fs.writeFileSync(idxP, priorIndex);
+    if (priorTopic === null) fs.rmSync(topicFile, { force: true }); else fs.writeFileSync(topicFile, priorTopic);
+  }
+});
+
 // ═══════════════════════════════════════════════════════════
 await test('failed config migration preserves the original legacy file and backup', () => {
   const config = fs.readFileSync(MEMORY_CONFIG);
