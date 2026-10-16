@@ -58,6 +58,36 @@ function makeCompactOutput() {
   return { context: [] };
 }
 
+// Minimal V2 context with spying collectors for every domain the V2 adapter
+// touches. Tasks 6-8 drive setupV2(ctx) with this and assert on the collectors.
+function makeFakeV2Ctx() {
+  const ctx = {
+    tool: {
+      added: [],
+      async transform(cb) { cb({ add: (t) => ctx.tool.added.push(t) }); },
+      async hook() {},
+      async list() { return []; },
+    },
+    session: {
+      hooks: {},
+      async hook(name, cb) { ctx.session.hooks[name] = cb; },
+      async context() { return []; },
+      async prompt() {},
+    },
+    skill: {
+      added: [],
+      async transform(cb) { cb({ add: (s) => ctx.skill.added.push(s) }); },
+    },
+    command: {
+      added: [],
+      async transform(cb) { cb({ add: (c) => ctx.command.added.push(c) }); },
+    },
+    event: { async subscribe() {} },
+    app: { version: '2.0.31' },
+  };
+  return ctx;
+}
+
 // Helper: write memory.jsonc with custom config values
 function writeRules(content) {
   fs.mkdirSync(path.dirname(MEMORY_CONFIG), { recursive: true });
@@ -2164,6 +2194,23 @@ await test('toObjectSchema builds a V2 object schema from a flat args map', () =
   assert.deepEqual(s.required, ['a']);
   assert.equal(s.additionalProperties, false);
   assert.equal(s.properties.a.default, undefined);
+});
+
+await test('setupV2 registers four tools as object-schema codemode tools returning {content}', async () => {
+  const ctx = makeFakeV2Ctx();
+  await __core.setupV2(ctx);
+  assert.deepEqual(ctx.tool.added.map(t => t.name), ['write_memory', 'remove_memory', 'pin_memory', 'repair_memory']);
+  for (const t of ctx.tool.added) {
+    assert.equal(t.input.type, 'object');
+    assert.equal(t.input.additionalProperties, false);
+    assert.equal(t.options && t.options.codemode, false, `${t.name} must set codemode:false to appear as a top-level tool`);
+  }
+  const write = ctx.tool.added.find(t => t.name === 'write_memory');
+  writeRules('{}');
+  const result = await write.execute({ topic: 'V2 Seed Topic', content: 'body', summary: 'sum', pin: false, mode: 'append' });
+  assert.equal(typeof result, 'object');
+  assert.equal(typeof result.content, 'string');
+  assert.match(result.content, /Memory (created|updated)/);
 });
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);

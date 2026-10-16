@@ -711,10 +711,29 @@ function toObjectSchema(flatArgs) {
   return { type: 'object', properties, required, additionalProperties: false };
 }
 
+// V2 tool registration: convert each TOOL_SPECS entry into a V2 tool with an
+// object JSON Schema (toObjectSchema) and an executor that wraps the string
+// return in `{ content }`. `options: { codemode: false }` is required so these
+// surface as top-level function tools like V1 (verified in Phase 0): without
+// it they are only reachable through Code Mode's `execute` tool.
+async function registerV2Tools(ctx) {
+  await ctx.tool.transform((editor) => {
+    for (const spec of TOOL_SPECS) {
+      editor.add({
+        name: spec.name,
+        description: spec.description,
+        options: { codemode: false },
+        input: toObjectSchema(spec.args),
+        execute: async (input) => ({ content: await toolExecutors[spec.name](input) }),
+      });
+    }
+  });
+}
+
 // Test/adaptation seam. `setupV2` is the V2 adapter body (Tasks 6-9); tests
 // drive it with a fake context. `toObjectSchema` is the V2 schema builder.
 const setupV2 = async (ctx) => {
-  // Populated across Tasks 6-8; wired into the default-export `setup`.
+  await registerV2Tools(ctx);
 };
 
 export const __core = { toObjectSchema, setupV2 };
