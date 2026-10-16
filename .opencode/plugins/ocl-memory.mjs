@@ -711,12 +711,17 @@ function toObjectSchema(flatArgs) {
   return { type: 'object', properties, required, additionalProperties: false };
 }
 
-// Test/adaptation seam. `setupV2` is added in Task 9; `toObjectSchema` here.
-export const __core = { toObjectSchema };
+// Test/adaptation seam. `setupV2` is the V2 adapter body (Tasks 6-9); tests
+// drive it with a fake context. `toObjectSchema` is the V2 schema builder.
+const setupV2 = async (ctx) => {
+  // Populated across Tasks 6-8; wired into the default-export `setup`.
+};
+
+export const __core = { toObjectSchema, setupV2 };
 
 // --- Plugin export ---
 
-export default async (input) => {
+async function buildV1Hooks(input) {
   const client = input && input.client;
   const skillsDir = new URL('../../skills', import.meta.url).pathname;
   let commandTemplate;
@@ -908,4 +913,19 @@ Any text including single words is treated literally as content to store. Do not
       }
     },
   };
+}
+
+// V2 adapter entry point. Populated across Tasks 6-8 (tools, injection,
+// skills/commands/compaction) and wired together with setupV2 in Task 9.
+async function setup(ctx) {
+  await setupV2(ctx);
+}
+
+// Dual-version default export. V1 (>=1.18.29) reads `server()` and calls it
+// with the plugin input; V2 reads `setup(ctx)` and calls it with the V2 context.
+// The foreign key is ignored by the other version (verified in Phase 0).
+export default {
+  id: 'ocl-memory',
+  setup,
+  server: (input) => buildV1Hooks(input),
 };

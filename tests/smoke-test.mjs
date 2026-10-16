@@ -47,7 +47,7 @@ const shared = await import('../.opencode/plugins/ocl-memory-shared.mjs');
 // Helper: instantiate plugin and get the hooks object. Pass { client } to
 // exercise the consolidation autocontinue path.
 async function makePlugin(input) {
-  return pluginFactory(input);
+  return pluginFactory.server(input);
 }
 
 // Helper: build minimal output objects for hook calls

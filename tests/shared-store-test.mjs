@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 if (process.argv[2] === '--worker') {
   const [name, piPath] = process.argv.slice(3);
   const core = piPath ? await import(pathToFileURL(piPath)) : null;
-  const plugin = core ? null : await (await import('../.opencode/plugins/ocl-memory.mjs')).default();
+  const plugin = core ? null : await (await import('../.opencode/plugins/ocl-memory.mjs')).default.server({});
   process.send('ready');
   await new Promise(resolve => process.once('message', resolve));
   if (core) await core.retireRecapEntries();
