@@ -869,6 +869,60 @@ async function registerV2Command(ctx) {
   });
 }
 
+// V2 consolidate_on_compact. V1 used `experimental.compaction.autocontinue`,
+// which has no V2 equivalent. V2 emits a `session.compacted` event AFTER a
+// compaction completes, so we drive consolidation from an event subscription
+// instead of a request-time hook. Known V2 differences (documented in docs/):
+//  - There is no hook to suppress the native post-compaction continue, so
+//    consolidation is an ADDITIONAL queued prompt (delivery:'queue') rather
+//    than a replacement for the continue.
+//  - We recover auto-vs-manual from the just-written compaction message's
+//    `reason`, preserving V1's "auto only" gate.
+//  - A per-session cooldown collapses a consolidation loop that re-compacts.
+
+const CONSOLIDATION_COOLDOWN_MS = 60_000;
+
+// Latest completed compaction message, or null. Messages are a tagged union;
+// a compaction message has type:'compaction' and status:'completed'.
+function latestCompletedCompaction(messages) {
+  if (!Array.isArray(messages)) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.type === 'compaction' && m.status === 'completed' && (m.summary || m.reason)) return m;
+  }
+  return null;
+}
+
+// Fire-and-forget: the subscription loops for the plugin's lifetime. Gating on
+// config happens per event so toggling consolidate_on_compact takes effect
+// without a restart.
+function registerV2Consolidation(ctx) {
+  const seen = new Map(); // sessionID -> last consolidated epoch ms
+  (async () => {
+    try {
+      for await (const event of ctx.event.subscribe()) {
+        try {
+          if (!event || event.type !== 'session.compacted') continue;
+          const sessionID = (event.data && event.data.sessionID) || event.sessionID;
+          if (!sessionID) continue;
+          const { config } = await getCache();
+          if (!config.consolidateOnCompact) continue;
+          if (Date.now() - (seen.get(sessionID) || 0) < CONSOLIDATION_COOLDOWN_MS) continue;
+          const messages = await ctx.session.context({ sessionID });
+          const compaction = latestCompletedCompaction(messages);
+          // V1 parity: only automatic compaction consolidates.
+          if (!compaction || compaction.reason === 'manual') continue;
+          seen.set(sessionID, Date.now());
+          const text = compaction.summary
+            ? buildCompactConsolidationPrompt(compaction.summary)
+            : CONSOLIDATION_PROMPT;
+          await ctx.session.prompt({ sessionID, text, delivery: 'queue' });
+        } catch { /* best-effort per event */ }
+      }
+    } catch { /* subscription closed/errored */ }
+  })();
+}
+
 // Test/adaptation seam. `setupV2` is the V2 adapter body (Tasks 6-9); tests
 // drive it with a fake context. `toObjectSchema` is the V2 schema builder.
 const setupV2 = async (ctx) => {
@@ -877,6 +931,7 @@ const setupV2 = async (ctx) => {
   await registerV2Compaction(ctx);
   await registerV2Skill(ctx);
   await registerV2Command(ctx);
+  registerV2Consolidation(ctx);
 };
 
 export const __core = { toObjectSchema, setupV2 };

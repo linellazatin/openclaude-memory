@@ -84,7 +84,26 @@ function makeFakeV2Ctx() {
       added: [],
       async transform(cb) { cb({ add: (c) => ctx.command.added.push(c) }); },
     },
-    event: { async subscribe() {} },
+    event: {
+      _queue: [],
+      _waiters: [],
+      push(e) {
+        const w = ctx.event._waiters.shift();
+        if (w) w({ value: e, done: false });
+        else ctx.event._queue.push(e);
+      },
+      subscribe() {
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              next: () => ctx.event._queue.length
+                ? Promise.resolve({ value: ctx.event._queue.shift(), done: false })
+                : new Promise(resolve => ctx.event._waiters.push(resolve)),
+            };
+          },
+        };
+      },
+    },
     app: { version: '2.0.31' },
   };
   return ctx;
@@ -2314,6 +2333,28 @@ await test('setupV2 registers compaction, skill, and command', async () => {
   assert.equal(prompted.sessionID, 's1');
   assert.ok(prompted.text.includes('Arguments: hello world'));
   assert.ok(prompted.text.includes('Memory dir:'));
+});
+
+await test('setupV2 consolidates once per auto compaction and not on manual', async () => {
+  const ctx = makeFakeV2Ctx();
+  await __core.setupV2(ctx);
+  writeRules('{ "consolidate_on_compact": true }');
+  const flush = () => new Promise(r => setTimeout(r, 30));
+  await flush(); // prime the event subscription
+
+  ctx.session.context = async () => [{ type: 'compaction', status: 'completed', reason: 'auto', summary: 'SUMMARY X' }];
+  ctx.event.push({ type: 'session.compacted', data: { sessionID: 's1' } });
+  ctx.event.push({ type: 'session.compacted', data: { sessionID: 's1' } });
+  await flush();
+  assert.equal(ctx.session.prompted.length, 1, 'rapid duplicate events collapse to one consolidation');
+  assert.equal(ctx.session.prompted[0].sessionID, 's1');
+  assert.equal(ctx.session.prompted[0].delivery, 'queue');
+  assert.ok(ctx.session.prompted[0].text.includes('SUMMARY X'), 'must seed from the compaction summary');
+
+  ctx.session.context = async () => [{ type: 'compaction', status: 'completed', reason: 'manual', summary: 'MANUAL' }];
+  ctx.event.push({ type: 'session.compacted', data: { sessionID: 's2' } });
+  await flush();
+  assert.equal(ctx.session.prompted.length, 1, 'manual compaction must not consolidate');
 });
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);
