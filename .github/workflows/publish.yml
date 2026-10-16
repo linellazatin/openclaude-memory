@@ -10,7 +10,13 @@ permissions:
   contents: write
 
 jobs:
+  # Release gate: the full Test workflow (syntax-check, smoke, and the real-V2
+  # host test) must pass before the release tag is published.
+  test:
+    uses: ./.github/workflows/test.yml
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     environment: npm
     steps:
@@ -21,13 +27,6 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
-
-      - name: Syntax-check plugin and test sources
-        run: |
-          for f in .opencode/plugins/*.mjs tests/*.mjs; do node --check "$f"; done
-
-      - name: Run smoke tests
-        run: npm test
 
       # Version consistency has no single source of truth in this repo (package.json,
       # SKILL.md frontmatter, and the tag must all agree; the release body is scraped
@@ -60,5 +59,3 @@ jobs:
       - run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ''
-
-      

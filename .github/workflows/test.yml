@@ -5,6 +5,8 @@ on:
     branches:
       - main
   pull_request:
+  # Reused by publish.yml as the release gate — `publish` waits on `test` + `host-v2`.
+  workflow_call:
 
 jobs:
   test:
@@ -23,3 +25,21 @@ jobs:
 
       - name: Run smoke tests
         run: npm test
+
+  # Real OpenCode V2 binary end-to-end: registers the plugin, drives write_memory
+  # via a local fake model, and asserts the marker + rules reach a later request.
+  # Pin @opencode/cli so a future 2.x can't block a release; bump alongside the
+  # version revalidated in docs/architecture.md (currently 2.0.31).
+  host-v2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install OpenCode CLI (V2)
+        run: npm install -g @opencode/cli@2.0.31
+
+      - name: Run V2 host test
+        run: npm run test:host:v2
