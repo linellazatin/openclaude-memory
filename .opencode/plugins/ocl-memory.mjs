@@ -14,6 +14,11 @@ const MAX_BYTES = 50 * 1024;
 // whole 50 KB injection budget.
 const MAX_SUMMARY_LENGTH = 500;
 
+// Skills directory (absolute path) shared by the V1 `config` hook and the V2
+// skill registration.
+const skillsDir = new URL('../../skills', import.meta.url).pathname;
+const skillPath = path.join(skillsDir, 'memory', 'SKILL.md');
+
 const CONSOLIDATION_PROMPT = `Review the current conversation for facts, decisions, or discoveries that match the "always_persist" rules in ${MEMORY_CONFIG} but have not yet been written to memory. For each one found, call write_memory with an appropriate topic, content, summary, and pin value.
 
 Then write or update a topic named "OCL Last Session Recap" (toSlug of that name is exactly ocl-last-session-recap.md — use this topic string verbatim so repeated consolidations update ONE recap instead of creating duplicates) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
@@ -102,6 +107,60 @@ function buildInjectionParts(cache) {
     parts.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
   }
   return parts;
+}
+
+// The /memory command template shared by V1 (`config` hooks it as `template`,
+// with `command.execute.before` substituting stale paths + arguments) and V2
+// (the command `execute` builds it with fresh paths and substitutes $ARGUMENTS).
+function buildCommandTemplate(activeDir, activeIndex) {
+  return `Memory dir: ${activeDir}
+Memory index: ${activeIndex}
+
+Arguments: $ARGUMENTS
+
+## No arguments: show index
+
+Read ${activeIndex}. Display each entry as a table with columns: Topic (name only — no markdown links, no filenames), Date, Pinned (yes/no), Stale (yes/no). List all .md files in ${activeDir}. Do not write anything.
+
+After listing, append this legend:
+Tip: /memory <text> to store  |  /memory pin <topic> to pin  |  /memory unpin <topic> to unpin  |  /memory remove <topic> to remove  |  /memory consolidate to consolidate this session  |  /memory repair to re-index orphaned files
+
+## Arguments start with "remove ": remove an index entry
+
+The text after "remove " is the topic to find. Call the remove_memory tool:
+  remove_memory({ topic: "<the text after 'remove '>" })
+
+The tool will refuse if the entry is pinned and report the reason.
+
+## Arguments start with "pin ": pin an entry
+
+The text after "pin " is the topic to find. Call the pin_memory tool:
+  pin_memory({ topic: "<the text after 'pin '>", pin: true })
+
+## Arguments start with "unpin ": unpin an entry
+
+The text after "unpin " is the topic to find. Call the pin_memory tool:
+  pin_memory({ topic: "<the text after 'unpin '>", pin: false })
+
+## Arguments are exactly "consolidate": consolidate memory from this session
+
+${CONSOLIDATION_PROMPT}
+
+## Arguments are exactly "repair": re-index orphaned topic files
+
+Call the repair_memory tool with no arguments:
+  repair_memory({})
+
+It additively re-indexes any .md topic file that exists in the memory dir but is missing from ${activeIndex} (marking recovered entries [stale?]), never deletes or reorders existing entries, and skips topics you intentionally removed (recorded in the dir's .ocl-removed list). Report how many were re-indexed.
+
+## Arguments provided (not starting with "pin ", "unpin ", or "remove ", and not exactly "consolidate" or "repair"): store a memory
+
+Treat the arguments as a fact or note to persist. Decide the topic, a slug filename, a one-line summary, and whether the topic is permanent (hardware, user identity, core workflows = pin it). Then call the write_memory tool:
+  write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false>, mode: "append" })
+
+The tool creates a new topic file or appends to an existing one, and updates the MEMORY.md index automatically.
+
+Any text including single words is treated literally as content to store. Do not interpret "show", "list", or similar words as subcommands unless the full argument starts with "pin ", "unpin ", or "remove ", or is exactly "consolidate" or "repair".`;
 }
 
 // Transforms memory.jsonc content into markdown for agent injection.
@@ -766,11 +825,58 @@ async function registerV2Injection(ctx) {
   });
 }
 
+// V2 compaction hook — mirrors V1 `experimental.session.compacting`, injecting
+// the current memory index + rules into the compaction request as SystemParts.
+async function registerV2Compaction(ctx) {
+  await ctx.session.hook('compaction', async (e) => {
+    const { renderedRules, content } = await getCache(true);
+    if (content) e.system.push({ type: 'text', text: `## Global Memory (current index)\n\n${content}` });
+    if (renderedRules) e.system.push({ type: 'text', text: `## Memory Rules\n\n${renderedRules}` });
+  });
+}
+
+// V2 skill registration — embeds skills/memory/SKILL.md as a named skill.
+async function registerV2Skill(ctx) {
+  await ctx.skill.transform((editor) => {
+    let content;
+    try { content = fs.readFileSync(skillPath, 'utf8'); } catch { return; }
+    editor.add({
+      id: 'memory',
+      name: 'memory',
+      description: 'Read and write global persistent memory across opencode sessions',
+      path: skillPath,
+      content,
+    });
+  });
+}
+
+// V2 command registration — the /memory command. Unlike V1 (template +
+// command.execute.before), the path refresh and $ARGUMENTS substitution happen
+// inside `execute`, which then enqueues the rendered prompt.
+async function registerV2Command(ctx) {
+  await ctx.command.transform((editor) => {
+    editor.add({
+      name: 'memory',
+      description: '/memory → show index | /memory <text> → store | /memory pin <topic> → pin | /memory unpin <topic> → unpin | /memory remove <topic> → remove entry | /memory consolidate → consolidate session | /memory repair → re-index orphaned topic files',
+      execute: async ({ sessionID, prompt, delivery }) => {
+        const { config } = await getCache();
+        const memDir = getMemoryDir(config);
+        const activeIndex = getMemoryIndex(config);
+        const text = buildCommandTemplate(memDir, activeIndex).replaceAll('$ARGUMENTS', () => prompt?.text || '');
+        await ctx.session.prompt({ sessionID, text, delivery });
+      },
+    });
+  });
+}
+
 // Test/adaptation seam. `setupV2` is the V2 adapter body (Tasks 6-9); tests
 // drive it with a fake context. `toObjectSchema` is the V2 schema builder.
 const setupV2 = async (ctx) => {
   await registerV2Tools(ctx);
   await registerV2Injection(ctx);
+  await registerV2Compaction(ctx);
+  await registerV2Skill(ctx);
+  await registerV2Command(ctx);
 };
 
 export const __core = { toObjectSchema, setupV2 };
@@ -779,7 +885,6 @@ export const __core = { toObjectSchema, setupV2 };
 
 async function buildV1Hooks(input) {
   const client = input && input.client;
-  const skillsDir = new URL('../../skills', import.meta.url).pathname;
   let commandTemplate;
   let commandDir;
 
@@ -826,54 +931,7 @@ async function buildV1Hooks(input) {
       if (!config.command) config.command = {};
       config.command['memory'] = {
         description: '/memory → show index | /memory <text> → store | /memory pin <topic> → pin | /memory unpin <topic> → unpin | /memory remove <topic> → remove entry | /memory consolidate → consolidate session | /memory repair → re-index orphaned topic files',
-        template: `Memory dir: ${activeDir}
-Memory index: ${activeIndex}
-
-Arguments: $ARGUMENTS
-
-## No arguments: show index
-
-Read ${activeIndex}. Display each entry as a table with columns: Topic (name only — no markdown links, no filenames), Date, Pinned (yes/no), Stale (yes/no). List all .md files in ${activeDir}. Do not write anything.
-
-After listing, append this legend:
-Tip: /memory <text> to store  |  /memory pin <topic> to pin  |  /memory unpin <topic> to unpin  |  /memory remove <topic> to remove  |  /memory consolidate to consolidate this session  |  /memory repair to re-index orphaned files
-
-## Arguments start with "remove ": remove an index entry
-
-The text after "remove " is the topic to find. Call the remove_memory tool:
-  remove_memory({ topic: "<the text after 'remove '>" })
-
-The tool will refuse if the entry is pinned and report the reason.
-
-## Arguments start with "pin ": pin an entry
-
-The text after "pin " is the topic to find. Call the pin_memory tool:
-  pin_memory({ topic: "<the text after 'pin '>", pin: true })
-
-## Arguments start with "unpin ": unpin an entry
-
-The text after "unpin " is the topic to find. Call the pin_memory tool:
-  pin_memory({ topic: "<the text after 'unpin '>", pin: false })
-
-## Arguments are exactly "consolidate": consolidate memory from this session
-
-${CONSOLIDATION_PROMPT}
-
-## Arguments are exactly "repair": re-index orphaned topic files
-
-Call the repair_memory tool with no arguments:
-  repair_memory({})
-
-It additively re-indexes any .md topic file that exists in the memory dir but is missing from ${activeIndex} (marking recovered entries [stale?]), never deletes or reorders existing entries, and skips topics you intentionally removed (recorded in the dir's .ocl-removed list). Report how many were re-indexed.
-
-## Arguments provided (not starting with "pin ", "unpin ", or "remove ", and not exactly "consolidate" or "repair"): store a memory
-
-Treat the arguments as a fact or note to persist. Decide the topic, a slug filename, a one-line summary, and whether the topic is permanent (hardware, user identity, core workflows = pin it). Then call the write_memory tool:
-  write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false>, mode: "append" })
-
-The tool creates a new topic file or appends to an existing one, and updates the MEMORY.md index automatically.
-
-Any text including single words is treated literally as content to store. Do not interpret "show", "list", or similar words as subcommands unless the full argument starts with "pin ", "unpin ", or "remove ", or is exactly "consolidate" or "repair".`,
+        template: buildCommandTemplate(activeDir, activeIndex),
       };
       commandTemplate = config.command.memory.template;
       commandDir = activeDir;

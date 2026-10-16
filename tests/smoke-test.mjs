@@ -71,9 +71,10 @@ function makeFakeV2Ctx() {
     },
     session: {
       hooks: {},
+      prompted: [],
       async hook(name, cb) { ctx.session.hooks[name] = cb; },
       async context() { return []; },
-      async prompt() {},
+      async prompt(input) { ctx.session.prompted.push(input); },
     },
     skill: {
       added: [],
@@ -2233,6 +2234,42 @@ await test('setupV2 injects memory/rules as SystemPart objects and registers exe
   assert.ok(joined.includes('## Memory Rules'), 'rules block must be present');
   assert.ok(ctx.tool.hooks['execute.after'], 'execute.after hook must be registered');
   assert.doesNotThrow(() => ctx.tool.hooks['execute.after']({ tool: 'write_memory' }));
+});
+
+await test('setupV2 registers compaction, skill, and command', async () => {
+  const ctx = makeFakeV2Ctx();
+  await __core.setupV2(ctx);
+
+  // compaction hook pushes memory + rules as SystemParts
+  assert.ok(ctx.session.hooks.compaction, 'compaction hook must be registered');
+  writeRules('{ "always_persist": ["Persist Rule Marker"] }');
+  const write = ctx.tool.added.find(t => t.name === 'write_memory');
+  await write.execute({ topic: 'V2 Compact Seed', content: 'body', summary: 'cs', pin: false, mode: 'append' });
+  const ce = { system: [] };
+  await ctx.session.hooks.compaction(ce);
+  assert.ok(ce.system.length > 0, 'compaction hook must push system parts');
+  for (const p of ce.system) {
+    assert.equal(p.type, 'text');
+    assert.equal(typeof p.text, 'string');
+  }
+  assert.ok(ce.system.map(p => p.text).join('\n').includes('## Global Memory (current index)'));
+
+  // skill transform registers the memory skill
+  assert.equal(ctx.skill.added.length, 1);
+  assert.equal(ctx.skill.added[0].id, 'memory');
+  assert.equal(typeof ctx.skill.added[0].content, 'string');
+  assert.ok(ctx.skill.added[0].content.length > 0);
+
+  // command transform registers /memory and its execute enqueues the template
+  assert.equal(ctx.command.added.length, 1);
+  const cmd = ctx.command.added[0];
+  assert.equal(cmd.name, 'memory');
+  await cmd.execute({ sessionID: 's1', prompt: { text: 'hello world' }, delivery: 'queue' });
+  assert.equal(ctx.session.prompted.length, 1);
+  const prompted = ctx.session.prompted[0];
+  assert.equal(prompted.sessionID, 's1');
+  assert.ok(prompted.text.includes('Arguments: hello world'));
+  assert.ok(prompted.text.includes('Memory dir:'));
 });
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);
