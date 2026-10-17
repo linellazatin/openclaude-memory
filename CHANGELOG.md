@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Dual OpenCode V1/V2 support from a single set of entrypoints. The server plugin now default-exports `{ id, setup, server }` (V1 calls `server`, V2 calls `setup`); the TUI plugin exports `{ id, setup, tui }`. Floor version remains OpenCode 1.18.29; verified through 2.0.31.
+- Root `index.mjs` / `tui.mjs` re-export shims so a local checkout referenced by directory path loads under V2 (which resolves `<dir>/index.mjs` and `<dir>/tui.mjs`, not the directory's `package.json` exports).
 - V2 tool registration via `ctx.tool.transform` with object JSON Schema input, `options: { codemode: false }` for V1-parity function-tool exposure, and `{ content }` result wrapping. Memory/rules injection via `ctx.session.hook("context")` SystemParts; cache invalidation via `ctx.tool.hook("execute.after")`.
 - V2 skill, command, and compaction hooks (`ctx.skill.transform`, `ctx.command.transform`, `ctx.session.hook("compaction")`).
 - V2 TUI browser (`setup`) using promise dialogs and a `ctrl+alt+m` keymap layer, alongside the byte-identical V1 `tui` callback interface.

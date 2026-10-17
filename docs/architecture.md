@@ -9,6 +9,7 @@
 | `.opencode/plugins/ocl-memory.mjs` | Server plugin: dual V1/V2 entrypoint (`setup` for V2, `server` for V1), four native tools, per-request injection, stamp-checked cache, dynamic `/memory`, and automatic consolidation. |
 | `.opencode/plugins/ocl-memory-shared.mjs` | Pure shared module: path/config resolution, JSONC parsing, safe reads, atomic file writes, tombstones, locks, and carry-over. |
 | `.opencode/plugins/ocl-memory-tui.mjs` | Separate TUI entry: dual V1/V2 (`setup` for V2, `tui` for V1), `ctrl+alt+m`, bounded topic previews, locked pin/removal actions, and visible errors. |
+| `index.mjs` / `tui.mjs` | Root one-line re-export shims so a directory-path `plugins` reference (V2) loads the server and CLI entrypoints; not published (`files` excludes them). |
 | `.opencode/command/memory.md` | Static `/memory` fallback; resolves the active directory before reads. Dynamic registration normally replaces it. |
 | `skills/memory/SKILL.md` | Agent reference for reading, writing, pinning, repair, and consolidation. |
 | `tests/smoke-test.mjs` | Sequential isolated regression suite, including injected filesystem failures. |
@@ -17,6 +18,8 @@
 | `tests/host-test-v2.mjs` | Real OpenCode 2.0.x server with a local fake model and temporary storage (`npm run test:host:v2`). |
 
 Server and TUI entry points remain separate files, but each now exports a single dual object: `{ id, setup, server }` for the server and `{ id, setup, tui }` for the TUI. OpenCode V2 calls `setup` while V1 calls `server`/`tui`, so one file serves both majors (floor 1.18.29). The V1 path preserves the server's legacy hook object and the TUI's callback interface byte-for-byte; the V2 path registers tools, hooks, skills, the command, and the promise-dialog TUI browser. The shared module exports no plugin hooks.
+
+When referenced as a package (npm), OpenCode V2 loads the server via `exports["."]` and the TUI via `exports["./tui"]`. When referenced as a directory path, V2 instead resolves `<dir>/index.mjs` (server) and `<dir>/tui.mjs` (CLI) and ignores the directory's `package.json` `exports`; the root `index.mjs`/`tui.mjs` re-export shims exist precisely so a local checkout referenced by path behaves identically to the published package.
 
 ## Scope
 

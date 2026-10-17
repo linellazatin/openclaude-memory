@@ -30,7 +30,9 @@ Three plugin files in `.opencode/plugins/`, all dual V1/V2:
 
 The two entry-point files stay separate: the type system forbids a server plugin exporting `tui` and a TUI plugin exporting `server` (`TuiPluginModule.server?: never` / `PluginModule.tui?: never`). The shared module is exempt (exports no hooks).
 
-Storage: index at `~/.config/opencode/memory/MEMORY.md` (or `~/.agents/memory/` when `shared_dir`), config at `~/.config/opencode/memory.jsonc`; resolved from `XDG_CONFIG_HOME`/`os.homedir()` at module load. `V2` note: configured plugin paths must be directory form (`index.mjs`/`tui.mjs`); the published package is unaffected (uses `exports`).
+Storage: index at `~/.config/opencode/memory/MEMORY.md` (or `~/.agents/memory/` when `shared_dir`), config at `~/.config/opencode/memory.jsonc`; resolved from `XDG_CONFIG_HOME`/`os.homedir()` at module load.
+
+**V2 directory-path loading (a real gotcha).** When the repo is referenced as a plugin *path* (`"plugins": ["/abs/path/openclaude-memory"]`), V2 resolves the server entrypoint from `<dir>/index.mjs` and the CLI entrypoint from `<dir>/tui.mjs` — it does **not** read the directory's `package.json` `exports`. The published npm package loads through `exports` fine, but a bare directory reference silently loads nothing without those files. The root `index.mjs` / `tui.mjs` re-export shims (`export { default } from './.opencode/plugins/ocl-memory.mjs'` / `.../ocl-memory-tui.mjs'`) close that gap; keep them one-line re-exports, never logic. They sit outside `files` so they are not published.
 
 Module-level state (no reset API between tests): `ocl-memory.mjs` `_cache` (config/content/stamps) and `_requestCount`; `ocl-memory-shared.mjs` `_carryOverChecked` (set only after success) and `_carryOverPending`.
 
@@ -41,6 +43,7 @@ Module-level state (no reset API between tests): `ocl-memory.mjs` `_cache` (conf
 | `.opencode/plugins/ocl-memory.mjs` | Server plugin — hooks/tools/injection/consolidation (`exports["."]`) |
 | `.opencode/plugins/ocl-memory-shared.mjs` | Pure shared logic, no hooks |
 | `.opencode/plugins/ocl-memory-tui.mjs` | TUI browser (`exports["./tui"]`) |
+| `index.mjs` / `tui.mjs` | Root re-export shims for V2 directory-path plugin loading (server / CLI entrypoints) |
 | `.opencode/command/memory.md` | Static `/memory` fallback; dynamic registration overrides at runtime |
 | `skills/memory/SKILL.md` | Agent skill, on-demand; carries `version:` frontmatter |
 | `package.json` | Root manifest, published; `files: ["skills/", ".opencode/"]` |

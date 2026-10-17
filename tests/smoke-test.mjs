@@ -2357,5 +2357,16 @@ await test('setupV2 consolidates once per auto compaction and not on manual', as
   assert.equal(ctx.session.prompted.length, 1, 'manual compaction must not consolidate');
 });
 
+await test('root index.mjs and tui.mjs shims re-export the dual-entrypoint plugins', async () => {
+  const serverShim = await import('../index.mjs');
+  assert.equal(serverShim.default.id, 'ocl-memory');
+  assert.equal(typeof serverShim.default.setup, 'function', 'V2 calls setup');
+  assert.equal(typeof serverShim.default.server, 'function', 'V1 calls server');
+  const tuiShim = await import('../tui.mjs');
+  assert.equal(tuiShim.default.id, 'ocl-memory-tui');
+  assert.equal(typeof tuiShim.default.setup, 'function', 'V2 calls setup');
+  assert.equal(typeof tuiShim.default.tui, 'function', 'V1 calls tui');
+});
+
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);
 if (failed > 0) process.exit(1);
