@@ -15,10 +15,11 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - `consolidate_on_compact` under V2 is driven by a `session.compacted` event subscription and enqueues an additional consolidation prompt; V2 has no native-continuation suppression, so it cannot replace the running loop as it does under V1.
+- The V2 `setup` entrypoint now returns a cleanup that aborts the consolidation subscription, so a config-triggered plugin reload does not leave a stale loop that double-consolidates alongside the new one.
 
 ### Tests
 
-- 120 to 126 smoke tests plus a V2 fake-context seam (`__core.setupV2`) and promise-dialog TUI coverage.
+- 128 smoke tests plus a V2 fake-context seam (`__core.setupV2`) and promise-dialog TUI coverage.
 - Host suites split by major: `npm run test:host:v1` (OpenCode 1.18.x) and `npm run test:host:v2` (OpenCode 2.0.31).
 
 ## [0.6.7] - 2026-10-03

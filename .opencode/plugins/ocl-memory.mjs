@@ -893,14 +893,17 @@ function latestCompletedCompaction(messages) {
   return null;
 }
 
-// Fire-and-forget: the subscription loops for the plugin's lifetime. Gating on
-// config happens per event so toggling consolidate_on_compact takes effect
-// without a restart.
+// Event subscription. Gating on config happens per event so toggling
+// consolidate_on_compact takes effect without a restart. Returns a cleanup
+// that aborts the subscription, which V2 `setup` must return so the loop is
+// torn down on plugin unload/reload (otherwise a stale loop survives a
+// config-triggered reload and double-consolidates alongside the new one).
 function registerV2Consolidation(ctx) {
   const seen = new Map(); // sessionID -> last consolidated epoch ms
+  const controller = new AbortController();
   (async () => {
     try {
-      for await (const event of ctx.event.subscribe()) {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
         try {
           if (!event || event.type !== 'session.compacted') continue;
           const sessionID = (event.data && event.data.sessionID) || event.sessionID;
@@ -921,17 +924,19 @@ function registerV2Consolidation(ctx) {
       }
     } catch { /* subscription closed/errored */ }
   })();
+  return () => controller.abort();
 }
 
 // Test/adaptation seam. `setupV2` is the V2 adapter body (Tasks 6-9); tests
 // drive it with a fake context. `toObjectSchema` is the V2 schema builder.
+// Returns a cleanup that V2 runs on plugin unload.
 const setupV2 = async (ctx) => {
   await registerV2Tools(ctx);
   await registerV2Injection(ctx);
   await registerV2Compaction(ctx);
   await registerV2Skill(ctx);
   await registerV2Command(ctx);
-  registerV2Consolidation(ctx);
+  return registerV2Consolidation(ctx);
 };
 
 export const __core = { toObjectSchema, setupV2 };
@@ -1077,7 +1082,7 @@ async function buildV1Hooks(input) {
 // V2 adapter entry point. Populated across Tasks 6-8 (tools, injection,
 // skills/commands/compaction) and wired together with setupV2 in Task 9.
 async function setup(ctx) {
-  await setupV2(ctx);
+  return await setupV2(ctx);
 }
 
 // Dual-version default export. V1 (>=1.18.29) reads `server()` and calls it

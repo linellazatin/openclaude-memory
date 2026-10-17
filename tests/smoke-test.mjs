@@ -92,7 +92,8 @@ function makeFakeV2Ctx() {
         if (w) w({ value: e, done: false });
         else ctx.event._queue.push(e);
       },
-      subscribe() {
+      subscribe(options) {
+        ctx.event._signal = options && options.signal;
         return {
           [Symbol.asyncIterator]() {
             return {
@@ -2355,6 +2356,17 @@ await test('setupV2 consolidates once per auto compaction and not on manual', as
   ctx.event.push({ type: 'session.compacted', data: { sessionID: 's2' } });
   await flush();
   assert.equal(ctx.session.prompted.length, 1, 'manual compaction must not consolidate');
+});
+
+await test('setupV2 returns a cleanup that aborts the consolidation subscription', async () => {
+  const ctx = makeFakeV2Ctx();
+  const cleanup = await __core.setupV2(ctx);
+  assert.equal(typeof cleanup, 'function', 'setupV2 must return a cleanup function');
+  const signal = ctx.event._signal;
+  assert.ok(signal instanceof AbortSignal, 'subscribe must receive an AbortSignal');
+  assert.equal(signal.aborted, false, 'signal starts unaborted');
+  cleanup();
+  assert.equal(signal.aborted, true, 'cleanup must abort the subscription');
 });
 
 await test('root index.mjs and tui.mjs shims re-export the dual-entrypoint plugins', async () => {
