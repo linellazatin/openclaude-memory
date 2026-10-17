@@ -6,13 +6,13 @@
 
 - The store uses advisory locks and atomic replacement of individual files, not a multi-file transaction. Normal write exceptions trigger rollback; abrupt termination or power loss can leave recoverable drift. Directory entries are not fsynced.
 - Lock ownership is checked by token and stale reclaim by PID plus inode/mtime. These checks mitigate replacement races but are not an atomic filesystem compare-and-unlink. Cooperating writers on a local filesystem are the supported model; manual writers or network filesystems can violate that model.
-- Automatic consolidation depends on OpenCode's continuation hook. Manual `/compact` and automatic user-message replay paths bypass it. Use `/memory consolidate` explicitly when needed.
+- Automatic consolidation depends on OpenCode's continuation hook under V1, and on the `session.compacted` event under V2 (where it enqueues an additional prompt rather than replacing the loop). Manual `/compact` and automatic user-message replay paths bypass both. Use `/memory consolidate` explicitly when needed.
 - Carry-over happens once after success. Changing `shared_dir` switches the active path but does not continuously reconcile both stores.
 - Memory is global across sessions and agents. Persist rules guide the model and do not enforce factual accuracy or sensitive-data handling.
 
 ## Compatibility
 
-**Which OpenCode release was verified?** OpenCode 1.18.34. Release-source contracts, smoke tests, and a real-server run with a local fake model were checked. The server test covers tool registration/execution, repeated requests, another session, and automatic consolidation. TUI APIs and mutation behavior are checked separately; interactive rendering and older releases have not been revalidated.
+**Which OpenCode releases are supported?** Both V1 (floor 1.18.29) and V2 (2.0.31). Release-source contracts, smoke tests, and real-server runs with a local fake model were checked: 1.18.34 for V1 (`npm run test:host:v1`) and 2.0.31 for V2 (`npm run test:host:v2`). The V1 server test covers tool registration/execution, repeated requests, another session, and automatic consolidation; the V2 test covers tool registration/execution and later-request injection. TUI APIs and mutation behavior are checked separately; interactive rendering and older releases have not been revalidated.
 
 **Do I need to restart?** Restart after changing plugin code, skills, or OpenCode plugin registration. Editing `memory.jsonc` or `MEMORY.md` is detected on the next cache check; the TUI resolves the active directory every time it opens, and dynamic `/memory` paths refresh before execution.
 

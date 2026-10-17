@@ -1,7 +1,7 @@
 ---
 name: memory
 description: "Read and write global persistent memory across opencode sessions"
-version: 0.6.7
+version: 0.7.0
 author: Lines
 license: MIT
 platforms: [linux, macos]
@@ -221,7 +221,7 @@ All mutations use a directory lock and atomic file replacement. Local contention
 
 `/memory consolidate` reviews the current conversation for facts that match `always_persist` in `memory.jsonc` but haven't been written yet, calls `write_memory` for each, and writes or updates a `OCL Last Session Recap` topic (`ocl-last-session-recap.md`, `mode: "replace"`, unpinned — it's meant to be overwritten every session, not accumulated). The `ocl-` prefix keeps it distinct from openpi-memory's reserved `last-session-recap` slug, which that tool strips from a shared index every session.
 
-Setting `"consolidate_on_compact": true` in `memory.jsonc` runs the same consolidation automatically after opencode's automatic (threshold-triggered) compaction, replacing opencode's default synthetic "continue" message. To avoid re-scanning the whole conversation, the consolidation turn is seeded with the compaction summary opencode just generated, and it tells the agent to resume any pending work from the summary's "Next Move" section afterwards — so consolidation persists the session's facts without abandoning an in-progress task. Default is `false` — opencode already sends that default continue message on its own; this setting only matters if you want a consolidation pass to run instead. **This only fires on automatic (overflow-triggered) compaction.** Manual `/compact` does not trigger consolidation — run `/memory consolidate` explicitly if you compact manually and want the same effect.
+Setting `"consolidate_on_compact": true` in `memory.jsonc` runs the same consolidation automatically after opencode's automatic (threshold-triggered) compaction, replacing opencode's default synthetic "continue" message (V1). To avoid re-scanning the whole conversation, the consolidation turn is seeded with the compaction summary opencode just generated, and it tells the agent to resume any pending work from the summary's "Next Move" section afterwards — so consolidation persists the session's facts without abandoning an in-progress task. Default is `false` — opencode already sends that default continue message on its own; this setting only matters if you want a consolidation pass to run instead. **This only fires on automatic (overflow-triggered) compaction.** Manual `/compact` does not trigger consolidation — run `/memory consolidate` explicitly if you compact manually and want the same effect. Under OpenCode V2, consolidation enqueues an additional prompt after compaction rather than replacing the running loop. This skill applies to both OpenCode V1 and V2 sessions.
 
 If there are no new durable facts, say so and only refresh the unpinned recap. Automatic consolidation is queued with `noReply: true`, preserving agent/model/variant; API failure retains native continuation. The full-conversation fallback also instructs resuming pending work. Automatic user-message replay paths may bypass this hook, like manual `/compact`; use explicit consolidation when needed.
 

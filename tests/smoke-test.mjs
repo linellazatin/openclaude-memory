@@ -40,14 +40,14 @@ process.on('exit', () => {
 });
 
 // --- Import plugin (after env vars are set) ---
-const { default: pluginFactory } = await import('../.opencode/plugins/ocl-memory.mjs');
+const { default: pluginFactory, __core } = await import('../.opencode/plugins/ocl-memory.mjs');
 const tui = await import('../.opencode/plugins/ocl-memory-tui.mjs');
 const shared = await import('../.opencode/plugins/ocl-memory-shared.mjs');
 
 // Helper: instantiate plugin and get the hooks object. Pass { client } to
 // exercise the consolidation autocontinue path.
 async function makePlugin(input) {
-  return pluginFactory(input);
+  return pluginFactory.server(input);
 }
 
 // Helper: build minimal output objects for hook calls
@@ -56,6 +56,58 @@ function makeSystemOutput() {
 }
 function makeCompactOutput() {
   return { context: [] };
+}
+
+// Minimal V2 context with spying collectors for every domain the V2 adapter
+// touches. Tasks 6-8 drive setupV2(ctx) with this and assert on the collectors.
+function makeFakeV2Ctx() {
+  const ctx = {
+    tool: {
+      added: [],
+      hooks: {},
+      async transform(cb) { cb({ add: (t) => ctx.tool.added.push(t) }); },
+      async hook(name, cb) { ctx.tool.hooks[name] = cb; },
+      async list() { return []; },
+    },
+    session: {
+      hooks: {},
+      prompted: [],
+      async hook(name, cb) { ctx.session.hooks[name] = cb; },
+      async context() { return []; },
+      async prompt(input) { ctx.session.prompted.push(input); },
+    },
+    skill: {
+      added: [],
+      async transform(cb) { cb({ add: (s) => ctx.skill.added.push(s) }); },
+    },
+    command: {
+      added: [],
+      async transform(cb) { cb({ add: (c) => ctx.command.added.push(c) }); },
+    },
+    event: {
+      _queue: [],
+      _waiters: [],
+      push(e) {
+        const w = ctx.event._waiters.shift();
+        if (w) w({ value: e, done: false });
+        else ctx.event._queue.push(e);
+      },
+      subscribe(options) {
+        ctx.event._signal = options && options.signal;
+        return {
+          [Symbol.asyncIterator]() {
+            return {
+              next: () => ctx.event._queue.length
+                ? Promise.resolve({ value: ctx.event._queue.shift(), done: false })
+                : new Promise(resolve => ctx.event._waiters.push(resolve)),
+            };
+          },
+        };
+      },
+    },
+    app: { version: '2.0.31' },
+  };
+  return ctx;
 }
 
 // Helper: write memory.jsonc with custom config values
@@ -2016,6 +2068,50 @@ await test('TUI shows a pinned refusal instead of silently returning to the brow
   assert.match(current.message || '', /pinned/i);
 });
 
+await test('TUI V2 setup registers a keymap layer and drives pin via promise dialogs', async () => {
+  const module = await import('../.opencode/plugins/ocl-memory-tui.mjs');
+  writeRules('{}');
+  fs.mkdirSync(MEMORY_DIR, { recursive: true });
+  const idxP = path.join(MEMORY_DIR, 'MEMORY.md');
+  const priorIndex = fs.existsSync(idxP) ? fs.readFileSync(idxP, 'utf8') : null;
+  const topicFile = path.join(MEMORY_DIR, 'seed-topic.md');
+  const priorTopic = fs.existsSync(topicFile) ? fs.readFileSync(topicFile, 'utf8') : null;
+  try {
+    fs.writeFileSync(topicFile, 'seed body');
+    fs.writeFileSync(idxP, '# Memory Index\n\n- [Seed Topic](seed-topic.md) 2026-01-01T00:00:00+00:00 -- seed summary\n');
+    let selectCalls = 0;
+    let layer;
+    const fakeCtx = {
+      ui: {
+        dialog: {
+          set() {},
+          async select(opts) { selectCalls++; if (selectCalls === 1) return opts.options[0].value; if (selectCalls === 2) return 'pin'; return undefined; },
+          async alert() {},
+          async confirm() { return true; },
+          async prompt() {},
+          clear() {},
+        },
+        toast: { show() {} },
+        format: { path: v => v },
+      },
+      keymap: { layer(factory) { layer = factory(); } },
+      app: { version: '2.0.31' },
+    };
+    await module.default.setup(fakeCtx);
+    assert.ok(layer, 'keymap layer must be registered');
+    const cmd = layer.commands[0];
+    assert.equal(cmd.id, 'ocl-memory.browser');
+    assert.equal(cmd.bind, 'ctrl+alt+m');
+    assert.deepEqual(layer.bindings, ['ocl-memory.browser']);
+    await cmd.run();
+    const index = fs.readFileSync(idxP, 'utf8');
+    assert.ok(index.includes('[pin]'), 'pin path must pin the entry');
+  } finally {
+    if (priorIndex === null) fs.rmSync(idxP, { force: true }); else fs.writeFileSync(idxP, priorIndex);
+    if (priorTopic === null) fs.rmSync(topicFile, { force: true }); else fs.writeFileSync(topicFile, priorTopic);
+  }
+});
+
 // ═══════════════════════════════════════════════════════════
 await test('failed config migration preserves the original legacy file and backup', () => {
   const config = fs.readFileSync(MEMORY_CONFIG);
@@ -2154,6 +2250,134 @@ await test('config target edits through a symlink refresh the active store', asy
     await plugin['experimental.chat.system.transform']({}, next);
     assert.ok(next.system.join('\n').includes(`Memory dir: ${SHARED_MEMORY_DIR}`));
   } finally { fs.unlinkSync(MEMORY_CONFIG); fs.writeFileSync(MEMORY_CONFIG, before); fs.rmSync(target, { force: true }); }
+});
+
+// ═══════════════════════════════════════════════════════════
+await test('toObjectSchema builds a V2 object schema from a flat args map', () => {
+  assert.ok(__core && __core.toObjectSchema, '__core.toObjectSchema must be exported');
+  const s = __core.toObjectSchema({ a: { type: 'string' }, b: { type: 'boolean', default: false } });
+  assert.deepEqual(Object.keys(s.properties), ['a', 'b']);
+  assert.deepEqual(s.required, ['a']);
+  assert.equal(s.additionalProperties, false);
+  assert.equal(s.properties.a.default, undefined);
+});
+
+await test('setupV2 registers four tools as object-schema codemode tools returning {content}', async () => {
+  const ctx = makeFakeV2Ctx();
+  await __core.setupV2(ctx);
+  assert.deepEqual(ctx.tool.added.map(t => t.name), ['write_memory', 'remove_memory', 'pin_memory', 'repair_memory']);
+  for (const t of ctx.tool.added) {
+    assert.equal(t.input.type, 'object');
+    assert.equal(t.input.additionalProperties, false);
+    assert.equal(t.options && t.options.codemode, false, `${t.name} must set codemode:false to appear as a top-level tool`);
+  }
+  const write = ctx.tool.added.find(t => t.name === 'write_memory');
+  writeRules('{}');
+  const result = await write.execute({ topic: 'V2 Seed Topic', content: 'body', summary: 'sum', pin: false, mode: 'append' });
+  assert.equal(typeof result, 'object');
+  assert.equal(typeof result.content, 'string');
+  assert.match(result.content, /Memory (created|updated)/);
+});
+
+await test('setupV2 injects memory/rules as SystemPart objects and registers execute.after', async () => {
+  const ctx = makeFakeV2Ctx();
+  await __core.setupV2(ctx);
+  assert.ok(ctx.session.hooks.context, 'context hook must be registered');
+  writeRules('{ "always_persist": ["Persist Rule Marker"] }');
+  const write = ctx.tool.added.find(t => t.name === 'write_memory');
+  await write.execute({ topic: 'V2 Injection Seed', content: 'body', summary: 'seed', pin: false, mode: 'append' });
+  const e = { system: [] };
+  await ctx.session.hooks.context(e);
+  assert.ok(e.system.length > 0, 'context hook must push system parts');
+  for (const part of e.system) {
+    assert.equal(part.type, 'text');
+    assert.equal(typeof part.text, 'string');
+  }
+  const joined = e.system.map(p => p.text).join('\n');
+  assert.ok(joined.includes('## Global Memory'), 'memory block must be present');
+  assert.ok(joined.includes('## Memory Rules'), 'rules block must be present');
+  assert.ok(ctx.tool.hooks['execute.after'], 'execute.after hook must be registered');
+  assert.doesNotThrow(() => ctx.tool.hooks['execute.after']({ tool: 'write_memory' }));
+});
+
+await test('setupV2 registers compaction, skill, and command', async () => {
+  const ctx = makeFakeV2Ctx();
+  await __core.setupV2(ctx);
+
+  // compaction hook pushes memory + rules as SystemParts
+  assert.ok(ctx.session.hooks.compaction, 'compaction hook must be registered');
+  writeRules('{ "always_persist": ["Persist Rule Marker"] }');
+  const write = ctx.tool.added.find(t => t.name === 'write_memory');
+  await write.execute({ topic: 'V2 Compact Seed', content: 'body', summary: 'cs', pin: false, mode: 'append' });
+  const ce = { system: [] };
+  await ctx.session.hooks.compaction(ce);
+  assert.ok(ce.system.length > 0, 'compaction hook must push system parts');
+  for (const p of ce.system) {
+    assert.equal(p.type, 'text');
+    assert.equal(typeof p.text, 'string');
+  }
+  assert.ok(ce.system.map(p => p.text).join('\n').includes('## Global Memory (current index)'));
+
+  // skill transform registers the memory skill
+  assert.equal(ctx.skill.added.length, 1);
+  assert.equal(ctx.skill.added[0].id, 'memory');
+  assert.equal(typeof ctx.skill.added[0].content, 'string');
+  assert.ok(ctx.skill.added[0].content.length > 0);
+
+  // command transform registers /memory and its execute enqueues the template
+  assert.equal(ctx.command.added.length, 1);
+  const cmd = ctx.command.added[0];
+  assert.equal(cmd.name, 'memory');
+  await cmd.execute({ sessionID: 's1', prompt: { text: 'hello world' }, delivery: 'queue' });
+  assert.equal(ctx.session.prompted.length, 1);
+  const prompted = ctx.session.prompted[0];
+  assert.equal(prompted.sessionID, 's1');
+  assert.ok(prompted.text.includes('Arguments: hello world'));
+  assert.ok(prompted.text.includes('Memory dir:'));
+});
+
+await test('setupV2 consolidates once per auto compaction and not on manual', async () => {
+  const ctx = makeFakeV2Ctx();
+  await __core.setupV2(ctx);
+  writeRules('{ "consolidate_on_compact": true }');
+  const flush = () => new Promise(r => setTimeout(r, 30));
+  await flush(); // prime the event subscription
+
+  ctx.session.context = async () => [{ type: 'compaction', status: 'completed', reason: 'auto', summary: 'SUMMARY X' }];
+  ctx.event.push({ type: 'session.compacted', data: { sessionID: 's1' } });
+  ctx.event.push({ type: 'session.compacted', data: { sessionID: 's1' } });
+  await flush();
+  assert.equal(ctx.session.prompted.length, 1, 'rapid duplicate events collapse to one consolidation');
+  assert.equal(ctx.session.prompted[0].sessionID, 's1');
+  assert.equal(ctx.session.prompted[0].delivery, 'queue');
+  assert.ok(ctx.session.prompted[0].text.includes('SUMMARY X'), 'must seed from the compaction summary');
+
+  ctx.session.context = async () => [{ type: 'compaction', status: 'completed', reason: 'manual', summary: 'MANUAL' }];
+  ctx.event.push({ type: 'session.compacted', data: { sessionID: 's2' } });
+  await flush();
+  assert.equal(ctx.session.prompted.length, 1, 'manual compaction must not consolidate');
+});
+
+await test('setupV2 returns a cleanup that aborts the consolidation subscription', async () => {
+  const ctx = makeFakeV2Ctx();
+  const cleanup = await __core.setupV2(ctx);
+  assert.equal(typeof cleanup, 'function', 'setupV2 must return a cleanup function');
+  const signal = ctx.event._signal;
+  assert.ok(signal instanceof AbortSignal, 'subscribe must receive an AbortSignal');
+  assert.equal(signal.aborted, false, 'signal starts unaborted');
+  cleanup();
+  assert.equal(signal.aborted, true, 'cleanup must abort the subscription');
+});
+
+await test('root index.mjs and tui.mjs shims re-export the dual-entrypoint plugins', async () => {
+  const serverShim = await import('../index.mjs');
+  assert.equal(serverShim.default.id, 'ocl-memory');
+  assert.equal(typeof serverShim.default.setup, 'function', 'V2 calls setup');
+  assert.equal(typeof serverShim.default.server, 'function', 'V1 calls server');
+  const tuiShim = await import('../tui.mjs');
+  assert.equal(tuiShim.default.id, 'ocl-memory-tui');
+  assert.equal(typeof tuiShim.default.setup, 'function', 'V2 calls setup');
+  assert.equal(typeof tuiShim.default.tui, 'function', 'V1 calls tui');
 });
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);

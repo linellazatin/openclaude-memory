@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-10-17
+
+### Added
+
+- Dual OpenCode V1/V2 support from a single set of entrypoints. The server plugin now default-exports `{ id, setup, server }` (V1 calls `server`, V2 calls `setup`); the TUI plugin exports `{ id, setup, tui }`. Floor version remains OpenCode 1.18.29; verified through 2.0.31.
+- Root `index.mjs` / `tui.mjs` re-export shims so a local checkout referenced by directory path loads under V2 (which resolves `<dir>/index.mjs` and `<dir>/tui.mjs`, not the directory's `package.json` exports).
+- V2 tool registration via `ctx.tool.transform` with object JSON Schema input, `options: { codemode: false }` for V1-parity function-tool exposure, and `{ content }` result wrapping. Memory/rules injection via `ctx.session.hook("context")` SystemParts; cache invalidation via `ctx.tool.hook("execute.after")`.
+- V2 skill, command, and compaction hooks (`ctx.skill.transform`, `ctx.command.transform`, `ctx.session.hook("compaction")`).
+- V2 TUI browser (`setup`) using promise dialogs and a `ctrl+alt+m` keymap layer, alongside the byte-identical V1 `tui` callback interface.
+
+### Changed
+
+- `consolidate_on_compact` under V2 is driven by a `session.compacted` event subscription and enqueues an additional consolidation prompt; V2 has no native-continuation suppression, so it cannot replace the running loop as it does under V1.
+- The V2 `setup` entrypoint now returns a cleanup that aborts the consolidation subscription, so a config-triggered plugin reload does not leave a stale loop that double-consolidates alongside the new one.
+
+### Tests
+
+- 128 smoke tests plus a V2 fake-context seam (`__core.setupV2`) and promise-dialog TUI coverage.
+- Host suites split by major: `npm run test:host:v1` (OpenCode 1.18.x) and `npm run test:host:v2` (OpenCode 2.0.31).
+
 ## [0.6.7] - 2026-10-03
 
 ### Fixed

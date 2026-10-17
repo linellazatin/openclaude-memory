@@ -17,6 +17,12 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 > </div>
 
 >
+> ## v0.7.0: OpenCode V1 + V2 dual support
+> - One plugin now serves both OpenCode majors from a single set of entrypoints (V1 `server`/`tui` hooks, V2 `setup`), with floor version 1.18.29.
+> - V2 tools register via `ctx.tool.transform` (object JSON Schema, `codemode: false`), injection via `ctx.session.hook("context")`, and the TUI browser via promise dialogs under a `ctrl+alt+m` keymap layer.
+> - Under V2, `consolidate_on_compact` enqueues an additional consolidation prompt on `session.compacted` (no native-continuation suppression exists).
+> - 126 smoke tests plus split host suites: `test:host:v1` (1.18.x) and `test:host:v2` (2.0.31).
+>
 > ## v0.6.7: request injection and flat-file safety
 > - Memory is attached to every model request; filesystem changes refresh the cache automatically.
 > - Automatic consolidation queues a `noReply` prompt without waiting on its own running session.
@@ -142,7 +148,26 @@ The TUI memory browser (`ctrl+alt+m`) follows `shared_dir` too — both plugins 
 
 ### Install
 
-Add to your `~/.config/opencode/opencode.json` (or `opencode.jsonc`) `plugin` array:
+Add to your `~/.config/opencode/opencode.json` (or `opencode.jsonc`) `plugin` array (V1) or `plugins` array (V2 — `plugin` is still accepted as a deprecated alias):
+
+```jsonc
+{
+  "plugins": [
+    "@openlines/openclaude-memory"
+  ]
+}
+```
+**Via local path (development — works without publishing):**
+
+```jsonc
+{
+  "plugins": [
+    "/absolute/path/to/openclaude-memory"
+  ]
+}
+```
+
+The TUI plugin adds an interactive, arrow-key-navigable memory browser — no LLM turn required. Under OpenCode V2 it loads automatically alongside the server plugin (via the package's `./tui` export), so no extra step is needed. Under OpenCode V1, register it in `~/.config/opencode/tui.jsonc`:
 
 ```jsonc
 {
@@ -161,26 +186,7 @@ Add to your `~/.config/opencode/opencode.json` (or `opencode.jsonc`) `plugin` ar
 }
 ```
 
-The TUI plugin adds an interactive, arrow-key-navigable memory browser — no LLM turn required. Register to `~/.config/opencode/tui.jsonc`.
-
-```jsonc
-{
-  "plugin": [
-    "@openlines/openclaude-memory"
-  ]
-}
-```
-**Via local path (development — works without publishing):**
-
-```jsonc
-{
-  "plugin": [
-    "/absolute/path/to/openclaude-memory"
-  ]
-}
-```
-
-Restart opencode to load the updated plugins and skill. `memory.jsonc` is created automatically; the empty memory index is injected immediately and written to disk on the first locked mutation. The server lifecycle has been verified on OpenCode 1.18.34 with a local fake model; TUI API contracts and mutation behavior are covered separately.
+Restart opencode to load the updated plugins and skill. `memory.jsonc` is created automatically; the empty memory index is injected immediately and written to disk on the first locked mutation. The server lifecycle has been verified on OpenCode 1.18.34 (V1) and 2.0.31 (V2) with a local fake model; TUI API contracts and mutation behavior are covered separately.
 
 Once installed:
 
@@ -198,7 +204,7 @@ See [System Compatibility](docs/architecture.md#system-compatibility) for suppor
 
 ## Verification
 
-Run `npm test` for smoke tests and two real concurrent OpenCode writers. Run `npm run test:host` with `opencode` installed for the isolated real-server check; it uses a local fake model and temporary memory storage. To check the sibling implementation, run `node tests/shared-store-test.mjs /absolute/path/to/openpi-memory/extensions/memory-core.mjs`. Syntax-check each `.opencode/plugins/*.mjs` and `tests/*.mjs` file with `node --check`.
+Run `npm test` for smoke tests and two real concurrent OpenCode writers. Run `npm run test:host:v2` with `opencode` 2.0.x installed for the real V2 server check, and `npm run test:host:v1` with a 1.18.x binary on `OPENCODE_BIN` for the real V1 server check; both use a local fake model and temporary memory storage. To check the sibling implementation, run `node tests/shared-store-test.mjs /absolute/path/to/openpi-memory/extensions/memory-core.mjs`. Syntax-check each `.opencode/plugins/*.mjs` and `tests/*.mjs` file with `node --check`.
 
 ## License
 

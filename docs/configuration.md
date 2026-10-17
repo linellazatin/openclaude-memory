@@ -92,7 +92,9 @@ The cap exists to keep per-turn token overhead bounded. At the default 300 lines
   // so other tools can read/write the same files. This file always stays local.
   "shared_dir": false,
   // consolidate_on_compact: true = run a consolidation pass after automatic
-  // compaction instead of opencode's default "continue" message.
+  // compaction instead of opencode's default "continue" message. Under OpenCode
+  // V2 there is no native-continuation suppression, so this enqueues an
+  // additional consolidation prompt rather than replacing the running loop.
   "consolidate_on_compact": false
 }
 ```
@@ -105,7 +107,7 @@ Change `inject_every_n_turns` to tune the forced disk-refresh interval in model 
 
 Change `"shared_dir"` to `true` to move `MEMORY.md` and topic files to `~/.agents/memory/` — see [Cross-tool shared memory](shared-directory.md).
 
-Change `"consolidate_on_compact"` to `true` to run consolidation automatically after automatic compaction — see [Consolidation](../README.md#consolidation) in the README.
+Change `"consolidate_on_compact"` to `true` to run consolidation automatically after automatic compaction — see [Consolidation](../README.md#consolidation) in the README. Under OpenCode V2, consolidation enqueues an additional prompt after the `session.compacted` event because V2 has no native-continuation suppression; the running loop still resumes normally.
 
 The plugin renders non-empty behavioral rule arrays under `## Memory Rules` on every model request. Malformed JSONC or config with no non-empty behavioral arrays falls back to raw text, including scalar settings. `memory.jsonc` is the single source of truth for persist rules.
 

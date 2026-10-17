@@ -14,6 +14,11 @@ const MAX_BYTES = 50 * 1024;
 // whole 50 KB injection budget.
 const MAX_SUMMARY_LENGTH = 500;
 
+// Skills directory (absolute path) shared by the V1 `config` hook and the V2
+// skill registration.
+const skillsDir = new URL('../../skills', import.meta.url).pathname;
+const skillPath = path.join(skillsDir, 'memory', 'SKILL.md');
+
 const CONSOLIDATION_PROMPT = `Review the current conversation for facts, decisions, or discoveries that match the "always_persist" rules in ${MEMORY_CONFIG} but have not yet been written to memory. For each one found, call write_memory with an appropriate topic, content, summary, and pin value.
 
 Then write or update a topic named "OCL Last Session Recap" (toSlug of that name is exactly ocl-last-session-recap.md — use this topic string verbatim so repeated consolidations update ONE recap instead of creating duplicates) summarizing what was accomplished this session, using mode: "replace" so it always reflects only the most recent session. Do not pin this entry — it is meant to be overwritten every session.
@@ -82,6 +87,80 @@ async function getCache(forceRefresh = false) {
 
 function invalidateCache() {
   _cache = null;
+}
+
+// Pure rendering of the injected markdown from a resolved cache: the memory
+// block (with the shared-dir drift note), then the rules block. Returns string
+// parts in insertion order. Shared by the V1 system transform (pushes strings)
+// and the V2 context hook (wraps each in a SystemPart object).
+function buildInjectionParts(cache) {
+  const parts = [];
+  const { renderedRules, content, config, memDir, drift } = cache;
+  if (content) {
+    parts.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
+    if (config.sharedDir && drift && drift.fileCount > drift.indexedCount + DRIFT_NOTE_THRESHOLD) {
+      const missing = drift.fileCount - drift.indexedCount;
+      parts.push(`<!-- MEMORY MAINTENANCE: ~${missing} topic file(s) exist in the memory dir but are not in the index (possibly a co-tenant rewrote MEMORY.md). Run "/memory repair" to re-index them. -->`);
+    }
+  }
+  if (renderedRules) {
+    parts.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
+  }
+  return parts;
+}
+
+// The /memory command template shared by V1 (`config` hooks it as `template`,
+// with `command.execute.before` substituting stale paths + arguments) and V2
+// (the command `execute` builds it with fresh paths and substitutes $ARGUMENTS).
+function buildCommandTemplate(activeDir, activeIndex) {
+  return `Memory dir: ${activeDir}
+Memory index: ${activeIndex}
+
+Arguments: $ARGUMENTS
+
+## No arguments: show index
+
+Read ${activeIndex}. Display each entry as a table with columns: Topic (name only — no markdown links, no filenames), Date, Pinned (yes/no), Stale (yes/no). List all .md files in ${activeDir}. Do not write anything.
+
+After listing, append this legend:
+Tip: /memory <text> to store  |  /memory pin <topic> to pin  |  /memory unpin <topic> to unpin  |  /memory remove <topic> to remove  |  /memory consolidate to consolidate this session  |  /memory repair to re-index orphaned files
+
+## Arguments start with "remove ": remove an index entry
+
+The text after "remove " is the topic to find. Call the remove_memory tool:
+  remove_memory({ topic: "<the text after 'remove '>" })
+
+The tool will refuse if the entry is pinned and report the reason.
+
+## Arguments start with "pin ": pin an entry
+
+The text after "pin " is the topic to find. Call the pin_memory tool:
+  pin_memory({ topic: "<the text after 'pin '>", pin: true })
+
+## Arguments start with "unpin ": unpin an entry
+
+The text after "unpin " is the topic to find. Call the pin_memory tool:
+  pin_memory({ topic: "<the text after 'unpin '>", pin: false })
+
+## Arguments are exactly "consolidate": consolidate memory from this session
+
+${CONSOLIDATION_PROMPT}
+
+## Arguments are exactly "repair": re-index orphaned topic files
+
+Call the repair_memory tool with no arguments:
+  repair_memory({})
+
+It additively re-indexes any .md topic file that exists in the memory dir but is missing from ${activeIndex} (marking recovered entries [stale?]), never deletes or reorders existing entries, and skips topics you intentionally removed (recorded in the dir's .ocl-removed list). Report how many were re-indexed.
+
+## Arguments provided (not starting with "pin ", "unpin ", or "remove ", and not exactly "consolidate" or "repair"): store a memory
+
+Treat the arguments as a fact or note to persist. Decide the topic, a slug filename, a one-line summary, and whether the topic is permanent (hardware, user identity, core workflows = pin it). Then call the write_memory tool:
+  write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false>, mode: "append" })
+
+The tool creates a new topic file or appends to an existing one, and updates the MEMORY.md index automatically.
+
+Any text including single words is treated literally as content to store. Do not interpret "show", "list", or similar words as subcommands unless the full argument starts with "pin ", "unpin ", or "remove ", or is exactly "consolidate" or "repair".`;
 }
 
 // Transforms memory.jsonc content into markdown for agent injection.
@@ -400,8 +479,11 @@ const BUSY_MESSAGE = 'Error: memory store is busy (another tool or process holds
 // false positives from transient in-flight writes.
 const DRIFT_NOTE_THRESHOLD = 5;
 
-const tools = {
-  write_memory: {
+// Flat V1 args maps + descriptions, shared by both adapters. V1 consumes these
+// verbatim; the V2 adapter converts `args` to an object schema (Task 4).
+const TOOL_SPECS = [
+  {
+    name: 'write_memory',
     description: 'Write or update a memory topic. Creates a new topic file or appends to an existing one. Updates the MEMORY.md index automatically. Use this instead of raw Write/Edit tools for all memory operations.',
     args: {
       topic:   { type: 'string', description: 'Topic name, e.g. "PostgreSQL Setup" or "Homelab Server"' },
@@ -410,277 +492,459 @@ const tools = {
       pin:     { type: 'boolean', description: 'Pin this entry so it is never a cleanup candidate', default: false },
       mode:    { type: 'string', enum: ['append', 'replace'], description: 'append (default): add content under a new date heading. replace: overwrite the body, keeping frontmatter and advancing last_updated.', default: 'append' },
     },
-    async execute(args) {
-      const { topic, content, summary, pin, mode = 'append' } = args;
-      if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
-      if (typeof content !== 'string') return 'Error: content is required and must be a string.';
-      if (typeof summary !== 'string') return 'Error: summary is required and must be a string.';
-      // Sanitize the topic up front so filename matching, frontmatter name, and
-      // the index line all use the SAME clean value (a raw `]` in the name
-      // would otherwise break parseIndexLine on read-back). A topic of only
-      // metacharacters sanitizes to empty -> treat as missing.
-      const cleanTopic = sanitizeIndexField(topic).trim();
-      if (!cleanTopic) return 'Error: topic is required and must be a non-empty string.';
-      // Collapse to one clean line and cap length (openpi-memory parity) BEFORE
-      // any use, so the frontmatter description, the index line, and the
-      // returned Entry line all carry the SAME summary value.
-      const cleanSummary = sanitizeIndexField(summary).replace(/\s+/g, ' ').trim().slice(0, MAX_SUMMARY_LENGTH);
-      const pinBool = pin === true || pin === 'true';
-
-      const { config } = await getCache();
-      const memDir = getMemoryDir(config);
-      const memIndex = getMemoryIndex(config);
-      ensureMemoryDir(memDir);
-
-      try {
-        return await withLock(memDir, async () => {
-          // Read index once — reuse for topic-name lookup and upsert
-          const rawIndex = fs.existsSync(memIndex)
-            ? readStoreFileSync(memIndex)
-            : INITIAL_MEMORY;
-
-          // Check if an existing index entry matches this topic name — use its filename if so
-          let filename = toSlug(cleanTopic) + '.md';
-          // A topic with no slug-formable characters (e.g. "!!!") would produce
-          // ".md" — reject cleanly rather than write a file the read-back guard
-          // (isSafeFilename rejects leading-dot names) would silently orphan.
-          if (!isSafeFilename(filename)) {
-            return 'Error: topic must contain at least one letter or digit to form a valid filename.';
-          }
-          let matchedExisting = false;
-          for (const line of rawIndex.split('\n')) {
-            const parsed = parseIndexLine(line);
-            if (parsed && parsed.name.toLowerCase() === cleanTopic.toLowerCase()) {
-              if (!isSafeFilename(parsed.filename)) {
-                return `Entry has an unsafe filename (${parsed.filename}) and was not modified. This may indicate a corrupted index — inspect it manually.`;
-              }
-              filename = parsed.filename;
-              matchedExisting = true;
-              break;
-            }
-          }
-
-          // Genuinely new topic (no existing entry matched by name) whose slug
-          // collides with an unrelated file already on disk — bump a numeric
-          // suffix instead of silently sharing/overwriting that file's content.
-          if (!matchedExisting) {
-            const base = filename.replace(/\.md$/, '');
-            let n = 2;
-            const removedSet = readRemovedList(memDir);
-            // A tombstoned file (a topic the user deliberately removed but whose
-            // file we kept) is RECLAIMED by a fresh write of that topic — not
-            // bumped like an unrelated slug collision. removeFromRemovedList()
-            // below clears the tombstone. Only genuinely-unrelated existing files
-            // force a numeric suffix.
-            while (fs.existsSync(path.join(memDir, filename))) {
-              const candidate = path.join(memDir, filename);
-              if (removedSet.has(filename) && isRegularFile(candidate)
-                && readFrontmatter(candidate).name.toLowerCase() === cleanTopic.toLowerCase()) break;
-              filename = `${base}-${n}.md`;
-              n++;
-            }
-          }
-          const topicPath = path.join(memDir, filename);
-          const previous = fs.existsSync(topicPath) ? readStoreFileSync(topicPath) : null;
-          const isNew = previous === null;
-          const now = nowIso();
-          const match = previous?.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
-          let fm = match ? match[1].replace(/\r\n/g, '\n') : 'metadata:\n  node_type: memory';
-          const fields = { name: JSON.stringify(cleanTopic), description: JSON.stringify(cleanSummary), last_updated: now };
-          if (!/^created:/m.test(fm)) fields.created = now;
-          for (const [key, value] of Object.entries(fields)) {
-            const re = new RegExp(`^${key}:.*$`, 'm');
-            fm = re.test(fm) ? fm.replace(re, () => `${key}: ${value}`) : fm + `\n${key}: ${value}`;
-          }
-          const oldBody = match ? previous.slice(match[0].length) : previous || '';
-          const body = isNew || mode === 'replace' ? '\n' + content + '\n' : oldBody + `\n## ${now}\n\n${content}\n`;
-          const wasRemoved = readRemovedList(memDir).has(filename);
-          let indexWritten = false;
-          try {
-            atomicWriteFileSync(topicPath, `---\n${fm}\n---\n${body}`);
-            let lines = upsertIndexLine(rawIndex.split('\n'), filename, cleanTopic, cleanSummary, pinBool);
-            lines = maintainIndex(lines, config, memDir);
-            atomicWriteFileSync(memIndex, lines.join('\n'));
-            indexWritten = true;
-            removeFromRemovedList(memDir, filename);
-          } catch (error) {
-            try {
-              if (indexWritten) atomicWriteFileSync(memIndex, rawIndex);
-              if (previous !== null) atomicWriteFileSync(topicPath, previous);
-              else if (fs.existsSync(topicPath)) fs.unlinkSync(topicPath);
-              if (wasRemoved) addToRemovedList(memDir, filename);
-            } catch (rollbackError) {
-              throw new AggregateError([error, rollbackError], `Memory update and rollback failed; inspect ${topicPath} and ${memIndex}.`);
-            }
-            throw error;
-          } finally { invalidateCache(); }
-
-          return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${memIndex}\nEntry: [${cleanTopic}](${filename}) ${nowIso()} -- ${cleanSummary}`;
-        }, { strict: config.sharedDir });
-      } catch (e) {
-        if (e instanceof LockContendedError) return BUSY_MESSAGE;
-        throw e;
-      }
-    },
   },
-
-  remove_memory: {
+  {
+    name: 'remove_memory',
     description: 'Remove a topic entry from the MEMORY.md index. The topic file on disk is preserved. Pinned entries cannot be removed.',
     args: {
       topic: { type: 'string', description: 'Topic name or partial filename to search for (case-insensitive)' },
     },
-    async execute(args) {
-      const { topic } = args;
-      if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
-      const search = topic.toLowerCase();
-
-      const { config } = await getCache();
-      const memDir = getMemoryDir(config);
-      const memIndex = getMemoryIndex(config);
-
-      if (!fs.existsSync(memIndex)) {
-        return 'No memory index found.';
-      }
-
-      try {
-        return await withLock(memDir, async () => {
-          const raw = readStoreFileSync(memIndex);
-          const lines = raw.split('\n');
-
-          const found = findIndexEntry(lines, search);
-          if (!found) {
-            return `No matching entry found for "${topic}".`;
-          }
-          if (found.ambiguous) {
-            return `Multiple entries match "${topic}" — be more specific (exact names win over partial matches). Candidates: ${found.names.join(', ')}. Nothing was modified.`;
-          }
-          const { idx: foundIdx, parsed } = found;
-
-          if (!isSafeFilename(parsed.filename)) {
-            return `Entry has an unsafe filename (${parsed.filename}) and was not modified. This may indicate a corrupted index — inspect it manually.`;
-          }
-
-          if (lines.map(parseIndexLine).some(p => p && p.filename === parsed.filename && hasIndexFlag(p.rest, '[pin]'))) {
-            return `Entry is pinned and cannot be removed. Use pin_memory with pin: false to unpin it first.`;
-          }
-
-          const removedLine = lines[foundIdx];
-          const remaining = lines.filter(line => parseIndexLine(line)?.filename !== parsed.filename);
-          const maintained = maintainIndex(remaining, config, memDir);
-
-          addToRemovedList(memDir, parsed.filename); // tombstone: repair must not resurrect this
-          atomicWriteFileSync(memIndex, maintained.join('\n'));
-          invalidateCache();
-
-          const topicFile = path.join(memDir, parsed.filename);
-          const fileNote = fs.existsSync(topicFile)
-            ? `Topic file ${parsed.filename} still exists on disk (marked as intentionally removed — /memory repair will skip it).`
-            : `Topic file ${parsed.filename} was not found on disk.`;
-
-          return `Index entry removed: ${removedLine.trim()}\n${fileNote}`;
-        }, { strict: config.sharedDir });
-      } catch (e) {
-        if (e instanceof LockContendedError) return BUSY_MESSAGE;
-        throw e;
-      }
-    },
   },
-
-  pin_memory: {
+  {
+    name: 'pin_memory',
     description: 'Pin or unpin a memory index entry. Pinned entries are never flagged as stale and cannot be removed.',
     args: {
       topic: { type: 'string', description: 'Topic name or partial filename to search for (case-insensitive)' },
       pin:   { type: 'boolean', description: 'true to pin, false to unpin' },
     },
-    async execute(args) {
-      const { topic, pin } = args;
-      if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
-      const search = topic.toLowerCase();
-      const pinBool = pin === true || pin === 'true';
-
-      const { config } = await getCache();
-      const memDir = getMemoryDir(config);
-      const memIndex = getMemoryIndex(config);
-
-      if (!fs.existsSync(memIndex)) {
-        return 'No memory index found.';
-      }
-
-      try {
-        return await withLock(memDir, async () => {
-          const raw = readStoreFileSync(memIndex);
-          const lines = raw.split('\n');
-
-          const found = findIndexEntry(lines, search);
-          if (!found) {
-            return `No matching entry found for "${topic}".`;
-          }
-          if (found.ambiguous) {
-            return `Multiple entries match "${topic}" — be more specific (exact names win over partial matches). Candidates: ${found.names.join(', ')}. Nothing was modified.`;
-          }
-          const { idx: foundIdx, parsed } = found;
-
-          if (!isSafeFilename(parsed.filename)) return 'Entry has an unsafe filename and was not modified.';
-          const line = lines[foundIdx];
-          const alreadyPinned = lines.map(parseIndexLine).some(p => p && p.filename === parsed.filename && hasIndexFlag(p.rest, '[pin]'));
-
-          if (pinBool && alreadyPinned) return `Already pinned: ${line.trim()}`;
-          if (!pinBool && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
-
-          const before = line.trim();
-          for (let i = 0; i < lines.length; i++) {
-            const entry = parseIndexLine(lines[i]);
-            if (!entry || entry.filename !== parsed.filename) continue;
-            const rest = pinBool
-              ? (hasIndexFlag(entry.rest, '[pin]') ? entry.rest : ' [pin]' + entry.rest)
-              : (hasIndexFlag(entry.rest, '[pin]') ? entry.rest.replace(/\s*\[pin\]/, '') : entry.rest);
-            lines[i] = entry.prefix + entry.name + entry.mid + rest;
-          }
-          const after = lines[foundIdx].trim();
-
-          const maintained = maintainIndex(lines, config, memDir);
-
-          atomicWriteFileSync(memIndex, maintained.join('\n'));
-          invalidateCache();
-
-          return `${pinBool ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
-        }, { strict: config.sharedDir });
-      } catch (e) {
-        if (e instanceof LockContendedError) return BUSY_MESSAGE;
-        throw e;
-      }
-    },
   },
-
-  repair_memory: {
+  {
+    name: 'repair_memory',
     description: 'Re-index topic files that exist in the memory directory but are missing from MEMORY.md (additive only — never deletes or reorders). Recovered entries are marked [stale?]. Skips topics intentionally removed via remove_memory (tracked in .ocl-removed), so deliberate removals are never resurrected. Use when shared_dir co-tenancy drift leaves topics undiscoverable.',
     args: {},
-    async execute() {
-      const { config } = await getCache();
-      const memDir = getMemoryDir(config);
-      const memIndex = getMemoryIndex(config);
-      try {
-        return await withLock(memDir, async () => {
-          const { added, alreadyIndexed } = repairMemoryIndex({ memDir, memIndex });
-          invalidateCache();
-          if (added === 0) {
-            return `Index already consistent — ${alreadyIndexed} topic(s) indexed, no orphaned topic files found.`;
-          }
-          return `Re-indexed ${added} orphaned topic file(s) as [stale?]. Index now lists ${alreadyIndexed + added} entr${alreadyIndexed + added === 1 ? 'y' : 'ies'}.`;
-        }, { strict: config.sharedDir });
-      } catch (e) {
-        if (e instanceof LockContendedError) return BUSY_MESSAGE;
-        throw e;
-      }
-    },
   },
+];
+
+// Named executors. Each returns a single string (V1's tool result). The V2
+// adapter (Task 6) wraps the string in { content }, preserving the invariant
+// that executors never know which adapter called them.
+async function write_memory(args) {
+  const { topic, content, summary, pin, mode = 'append' } = args;
+  if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
+  if (typeof content !== 'string') return 'Error: content is required and must be a string.';
+  if (typeof summary !== 'string') return 'Error: summary is required and must be a string.';
+  // Sanitize the topic up front so filename matching, frontmatter name, and
+  // the index line all use the SAME clean value (a raw `]` in the name
+  // would otherwise break parseIndexLine on read-back). A topic of only
+  // metacharacters sanitizes to empty -> treat as missing.
+  const cleanTopic = sanitizeIndexField(topic).trim();
+  if (!cleanTopic) return 'Error: topic is required and must be a non-empty string.';
+  // Collapse to one clean line and cap length (openpi-memory parity) BEFORE
+  // any use, so the frontmatter description, the index line, and the
+  // returned Entry line all carry the SAME summary value.
+  const cleanSummary = sanitizeIndexField(summary).replace(/\s+/g, ' ').trim().slice(0, MAX_SUMMARY_LENGTH);
+  const pinBool = pin === true || pin === 'true';
+
+  const { config } = await getCache();
+  const memDir = getMemoryDir(config);
+  const memIndex = getMemoryIndex(config);
+  ensureMemoryDir(memDir);
+
+  try {
+    return await withLock(memDir, async () => {
+      // Read index once — reuse for topic-name lookup and upsert
+      const rawIndex = fs.existsSync(memIndex)
+        ? readStoreFileSync(memIndex)
+        : INITIAL_MEMORY;
+
+      // Check if an existing index entry matches this topic name — use its filename if so
+      let filename = toSlug(cleanTopic) + '.md';
+      // A topic with no slug-formable characters (e.g. "!!!") would produce
+      // ".md" — reject cleanly rather than write a file the read-back guard
+      // (isSafeFilename rejects leading-dot names) would silently orphan.
+      if (!isSafeFilename(filename)) {
+        return 'Error: topic must contain at least one letter or digit to form a valid filename.';
+      }
+      let matchedExisting = false;
+      for (const line of rawIndex.split('\n')) {
+        const parsed = parseIndexLine(line);
+        if (parsed && parsed.name.toLowerCase() === cleanTopic.toLowerCase()) {
+          if (!isSafeFilename(parsed.filename)) {
+            return `Entry has an unsafe filename (${parsed.filename}) and was not modified. This may indicate a corrupted index — inspect it manually.`;
+          }
+          filename = parsed.filename;
+          matchedExisting = true;
+          break;
+        }
+      }
+
+      // Genuinely new topic (no existing entry matched by name) whose slug
+      // collides with an unrelated file already on disk — bump a numeric
+      // suffix instead of silently sharing/overwriting that file's content.
+      if (!matchedExisting) {
+        const base = filename.replace(/\.md$/, '');
+        let n = 2;
+        const removedSet = readRemovedList(memDir);
+        // A tombstoned file (a topic the user deliberately removed but whose
+        // file we kept) is RECLAIMED by a fresh write of that topic — not
+        // bumped like an unrelated slug collision. removeFromRemovedList()
+        // below clears the tombstone. Only genuinely-unrelated existing files
+        // force a numeric suffix.
+        while (fs.existsSync(path.join(memDir, filename))) {
+          const candidate = path.join(memDir, filename);
+          if (removedSet.has(filename) && isRegularFile(candidate)
+            && readFrontmatter(candidate).name.toLowerCase() === cleanTopic.toLowerCase()) break;
+          filename = `${base}-${n}.md`;
+          n++;
+        }
+      }
+      const topicPath = path.join(memDir, filename);
+      const previous = fs.existsSync(topicPath) ? readStoreFileSync(topicPath) : null;
+      const isNew = previous === null;
+      const now = nowIso();
+      const match = previous?.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+      let fm = match ? match[1].replace(/\r\n/g, '\n') : 'metadata:\n  node_type: memory';
+      const fields = { name: JSON.stringify(cleanTopic), description: JSON.stringify(cleanSummary), last_updated: now };
+      if (!/^created:/m.test(fm)) fields.created = now;
+      for (const [key, value] of Object.entries(fields)) {
+        const re = new RegExp(`^${key}:.*$`, 'm');
+        fm = re.test(fm) ? fm.replace(re, () => `${key}: ${value}`) : fm + `\n${key}: ${value}`;
+      }
+      const oldBody = match ? previous.slice(match[0].length) : previous || '';
+      const body = isNew || mode === 'replace' ? '\n' + content + '\n' : oldBody + `\n## ${now}\n\n${content}\n`;
+      const wasRemoved = readRemovedList(memDir).has(filename);
+      let indexWritten = false;
+      try {
+        atomicWriteFileSync(topicPath, `---\n${fm}\n---\n${body}`);
+        let lines = upsertIndexLine(rawIndex.split('\n'), filename, cleanTopic, cleanSummary, pinBool);
+        lines = maintainIndex(lines, config, memDir);
+        atomicWriteFileSync(memIndex, lines.join('\n'));
+        indexWritten = true;
+        removeFromRemovedList(memDir, filename);
+      } catch (error) {
+        try {
+          if (indexWritten) atomicWriteFileSync(memIndex, rawIndex);
+          if (previous !== null) atomicWriteFileSync(topicPath, previous);
+          else if (fs.existsSync(topicPath)) fs.unlinkSync(topicPath);
+          if (wasRemoved) addToRemovedList(memDir, filename);
+        } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], `Memory update and rollback failed; inspect ${topicPath} and ${memIndex}.`);
+        }
+        throw error;
+      } finally { invalidateCache(); }
+
+      return `Memory ${isNew ? 'created' : 'updated'}: ${topicPath}\nIndex updated: ${memIndex}\nEntry: [${cleanTopic}](${filename}) ${nowIso()} -- ${cleanSummary}`;
+    }, { strict: config.sharedDir });
+  } catch (e) {
+    if (e instanceof LockContendedError) return BUSY_MESSAGE;
+    throw e;
+  }
+}
+
+async function remove_memory(args) {
+  const { topic } = args;
+  if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
+  const search = topic.toLowerCase();
+
+  const { config } = await getCache();
+  const memDir = getMemoryDir(config);
+  const memIndex = getMemoryIndex(config);
+
+  if (!fs.existsSync(memIndex)) {
+    return 'No memory index found.';
+  }
+
+  try {
+    return await withLock(memDir, async () => {
+      const raw = readStoreFileSync(memIndex);
+      const lines = raw.split('\n');
+
+      const found = findIndexEntry(lines, search);
+      if (!found) {
+        return `No matching entry found for "${topic}".`;
+      }
+      if (found.ambiguous) {
+        return `Multiple entries match "${topic}" — be more specific (exact names win over partial matches). Candidates: ${found.names.join(', ')}. Nothing was modified.`;
+      }
+      const { idx: foundIdx, parsed } = found;
+
+      if (!isSafeFilename(parsed.filename)) {
+        return `Entry has an unsafe filename (${parsed.filename}) and was not modified. This may indicate a corrupted index — inspect it manually.`;
+      }
+
+      if (lines.map(parseIndexLine).some(p => p && p.filename === parsed.filename && hasIndexFlag(p.rest, '[pin]'))) {
+        return `Entry is pinned and cannot be removed. Use pin_memory with pin: false to unpin it first.`;
+      }
+
+      const removedLine = lines[foundIdx];
+      const remaining = lines.filter(line => parseIndexLine(line)?.filename !== parsed.filename);
+      const maintained = maintainIndex(remaining, config, memDir);
+
+      addToRemovedList(memDir, parsed.filename); // tombstone: repair must not resurrect this
+      atomicWriteFileSync(memIndex, maintained.join('\n'));
+      invalidateCache();
+
+      const topicFile = path.join(memDir, parsed.filename);
+      const fileNote = fs.existsSync(topicFile)
+        ? `Topic file ${parsed.filename} still exists on disk (marked as intentionally removed — /memory repair will skip it).`
+        : `Topic file ${parsed.filename} was not found on disk.`;
+
+      return `Index entry removed: ${removedLine.trim()}\n${fileNote}`;
+    }, { strict: config.sharedDir });
+  } catch (e) {
+    if (e instanceof LockContendedError) return BUSY_MESSAGE;
+    throw e;
+  }
+}
+
+async function pin_memory(args) {
+  const { topic, pin } = args;
+  if (typeof topic !== 'string' || !topic.trim()) return 'Error: topic is required and must be a non-empty string.';
+  const search = topic.toLowerCase();
+  const pinBool = pin === true || pin === 'true';
+
+  const { config } = await getCache();
+  const memDir = getMemoryDir(config);
+  const memIndex = getMemoryIndex(config);
+
+  if (!fs.existsSync(memIndex)) {
+    return 'No memory index found.';
+  }
+
+  try {
+    return await withLock(memDir, async () => {
+      const raw = readStoreFileSync(memIndex);
+      const lines = raw.split('\n');
+
+      const found = findIndexEntry(lines, search);
+      if (!found) {
+        return `No matching entry found for "${topic}".`;
+      }
+      if (found.ambiguous) {
+        return `Multiple entries match "${topic}" — be more specific (exact names win over partial matches). Candidates: ${found.names.join(', ')}. Nothing was modified.`;
+      }
+      const { idx: foundIdx, parsed } = found;
+
+      if (!isSafeFilename(parsed.filename)) return 'Entry has an unsafe filename and was not modified.';
+      const line = lines[foundIdx];
+      const alreadyPinned = lines.map(parseIndexLine).some(p => p && p.filename === parsed.filename && hasIndexFlag(p.rest, '[pin]'));
+
+      if (pinBool && alreadyPinned) return `Already pinned: ${line.trim()}`;
+      if (!pinBool && !alreadyPinned) return `Already unpinned: ${line.trim()}`;
+
+      const before = line.trim();
+      for (let i = 0; i < lines.length; i++) {
+        const entry = parseIndexLine(lines[i]);
+        if (!entry || entry.filename !== parsed.filename) continue;
+        const rest = pinBool
+          ? (hasIndexFlag(entry.rest, '[pin]') ? entry.rest : ' [pin]' + entry.rest)
+          : (hasIndexFlag(entry.rest, '[pin]') ? entry.rest.replace(/\s*\[pin\]/, '') : entry.rest);
+        lines[i] = entry.prefix + entry.name + entry.mid + rest;
+      }
+      const after = lines[foundIdx].trim();
+
+      const maintained = maintainIndex(lines, config, memDir);
+
+      atomicWriteFileSync(memIndex, maintained.join('\n'));
+      invalidateCache();
+
+      return `${pinBool ? 'Pinned' : 'Unpinned'}.\nBefore: ${before}\nAfter:  ${after}`;
+    }, { strict: config.sharedDir });
+  } catch (e) {
+    if (e instanceof LockContendedError) return BUSY_MESSAGE;
+    throw e;
+  }
+}
+
+async function repair_memory() {
+  const { config } = await getCache();
+  const memDir = getMemoryDir(config);
+  const memIndex = getMemoryIndex(config);
+  try {
+    return await withLock(memDir, async () => {
+      const { added, alreadyIndexed } = repairMemoryIndex({ memDir, memIndex });
+      invalidateCache();
+      if (added === 0) {
+        return `Index already consistent — ${alreadyIndexed} topic(s) indexed, no orphaned topic files found.`;
+      }
+      return `Re-indexed ${added} orphaned topic file(s) as [stale?]. Index now lists ${alreadyIndexed + added} entr${alreadyIndexed + added === 1 ? 'y' : 'ies'}.`;
+    }, { strict: config.sharedDir });
+  } catch (e) {
+    if (e instanceof LockContendedError) return BUSY_MESSAGE;
+    throw e;
+  }
+}
+
+// Executors keyed by tool name, shared by both adapters. V1 wraps these
+// unchanged; V2 wraps their string return in `{ content }`.
+const toolExecutors = { write_memory, remove_memory, pin_memory, repair_memory };
+
+// V1 adapter tool map: same flat args/descriptions, executors returning strings.
+const tools = Object.fromEntries(
+  TOOL_SPECS.map(({ name, description, args }) => [name, { description, args, execute: toolExecutors[name] }])
+);
+
+// Build a V2 JSON Schema object from a V1 flat args map. `required` lists every
+// key without a `default`; each property is the flat entry minus its `default`.
+// This is the inverse companion to the flat map — V1 needs the flat map, V2
+// needs the object schema, and mixing them up would make every arg `undefined`
+// (the 0.5.1 outage).
+function toObjectSchema(flatArgs) {
+  const properties = {};
+  const required = [];
+  for (const [key, entry] of Object.entries(flatArgs)) {
+    const { default: _default, ...rest } = entry;
+    properties[key] = rest;
+    if (!('default' in entry)) required.push(key);
+  }
+  return { type: 'object', properties, required, additionalProperties: false };
+}
+
+// V2 tool registration: convert each TOOL_SPECS entry into a V2 tool with an
+// object JSON Schema (toObjectSchema) and an executor that wraps the string
+// return in `{ content }`. `options: { codemode: false }` is required so these
+// surface as top-level function tools like V1 (verified in Phase 0): without
+// it they are only reachable through Code Mode's `execute` tool.
+async function registerV2Tools(ctx) {
+  await ctx.tool.transform((editor) => {
+    for (const spec of TOOL_SPECS) {
+      editor.add({
+        name: spec.name,
+        description: spec.description,
+        options: { codemode: false },
+        input: toObjectSchema(spec.args),
+        execute: async (input) => ({ content: await toolExecutors[spec.name](input) }),
+      });
+    }
+  });
+}
+
+// V2 injection + cache-invalidation hooks. The context hook mirrors the V1
+// system transform exactly, but wraps each rendered part in a SystemPart
+// object (`{ type: 'text', text }`) instead of pushing a bare string. The
+// execute.after hook invalidates the cache after any memory tool (including a
+// mutation by another plugin).
+async function registerV2Injection(ctx) {
+  await ctx.session.hook('context', async (e) => {
+    let cache = await getCache();
+    if (++_requestCount % cache.config.injectEveryNTurns === 0) cache = await getCache(true);
+    for (const part of buildInjectionParts(cache)) e.system.push({ type: 'text', text: part });
+  });
+  await ctx.tool.hook('execute.after', (e) => {
+    if (MEMORY_TOOL_NAMES.has(e.tool)) invalidateCache();
+  });
+}
+
+// V2 compaction hook — mirrors V1 `experimental.session.compacting`, injecting
+// the current memory index + rules into the compaction request as SystemParts.
+async function registerV2Compaction(ctx) {
+  await ctx.session.hook('compaction', async (e) => {
+    const { renderedRules, content } = await getCache(true);
+    if (content) e.system.push({ type: 'text', text: `## Global Memory (current index)\n\n${content}` });
+    if (renderedRules) e.system.push({ type: 'text', text: `## Memory Rules\n\n${renderedRules}` });
+  });
+}
+
+// V2 skill registration — embeds skills/memory/SKILL.md as a named skill.
+async function registerV2Skill(ctx) {
+  await ctx.skill.transform((editor) => {
+    let content;
+    try { content = fs.readFileSync(skillPath, 'utf8'); } catch { return; }
+    editor.add({
+      id: 'memory',
+      name: 'memory',
+      description: 'Read and write global persistent memory across opencode sessions',
+      path: skillPath,
+      content,
+    });
+  });
+}
+
+// V2 command registration — the /memory command. Unlike V1 (template +
+// command.execute.before), the path refresh and $ARGUMENTS substitution happen
+// inside `execute`, which then enqueues the rendered prompt.
+async function registerV2Command(ctx) {
+  await ctx.command.transform((editor) => {
+    editor.add({
+      name: 'memory',
+      description: '/memory → show index | /memory <text> → store | /memory pin <topic> → pin | /memory unpin <topic> → unpin | /memory remove <topic> → remove entry | /memory consolidate → consolidate session | /memory repair → re-index orphaned topic files',
+      execute: async ({ sessionID, prompt, delivery }) => {
+        const { config } = await getCache();
+        const memDir = getMemoryDir(config);
+        const activeIndex = getMemoryIndex(config);
+        const text = buildCommandTemplate(memDir, activeIndex).replaceAll('$ARGUMENTS', () => prompt?.text || '');
+        await ctx.session.prompt({ sessionID, text, delivery });
+      },
+    });
+  });
+}
+
+// V2 consolidate_on_compact. V1 used `experimental.compaction.autocontinue`,
+// which has no V2 equivalent. V2 emits a `session.compacted` event AFTER a
+// compaction completes, so we drive consolidation from an event subscription
+// instead of a request-time hook. Known V2 differences (documented in docs/):
+//  - There is no hook to suppress the native post-compaction continue, so
+//    consolidation is an ADDITIONAL queued prompt (delivery:'queue') rather
+//    than a replacement for the continue.
+//  - We recover auto-vs-manual from the just-written compaction message's
+//    `reason`, preserving V1's "auto only" gate.
+//  - A per-session cooldown collapses a consolidation loop that re-compacts.
+
+const CONSOLIDATION_COOLDOWN_MS = 60_000;
+
+// Latest completed compaction message, or null. Messages are a tagged union;
+// a compaction message has type:'compaction' and status:'completed'.
+function latestCompletedCompaction(messages) {
+  if (!Array.isArray(messages)) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.type === 'compaction' && m.status === 'completed' && (m.summary || m.reason)) return m;
+  }
+  return null;
+}
+
+// Event subscription. Gating on config happens per event so toggling
+// consolidate_on_compact takes effect without a restart. Returns a cleanup
+// that aborts the subscription, which V2 `setup` must return so the loop is
+// torn down on plugin unload/reload (otherwise a stale loop survives a
+// config-triggered reload and double-consolidates alongside the new one).
+function registerV2Consolidation(ctx) {
+  const seen = new Map(); // sessionID -> last consolidated epoch ms
+  const controller = new AbortController();
+  (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        try {
+          if (!event || event.type !== 'session.compacted') continue;
+          const sessionID = (event.data && event.data.sessionID) || event.sessionID;
+          if (!sessionID) continue;
+          const { config } = await getCache();
+          if (!config.consolidateOnCompact) continue;
+          if (Date.now() - (seen.get(sessionID) || 0) < CONSOLIDATION_COOLDOWN_MS) continue;
+          const messages = await ctx.session.context({ sessionID });
+          const compaction = latestCompletedCompaction(messages);
+          // V1 parity: only automatic compaction consolidates.
+          if (!compaction || compaction.reason === 'manual') continue;
+          seen.set(sessionID, Date.now());
+          const text = compaction.summary
+            ? buildCompactConsolidationPrompt(compaction.summary)
+            : CONSOLIDATION_PROMPT;
+          await ctx.session.prompt({ sessionID, text, delivery: 'queue' });
+        } catch { /* best-effort per event */ }
+      }
+    } catch { /* subscription closed/errored */ }
+  })();
+  return () => controller.abort();
+}
+
+// Test/adaptation seam. `setupV2` is the V2 adapter body (Tasks 6-9); tests
+// drive it with a fake context. `toObjectSchema` is the V2 schema builder.
+// Returns a cleanup that V2 runs on plugin unload.
+const setupV2 = async (ctx) => {
+  await registerV2Tools(ctx);
+  await registerV2Injection(ctx);
+  await registerV2Compaction(ctx);
+  await registerV2Skill(ctx);
+  await registerV2Command(ctx);
+  return registerV2Consolidation(ctx);
 };
+
+export const __core = { toObjectSchema, setupV2 };
 
 // --- Plugin export ---
 
-export default async (input) => {
+async function buildV1Hooks(input) {
   const client = input && input.client;
-  const skillsDir = new URL('../../skills', import.meta.url).pathname;
   let commandTemplate;
   let commandDir;
 
@@ -727,54 +991,7 @@ export default async (input) => {
       if (!config.command) config.command = {};
       config.command['memory'] = {
         description: '/memory → show index | /memory <text> → store | /memory pin <topic> → pin | /memory unpin <topic> → unpin | /memory remove <topic> → remove entry | /memory consolidate → consolidate session | /memory repair → re-index orphaned topic files',
-        template: `Memory dir: ${activeDir}
-Memory index: ${activeIndex}
-
-Arguments: $ARGUMENTS
-
-## No arguments: show index
-
-Read ${activeIndex}. Display each entry as a table with columns: Topic (name only — no markdown links, no filenames), Date, Pinned (yes/no), Stale (yes/no). List all .md files in ${activeDir}. Do not write anything.
-
-After listing, append this legend:
-Tip: /memory <text> to store  |  /memory pin <topic> to pin  |  /memory unpin <topic> to unpin  |  /memory remove <topic> to remove  |  /memory consolidate to consolidate this session  |  /memory repair to re-index orphaned files
-
-## Arguments start with "remove ": remove an index entry
-
-The text after "remove " is the topic to find. Call the remove_memory tool:
-  remove_memory({ topic: "<the text after 'remove '>" })
-
-The tool will refuse if the entry is pinned and report the reason.
-
-## Arguments start with "pin ": pin an entry
-
-The text after "pin " is the topic to find. Call the pin_memory tool:
-  pin_memory({ topic: "<the text after 'pin '>", pin: true })
-
-## Arguments start with "unpin ": unpin an entry
-
-The text after "unpin " is the topic to find. Call the pin_memory tool:
-  pin_memory({ topic: "<the text after 'unpin '>", pin: false })
-
-## Arguments are exactly "consolidate": consolidate memory from this session
-
-${CONSOLIDATION_PROMPT}
-
-## Arguments are exactly "repair": re-index orphaned topic files
-
-Call the repair_memory tool with no arguments:
-  repair_memory({})
-
-It additively re-indexes any .md topic file that exists in the memory dir but is missing from ${activeIndex} (marking recovered entries [stale?]), never deletes or reorders existing entries, and skips topics you intentionally removed (recorded in the dir's .ocl-removed list). Report how many were re-indexed.
-
-## Arguments provided (not starting with "pin ", "unpin ", or "remove ", and not exactly "consolidate" or "repair"): store a memory
-
-Treat the arguments as a fact or note to persist. Decide the topic, a slug filename, a one-line summary, and whether the topic is permanent (hardware, user identity, core workflows = pin it). Then call the write_memory tool:
-  write_memory({ topic: "<topic name>", content: "<the full fact or note>", summary: "<one-line summary>", pin: <true|false>, mode: "append" })
-
-The tool creates a new topic file or appends to an existing one, and updates the MEMORY.md index automatically.
-
-Any text including single words is treated literally as content to store. Do not interpret "show", "list", or similar words as subcommands unless the full argument starts with "pin ", "unpin ", or "remove ", or is exactly "consolidate" or "repair".`,
+        template: buildCommandTemplate(activeDir, activeIndex),
       };
       commandTemplate = config.command.memory.template;
       commandDir = activeDir;
@@ -805,17 +1022,7 @@ Any text including single words is treated literally as content to store. Do not
     'experimental.chat.system.transform': async (_input, output) => {
       let cache = await getCache();
       if (++_requestCount % cache.config.injectEveryNTurns === 0) cache = await getCache(true);
-      const { renderedRules, content, config, memDir, drift } = cache;
-      if (content) {
-        output.system.push(`## Global Memory\n\nThe following is your persistent memory index. It persists across all sessions. Topic files referenced here can be read on-demand for detail.\n\nMemory dir: ${memDir}\n\n${content}`);
-        if (config.sharedDir && drift && drift.fileCount > drift.indexedCount + DRIFT_NOTE_THRESHOLD) {
-          const missing = drift.fileCount - drift.indexedCount;
-          output.system.push(`<!-- MEMORY MAINTENANCE: ~${missing} topic file(s) exist in the memory dir but are not in the index (possibly a co-tenant rewrote MEMORY.md). Run "/memory repair" to re-index them. -->`);
-        }
-      }
-      if (renderedRules) {
-        output.system.push(`## Memory Rules\n\nThe following rules govern what to persist or avoid persisting to memory. Edit ${MEMORY_CONFIG} to customise.\n\n${renderedRules}`);
-      }
+      for (const part of buildInjectionParts(cache)) output.system.push(part);
     },
 
     'experimental.session.compacting': async (_input, output) => {
@@ -870,4 +1077,19 @@ Any text including single words is treated literally as content to store. Do not
       }
     },
   };
+}
+
+// V2 adapter entry point. Populated across Tasks 6-8 (tools, injection,
+// skills/commands/compaction) and wired together with setupV2 in Task 9.
+async function setup(ctx) {
+  return await setupV2(ctx);
+}
+
+// Dual-version default export. V1 (>=1.18.29) reads `server()` and calls it
+// with the plugin input; V2 reads `setup(ctx)` and calls it with the V2 context.
+// The foreign key is ignored by the other version (verified in Phase 0).
+export default {
+  id: 'ocl-memory',
+  setup,
+  server: (input) => buildV1Hooks(input),
 };

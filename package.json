@@ -1,6 +1,6 @@
 {
   "name": "@openlines/openclaude-memory",
-  "version": "0.6.7",
+  "version": "0.7.0",
   "description": "OPEN. CONFIGURABLE. Global persistent memory for opencode sessions via MEMORY.md injection (like our mother Claude Code).",
   "keywords": ["opencode-plugin", "opencode", "memory", "markdown"],
   "license": "MIT",
@@ -10,7 +10,8 @@
   },
   "scripts": {
     "test": "node tests/smoke-test.mjs && node tests/shared-store-test.mjs",
-    "test:host": "node tests/host-test.mjs"
+    "test:host:v1": "node tests/host-test.mjs",
+    "test:host:v2": "node tests/host-test-v2.mjs"
   },
   "type": "module",
   "main": "./.opencode/plugins/ocl-memory.mjs",

@@ -218,4 +218,92 @@ const tui = async (api) => {
 };
 
 export { parseIndex, setPin, removeEntry, readTopic, resolveActiveDir };
-export default { id: 'ocl-memory-tui', tui };
+
+// V2 TUI entry point. Promise-based dialog API replacing the V1 callback API.
+// Reuses the same pure helpers (resolveActiveDir, parseIndex, setPin,
+// removeEntry, readTopic) so the browser flow — list → actions → view /
+// pin / unpin / remove — is identical across versions.
+const setup = async (context) => {
+  async function showBrowser() {
+    try {
+      const { memDir, memIndex, sharedDir } = await resolveActiveDir();
+      const entries = parseIndex(memIndex);
+      context.ui.dialog.set({ size: 'large' });
+      const selected = await context.ui.dialog.select({
+        title:       `Memory (${entries.length} ${entries.length === 1 ? 'entry' : 'entries'})`,
+        placeholder: 'Filter by topic...',
+        options:     entries.map(e => ({
+          title:       `${e.name}${e.pinned ? ' [pin]' : ''}${e.stale ? ' [stale?]' : ''}`,
+          description: [e.summary, e.date].filter(Boolean).join('  '),
+          value:       e,
+        })),
+      });
+      if (selected) await showActions(selected, memDir, memIndex, sharedDir);
+    } catch (err) {
+      await context.ui.dialog.alert({ title: 'Memory', message: String(err.message || err) });
+    }
+  }
+
+  async function doMutation(action) {
+    try {
+      const result = await action();
+      if (typeof result === 'string') await context.ui.dialog.alert({ title: 'Memory', message: result });
+      else await showBrowser();
+    } catch (err) {
+      await context.ui.dialog.alert({ title: 'Memory', message: String(err.message || err) });
+    }
+  }
+
+  async function showActions(entry, memDir, memIndex, sharedDir) {
+    const action = await context.ui.dialog.select({
+      title:   entry.name,
+      options: [
+        { title: 'View content', value: 'view', description: `Read ${entry.filename}` },
+        entry.pinned
+          ? { title: 'Unpin', value: 'unpin', description: 'Remove [pin] flag from index' }
+          : { title: 'Pin',   value: 'pin',   description: 'Add [pin] flag to index' },
+        ...(!entry.pinned ? [{
+          title:       'Remove from index',
+          value:       'remove',
+          description: 'Removes index entry; topic file preserved on disk',
+        }] : []),
+        { title: 'Back', value: 'back', description: 'Return to memory list' },
+      ],
+    });
+    if (!action) return;
+    switch (action) {
+      case 'view':
+        await context.ui.dialog.alert({ title: entry.name, message: readTopic(memDir, entry.filename) });
+        return showActions(entry, memDir, memIndex, sharedDir);
+      case 'pin':
+        return doMutation(() => setPin(memDir, memIndex, entry.filename, true, sharedDir));
+      case 'unpin':
+        return doMutation(() => setPin(memDir, memIndex, entry.filename, false, sharedDir));
+      case 'remove': {
+        const ok = await context.ui.dialog.confirm({
+          title:   'Remove from index',
+          message: `Remove "${entry.name}" from the memory index?\n\nThe topic file is preserved on disk.`,
+        });
+        if (ok) return doMutation(() => removeEntry(memDir, memIndex, entry.filename, sharedDir));
+        return showActions(entry, memDir, memIndex, sharedDir);
+      }
+      case 'back':
+        return showBrowser();
+    }
+  }
+
+  context.keymap.layer(() => ({
+    mode:     'global',
+    commands: [{
+      id:          'ocl-memory.browser',
+      title:       'Memory Browser',
+      description: 'Browse and manage the memory index',
+      group:       'Memory',
+      bind:        'ctrl+alt+m',
+      run:         showBrowser,
+    }],
+    bindings: ['ocl-memory.browser'],
+  }));
+};
+
+export default { id: 'ocl-memory-tui', setup, tui };

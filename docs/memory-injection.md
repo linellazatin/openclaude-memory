@@ -4,7 +4,7 @@
 
 ## Per-request system prompts
 
-OpenCode 1.18.34 constructs a fresh system prompt for each model request and invokes `experimental.chat.system.transform`. A plugin's previous `output.system` mutation is not retained for the next request. Openclaude-memory therefore appends `## Global Memory` and `## Memory Rules` on every invocation, including later steps, other sessions, title generation, and compaction requests. There is no process-global first-turn gate.
+OpenCode constructs a fresh system prompt for each model request. Under V1 (verified 1.18.34) it invokes `experimental.chat.system.transform`; under V2 (verified 2.0.31) the plugin registers `ctx.session.hook("context")` and pushes `{ type: "text", text }` into `event.system`. A plugin's previous mutation is not retained for the next request. Openclaude-memory therefore appends `## Global Memory` and `## Memory Rules` on every invocation, including later steps, other sessions, title generation, and compaction requests. There is no process-global first-turn gate.
 
 ## Cache freshness
 
@@ -14,9 +14,9 @@ The index and rendered behavioral rules are cached to avoid repeated content rea
 
 ## Compaction and consolidation
 
-`experimental.session.compacting` freshly reads memory into the compaction context. Subsequent model requests also receive their own memory blocks; no injection-state reset is needed.
+Under V1, `experimental.session.compacting` freshly reads memory into the compaction context; under V2, `ctx.session.hook("compaction")` pushes the same memory blocks into `event.system`. Subsequent model requests also receive their own memory blocks; no injection-state reset is needed.
 
-With `consolidate_on_compact: true`, the automatic continuation hook fetches the latest compaction summary and saves a consolidation prompt with `client.session.prompt({ body: { noReply: true, ... } })`. Saving returns immediately instead of awaiting the session loop that is already running. The queued prompt preserves the active agent, model, and variant. Native continuation is disabled only after a successful API response; failures leave it enabled.
+With `consolidate_on_compact: true`, V1's automatic continuation hook (`experimental.compaction.autocontinue`) fetches the latest compaction summary and saves a consolidation prompt with `client.session.prompt({ body: { noReply: true, ... } })`. Saving returns immediately instead of awaiting the session loop that is already running. The queued prompt preserves the active agent, model, and variant. Native continuation is disabled only after a successful API response; failures leave it enabled. V2 has no continuation hook: the plugin subscribes to the `session.compacted` event and enqueues an additional consolidation prompt via `ctx.session.prompt({ delivery: "queue" })`, so the running loop always resumes normally rather than being replaced.
 
 The summary-backed prompt resumes pending work from `Next Move`. If no summary can be fetched, the full-conversation fallback also instructs the agent to resume pending work. Manual `/compact` and automatic compaction paths that replay a user message do not invoke this continuation hook; run `/memory consolidate` explicitly when needed.
 
@@ -26,4 +26,4 @@ The memory blocks form part of every model request's input tokens. Provider prom
 
 ## Verification
 
-`npm run test:host` starts the installed OpenCode server with temporary config and memory paths and a local fake model. It verifies native tool execution, memory on subsequent requests, another session's first request, and automatic consolidation completing without re-entrant deadlock. OpenCode 1.18.34 passed this check; this establishes host integration, not a real model's memory-writing judgment.
+`npm run test:host:v1` starts an OpenCode 1.18.x server, and `npm run test:host:v2` an OpenCode 2.0.x server, each with temporary config and memory paths and a local fake model. The V1 suite verifies native tool execution, memory on subsequent requests, another session's first request, and automatic consolidation completing without re-entrant deadlock. The V2 suite verifies tool registration, execution, and marker/rule injection on a later request. 1.18.34 and 2.0.31 passed their respective checks; this establishes host integration, not a real model's memory-writing judgment.
