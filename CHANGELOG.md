@@ -2,11 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-11-11
+
+### Updated
+
+- V2 verified through OpenCode 2.2.7 (was 2.0.31). All smoke tests (128) and real-V2 host test pass against 2.2.7. No API compatibility issues.
+- `@opencode/plugin` devDependency relaxed to `>=2.0.31` (was pinned 2.0.31).
+- All version references updated across CLAUDE.md, docs/faq.md, docs/memory-injection.md, and docs/architecture.md.
+
 ## [0.7.0] - 2026-10-17
 
 ### Added
 
-- Dual OpenCode V1/V2 support from a single set of entrypoints. The server plugin now default-exports `{ id, setup, server }` (V1 calls `server`, V2 calls `setup`); the TUI plugin exports `{ id, setup, tui }`. Floor version remains OpenCode 1.18.29; verified through 2.0.31.
+- Dual OpenCode V1/V2 support from a single set of entrypoints. The server plugin now default-exports `{ id, setup, server }` (V1 calls `server`, V2 calls `setup`); the TUI plugin exports `{ id, setup, tui }`. Floor version remains OpenCode 1.18.29; verified through 2.2.7.
 - Root `index.mjs` / `tui.mjs` re-export shims so a local checkout referenced by directory path loads under V2 (which resolves `<dir>/index.mjs` and `<dir>/tui.mjs`, not the directory's `package.json` exports).
 - V2 tool registration via `ctx.tool.transform` with object JSON Schema input, `options: { codemode: false }` for V1-parity function-tool exposure, and `{ content }` result wrapping. Memory/rules injection via `ctx.session.hook("context")` SystemParts; cache invalidation via `ctx.tool.hook("execute.after")`.
 - V2 skill, command, and compaction hooks (`ctx.skill.transform`, `ctx.command.transform`, `ctx.session.hook("compaction")`).
@@ -20,7 +28,7 @@ All notable changes to this project will be documented in this file.
 ### Tests
 
 - 128 smoke tests plus a V2 fake-context seam (`__core.setupV2`) and promise-dialog TUI coverage.
-- Host suites split by major: `npm run test:host:v1` (OpenCode 1.18.x) and `npm run test:host:v2` (OpenCode 2.0.31).
+- Host suites split by major: `npm run test:host:v1` (OpenCode 1.18.x) and `npm run test:host:v2` (OpenCode 2.2.7).
 
 ## [0.6.7] - 2026-10-03
 
