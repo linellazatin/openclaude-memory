@@ -4,7 +4,7 @@
 
 ## Per-request system prompts
 
-OpenCode constructs a fresh system prompt for each model request. Under V1 (verified 1.18.34) it invokes `experimental.chat.system.transform`; under V2 (verified 2.0.31) the plugin registers `ctx.session.hook("context")` and pushes `{ type: "text", text }` into `event.system`. A plugin's previous mutation is not retained for the next request. Openclaude-memory therefore appends `## Global Memory` and `## Memory Rules` on every invocation, including later steps, other sessions, title generation, and compaction requests. There is no process-global first-turn gate.
+OpenCode constructs a fresh system prompt for each model request. Under V1 (verified 1.18.34) it invokes `experimental.chat.system.transform`; under V2 (verified 2.2.7) the plugin registers `ctx.session.hook("context")` and pushes `{ type: "text", text }` into `event.system`. A plugin's previous mutation is not retained for the next request. Openclaude-memory therefore appends `## Global Memory` and `## Memory Rules` on every invocation, including later steps, other sessions, title generation, and compaction requests. There is no process-global first-turn gate.
 
 ## Cache freshness
 
@@ -26,4 +26,4 @@ The memory blocks form part of every model request's input tokens. Provider prom
 
 ## Verification
 
-`npm run test:host:v1` starts an OpenCode 1.18.x server, and `npm run test:host:v2` an OpenCode 2.0.x server, each with temporary config and memory paths and a local fake model. The V1 suite verifies native tool execution, memory on subsequent requests, another session's first request, and automatic consolidation completing without re-entrant deadlock. The V2 suite verifies tool registration, execution, and marker/rule injection on a later request. 1.18.34 and 2.0.31 passed their respective checks; this establishes host integration, not a real model's memory-writing judgment.
+`npm run test:host:v1` starts an OpenCode 1.18.x server, and `npm run test:host:v2` an OpenCode 2.2.x server, each with temporary config and memory paths and a local fake model. The V1 suite verifies native tool execution, memory on subsequent requests, another session's first request, and automatic consolidation completing without re-entrant deadlock. The V2 suite verifies tool registration, execution, and marker/rule injection on a later request. 1.18.34 and 2.2.7 passed their respective checks; this establishes host integration, not a real model's memory-writing judgment.

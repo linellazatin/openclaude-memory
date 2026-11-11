@@ -12,7 +12,7 @@
 
 ## Compatibility
 
-**Which OpenCode releases are supported?** Both V1 (floor 1.18.29) and V2 (2.0.31). Release-source contracts, smoke tests, and real-server runs with a local fake model were checked: 1.18.34 for V1 (`npm run test:host:v1`) and 2.0.31 for V2 (`npm run test:host:v2`). The V1 server test covers tool registration/execution, repeated requests, another session, and automatic consolidation; the V2 test covers tool registration/execution and later-request injection. TUI APIs and mutation behavior are checked separately; interactive rendering and older releases have not been revalidated.
+**Which OpenCode releases are supported?** Both V1 (floor 1.18.29) and V2 (2.2.7). Release-source contracts, smoke tests, and real-server runs with a local fake model were checked: 1.18.34 for V1 (`npm run test:host:v1`) and 2.2.7 for V2 (`npm run test:host:v2`). The V1 server test covers tool registration/execution, repeated requests, another session, and automatic consolidation; the V2 test covers tool registration/execution and later-request injection. TUI APIs and mutation behavior are checked separately; interactive rendering and older releases have not been revalidated.
 
 **Do I need to restart?** Restart after changing plugin code, skills, or OpenCode plugin registration. Editing `memory.jsonc` or `MEMORY.md` is detected on the next cache check; the TUI resolves the active directory every time it opens, and dynamic `/memory` paths refresh before execution.
 

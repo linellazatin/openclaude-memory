@@ -105,7 +105,7 @@ function makeFakeV2Ctx() {
         };
       },
     },
-    app: { version: '2.0.31' },
+    app: { version: '2.2.7' },
   };
   return ctx;
 }
@@ -2095,7 +2095,7 @@ await test('TUI V2 setup registers a keymap layer and drives pin via promise dia
         format: { path: v => v },
       },
       keymap: { layer(factory) { layer = factory(); } },
-      app: { version: '2.0.31' },
+      app: { version: '2.2.7' },
     };
     await module.default.setup(fakeCtx);
     assert.ok(layer, 'keymap layer must be registered');

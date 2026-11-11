@@ -21,7 +21,7 @@ OPEN. CONFIGURABLE. Global persistent memory for [opencode](https://opencode.ai)
 > - One plugin now serves both OpenCode majors from a single set of entrypoints (V1 `server`/`tui` hooks, V2 `setup`), with floor version 1.18.29.
 > - V2 tools register via `ctx.tool.transform` (object JSON Schema, `codemode: false`), injection via `ctx.session.hook("context")`, and the TUI browser via promise dialogs under a `ctrl+alt+m` keymap layer.
 > - Under V2, `consolidate_on_compact` enqueues an additional consolidation prompt on `session.compacted` (no native-continuation suppression exists).
-> - 126 smoke tests plus split host suites: `test:host:v1` (1.18.x) and `test:host:v2` (2.0.31).
+> - 126 smoke tests plus split host suites: `test:host:v1` (1.18.x) and `test:host:v2` (2.2.7).
 >
 > ## v0.6.7: request injection and flat-file safety
 > - Memory is attached to every model request; filesystem changes refresh the cache automatically.
@@ -186,7 +186,7 @@ The TUI plugin adds an interactive, arrow-key-navigable memory browser — no LL
 }
 ```
 
-Restart opencode to load the updated plugins and skill. `memory.jsonc` is created automatically; the empty memory index is injected immediately and written to disk on the first locked mutation. The server lifecycle has been verified on OpenCode 1.18.34 (V1) and 2.0.31 (V2) with a local fake model; TUI API contracts and mutation behavior are covered separately.
+Restart opencode to load the updated plugins and skill. `memory.jsonc` is created automatically; the empty memory index is injected immediately and written to disk on the first locked mutation. The server lifecycle has been verified on OpenCode 1.18.34 (V1) and 2.2.7 (V2) with a local fake model; TUI API contracts and mutation behavior are covered separately.
 
 Once installed:
 

@@ -4,7 +4,7 @@ Guidance for AI agents working in this repository.
 
 ## What this is
 
-An opencode plugin (`@openlines/openclaude-memory`) giving agents persistent markdown memory across sessions. Plain ES JavaScript + Markdown — no TypeScript, no bundler, no lint, no formatter, zero runtime dependencies. Supports OpenCode V1 (floor 1.18.29) and V2 (2.0.31) from the same entrypoints.
+An opencode plugin (`@openlines/openclaude-memory`) giving agents persistent markdown memory across sessions. Plain ES JavaScript + Markdown — no TypeScript, no bundler, no lint, no formatter, zero runtime dependencies. Supports OpenCode V1 (floor 1.18.29) and V2 (2.2.7) from the same entrypoints.
 
 ## Commands
 
@@ -98,4 +98,4 @@ Module-level state (no reset API between tests): `ocl-memory.mjs` `_cache` (conf
 
 - Version bump touches 3 files with NO single source of truth: `package.json` (`version`), `skills/memory/SKILL.md` (`version:`), a dated `## [X.Y.Z]` entry in `CHANGELOG.md`. Publish CI checks consistency. **Current worktree version is 0.7.0.**
 - CI publishes on a `v*` tag; `publish.yml` scrapes the release body from `CHANGELOG.md` by matching the `## [<version>]` heading, so that heading MUST equal the tag version (minus `v`). `NODE_AUTH_TOKEN: ''` is intentional (OIDC Trusted Publishing) — never put a real token there.
-- CI gates: `test.yml` runs `node --check` + `npm test` + the real-V2 host test (`test:host:v2`, pinned `@opencode/cli@2.0.31`) on every push/PR and is reusable via `workflow_call`. `publish.yml`'s `publish` job `needs` that Test workflow (so the full suite, including real-V2 integration, must pass first) before running the 3-way version-consistency check and publishing. Still run `npm test` + `node --check` locally before tagging.
+- CI gates: `test.yml` runs `node --check` + `npm test` + the real-V2 host test (`test:host:v2`, pinned `@opencode/cli@2.2.7`) on every push/PR and is reusable via `workflow_call`. `publish.yml`'s `publish` job `needs` that Test workflow (so the full suite, including real-V2 integration, must pass first) before running the 3-way version-consistency check and publishing. Still run `npm test` + `node --check` locally before tagging.

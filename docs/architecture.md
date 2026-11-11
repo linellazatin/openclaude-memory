@@ -15,7 +15,7 @@
 | `tests/smoke-test.mjs` | Sequential isolated regression suite, including injected filesystem failures. |
 | `tests/shared-store-test.mjs` | Two real writer processes; optional sibling pi core exercises cross-harness storage. |
 | `tests/host-test.mjs` | Real OpenCode 1.18.x server with a local fake model and temporary storage (`npm run test:host:v1`). |
-| `tests/host-test-v2.mjs` | Real OpenCode 2.0.x server with a local fake model and temporary storage (`npm run test:host:v2`). |
+| `tests/host-test-v2.mjs` | Real OpenCode 2.2.x server with a local fake model and temporary storage (`npm run test:host:v2`). |
 
 Server and TUI entry points remain separate files, but each now exports a single dual object: `{ id, setup, server }` for the server and `{ id, setup, tui }` for the TUI. OpenCode V2 calls `setup` while V1 calls `server`/`tui`, so one file serves both majors (floor 1.18.29). The V1 path preserves the server's legacy hook object and the TUI's callback interface byte-for-byte; the V2 path registers tools, hooks, skills, the command, and the promise-dialog TUI browser. The shared module exports no plugin hooks.
 
@@ -29,7 +29,7 @@ Memory is global: one active index plus topic files, either local or shared acro
 
 | Requirement | Status |
 |---|---|
-| OpenCode | V1 (floor 1.18.29) and V2 (2.0.31) both supported; 1.18.34 verified against release source and the real-server check, and 2.0.31 verified via the real-V2 host test. Older V1 releases have not been revalidated. |
+| OpenCode | V1 (floor 1.18.29) and V2 (2.2.7) both supported; 1.18.34 verified against release source and the real-server check, and 2.2.7 verified via the real-V2 host test. Older V1 releases have not been revalidated. |
 | Node.js | Manifest requires >=18; local checks used Node 26.10.0 and CI uses Node 22. No runtime dependencies. |
 | macOS | Verified locally; paths follow `XDG_CONFIG_HOME` or `~/.config/opencode/`. |
 | Linux | Supported local-filesystem design; this verification ran on macOS. |
@@ -69,7 +69,7 @@ Atomicity is per file, not a transaction across topic, index, and tombstone file
 
 ## Architecture diagrams
 
-These diagrams trace the 0.7.0 implementation in the three plugin modules, command template, skill, and tests. Solid arrows show calls or data flow; dotted arrows show observation, guidance, or verification. Hook and event names in the diagrams are the V1 names; the V2 path maps them to `ctx.session.hook("context")`, `ctx.tool.transform`, `ctx.skill.transform`, `ctx.command.transform`, `ctx.session.hook("compaction")`, and a `session.compacted` event loop. Integration is verified on 1.18.34 (V1) and 2.0.31 (V2). The pi co-tenant is an external cooperating writer, not part of this plugin's runtime.
+These diagrams trace the 0.7.0 implementation in the three plugin modules, command template, skill, and tests. Solid arrows show calls or data flow; dotted arrows show observation, guidance, or verification. Hook and event names in the diagrams are the V1 names; the V2 path maps them to `ctx.session.hook("context")`, `ctx.tool.transform`, `ctx.skill.transform`, `ctx.command.transform`, `ctx.session.hook("compaction")`, and a `session.compacted` event loop. Integration is verified on 1.18.34 (V1) and 2.2.7 (V2). The pi co-tenant is an external cooperating writer, not part of this plugin's runtime.
 
 ## Complete system map
 
